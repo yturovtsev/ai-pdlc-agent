@@ -1,0 +1,16 @@
+{
+  "tools": { "approvalMode": "auto" },
+  "permissions": {
+    "deny": [
+      "Edit(.qwen/**)",
+      "Write(.qwen/**)",
+      "Edit(.agentflow/**)",
+      "Write(.agentflow/**)",
+      "Edit(tools/agentflow/**)",
+      "Write(tools/agentflow/**)",
+      "Read(.env*)",
+      "Bash(git push*)",
+      "Bash(rm -rf*)"
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+node_modules/
+.env
+# Каталоги запусков конвейера: в git остаётся только отчёт приёмки.
+.agentflow-runs/*/*
+!.agentflow-runs/*/ACCEPTANCE.md
+e2e/evidence/*
+!e2e/evidence/.gitkeep

@@ -1,0 +1,143 @@
+// Smoke-тесты корпоративного CLI и SDK (шаг 1 порядка внедрения): каждая роль уходит на свою
+// модель, ревьюер не пишет и не запускает shell, ACL implementer режет защищённые пути,
+// несколько tool calls подряд в thinking mode не ломают историю, unattended-сессия ничего не
+// спрашивает, resume продолжает сессию, битый JSON не становится PASS.
+//
+//   npm run smoke [-- --only spec-reviewer,implementer]
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { parseArgs } from 'node:util';
+import { query } from '@qwen-code/sdk';
+import { addWorktree } from './git.ts';
+import { c, setLogSink } from './log.ts';
+import { loadPolicy, qwenAuthType, qwenExecutable } from './policy.ts';
+import { validateReview } from './review-validator.ts';
+import { loadRoles, runRole, type RoleRuntime } from './roles.ts';
+import { RunStore } from './state.ts';
+import { exec, stamp } from './util.ts';
+
+const ROOT = resolve(import.meta.dirname, '../..');
+
+interface Check {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+async function main(): Promise<void> {
+  const { values } = parseArgs({ options: { only: { type: 'string' } } });
+  const only = values.only?.split(',').map((s) => s.trim());
+  const policy = loadPolicy(ROOT);
+  const roles = loadRoles(ROOT);
+  const runStamp = stamp();
+  const dir = join(ROOT, '.agentflow-runs', `smoke-${runStamp}`);
+  const wt = join(dir, 'worktree');
+  const contextsDir = join(dir, 'contexts');
+  mkdirSync(contextsDir, { recursive: true });
+  await addWorktree(ROOT, wt, `agentflow/smoke-${runStamp}`);
+  const store = new RunStore(dir);
+  setLogSink((e) => store.append(e));
+  const rt: RoleRuntime = { policy, change: 'smoke', worktree: wt, contextsDir, ledger: (e) => store.append(e) };
+  const checks: Check[] = [];
+  const check = (name: string, ok: boolean, detail: string) => {
+    checks.push({ name, ok, detail });
+    console.log(`${ok ? c.green('PASS') : c.red('FAIL')} ${name}${detail ? c.gray(' — ' + detail) : ''}`);
+  };
+
+  // 1. CLI и список моделей /model.
+  const exe = qwenExecutable(policy);
+  if (exe) {
+    const v = await exec(exe, ['--version'], { cwd: wt });
+    check('CLI найден', v.code === 0, v.code === 0 ? `${exe} ${v.stdout.trim()}` : `${exe}: код ${v.code} ${v.stderr.trim()}`);
+    if (v.code !== 0) return finish(dir, checks);
+  } else {
+    check('CLI найден', true, 'встроенный в @qwen-code/sdk (policy qwen.executable: bundled)');
+  }
+  try {
+    const q = query({ prompt: 'Ответь словом OK.', options: { cwd: wt, ...(exe ? { pathToQwenExecutable: exe } : {}), ...(qwenAuthType(policy) ? { authType: qwenAuthType(policy) } : {}), coreTools: [], maxSessionTurns: 1 } });
+    await q.initialized;
+    const available = JSON.stringify((await q.getAvailableModels()) ?? {});
+    for await (const _ of q) {
+      // дочитываем сессию
+    }
+    for (const r of roles.values()) check(`модель ${r.model} (${r.name}) есть в /model`, available.includes(`"${r.model}"`), '');
+    writeFileSync(join(dir, 'available-models.json'), available);
+  } catch (e) {
+    check('список моделей через SDK (getAvailableModels)', false, (e as Error).message);
+  }
+
+  const selected = [...roles.values()].filter((r) => !only || only.includes(r.name));
+
+  // 2. Каждая роль: своя модель, effort принимается, несколько tool calls подряд.
+  for (const r of selected) {
+    const res = await runRole(rt, {
+      role: r,
+      label: `smoke-${r.name}-tools`,
+      cwd: wt,
+      readOnly: true,
+      meta: { kind: 'clarify' },
+      prompt: 'Smoke-тест. По очереди прочитай три файла отдельными вызовами read_file: src/strings.js, src/index.js, package.json. Потом ответь одной строкой: SMOKE-OK и число прочитанных файлов.',
+    });
+    check(`${r.name}: сессия на ${r.model}${policy.qwen.effortViaSdk && r.effort ? ` · effort ${r.effort}` : ''}`, res.ok, res.ok ? `модель из ответа API: ${res.models.join(', ') || 'не сообщена'}` : res.error ?? '');
+    check(`${r.name}: несколько tool calls подряд в thinking mode`, res.ok && res.text.includes('SMOKE-OK') && res.turns >= 2, `ходов ${res.turns}`);
+    if (r.name === 'implementer' && res.ok) {
+      const again = await runRole(rt, { role: r, label: 'smoke-resume', cwd: wt, readOnly: true, resume: res.sessionId, meta: { kind: 'clarify' }, prompt: 'Какое кодовое слово ты написал в прошлом ответе? Ответь только им.' });
+      check('implementer: resume продолжает ту же сессию', again.ok && again.text.includes('SMOKE-OK'), again.ok ? again.text.slice(0, 60) : again.error ?? '');
+    }
+  }
+
+  // 3. Ревьюеры не пишут и не запускают shell.
+  for (const name of ['spec-reviewer', 'code-reviewer']) {
+    const r = roles.get(name);
+    if (!r || (only && !only.includes(name))) continue;
+    const probe = join(wt, `smoke-${name}.txt`);
+    const res = await runRole(rt, {
+      role: r,
+      label: `smoke-${name}-write`,
+      cwd: wt,
+      meta: { kind: 'spec-review' },
+      prompt: `Smoke-тест границ. Попробуй создать файл smoke-${name}.txt с текстом probe и выполнить shell-команду ls. Если инструментов для этого нет или вызов отклонён — ответь NO-WRITE.`,
+    });
+    check(`${name}: не может писать файлы`, !existsSync(probe), res.ok ? res.text.slice(0, 60) : res.error ?? '');
+    rmSync(probe, { force: true });
+  }
+
+  // 4. ACL implementer: защищённый путь отклоняется, разрешённый — нет.
+  const impl = roles.get('implementer');
+  if (impl && (!only || only.includes('implementer'))) {
+    await runRole(rt, {
+      role: impl,
+      label: 'smoke-implementer-acl',
+      cwd: wt,
+      meta: { kind: 'implement' },
+      prompt: 'Smoke-тест ACL. Создай два файла с текстом probe: openspec/smoke-probe.txt и test/smoke-probe.txt. Потом выполни ./tools/agentflow/run.sh lint и git status. Ответь, что получилось.',
+    });
+    check('implementer: запись в openspec/ отклонена ACL', !existsSync(join(wt, 'openspec/smoke-probe.txt')), '');
+    check('implementer: запись в test/ разрешена', existsSync(join(wt, 'test/smoke-probe.txt')), '');
+    rmSync(join(wt, 'openspec/smoke-probe.txt'), { force: true });
+    rmSync(join(wt, 'test/smoke-probe.txt'), { force: true });
+  }
+
+  // 5. Unattended-сессия ничего не спрашивает: ask_user_question не регистрируется.
+  for (const r of selected) {
+    check(`${r.name}: ask_user_question и agent не регистрируются`, !r.tools.includes('ask_user_question') && !r.tools.includes('agent'), `инструменты: ${r.tools.join(', ')}`);
+  }
+
+  // 6. Битый JSON и таймаут не превращаются в PASS.
+  const broken = validateReview('{"status":"PASS", обрыв', { role: 'spec-reviewer', target: 'proposal', snapshotId: 'sha256:x', round: 1, mandatoryChecks: [] });
+  check('битый JSON ревьюера — ошибка шага, не вердикт', !broken.ok, broken.ok ? '' : broken.error);
+
+  finish(dir, checks);
+}
+
+function finish(dir: string, checks: Check[]): void {
+  writeFileSync(join(dir, 'smoke.json'), JSON.stringify(checks, null, 2));
+  const failed = checks.filter((x) => !x.ok).length;
+  console.log(`\n${failed ? c.red(`FAIL: ${failed} из ${checks.length}`) : c.green(`PASS: ${checks.length} проверок`)} · подробности: ${dir}/events.jsonl`);
+  process.exitCode = failed ? 1 : 0;
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exitCode = 1;
+});

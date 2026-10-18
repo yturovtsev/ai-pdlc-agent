@@ -1,0 +1,83 @@
+# Политика конвейера agentflow: лимиты петель, ACL ролей, операции runner.
+# Контроллер читает файл при старте, его sha пишется в manifest запуска.
+# Роли не могут менять этот файл: запрет в .qwen/settings.json и в ACL контроллера.
+version: 1
+
+qwen:
+  # Корпоративный CLI на базе Qwen Code: модели доступны в нём сразу, без авторизации,
+  # и переключаются через /model. Имя команды в PATH или абсолютный путь.
+  # Переменная окружения AGENTFLOW_QWEN_CLI перекрывает значение.
+  # "bundled" — CLI, встроенный в @qwen-code/sdk (корпоративных моделей в нём нет).
+  executable: qwen
+  # Тип авторизации для --auth-type. Пусто — не передавать: CLI берёт свой преднастроенный.
+  # Заполни, только если smoke пишет "No auth type is selected" (например: openai).
+  authType: ""
+  # Передавать effort из frontmatter роли в сессию: query({ effort }).
+  # Если модель или шлюз отвечают ошибкой на поле reasoning — поставь false,
+  # модели пойдут на своём уровне по умолчанию.
+  effortViaSdk: true
+  # Подробный лог CLI (пишется в events.jsonl через stderr).
+  debug: false
+
+openspec:
+  schema: agentflow
+
+limits:
+  artifactRounds: 3     # раунды исправления одного артефакта
+  holisticRounds: 3     # раунды сквозного ревью спеки
+  batchRounds: 3        # раунды исправления task batch
+  finalFixRounds: 2     # раунды исправлений после финального ревью
+  gateAttempts: 3       # попытки гейта на один вызов implementer
+  infraRetries: 2       # повторы при инфраструктурных ошибках и битом контракте
+  # Лимитов бюджета и времени нет: 0 = без ограничения.
+  roleTimeoutMinutes: 0
+
+git:
+  branchPrefix: agentflow/
+
+# Операции tools/agentflow/run.sh, которые контроллер запускает как гейты.
+gates:
+  batch: [lint, unit]
+  full: [lint, unit, e2e]
+
+# Чтение разрешено всем в пределах worktree. Запись и shell — только перечисленное.
+# write/denyWrite — glob относительно корня worktree; {change} — id текущего change.
+# shell — операции run.sh, которые роль может вызвать сама.
+roles:
+  spec-author:
+    write: ["openspec/changes/{change}/**"]
+    shell: []
+  spec-reviewer:
+    write: []
+    shell: []
+  implementer:
+    write: ["**"]
+    denyWrite:
+      - "openspec/**"
+      - "e2e/**"
+      - ".qwen/**"
+      - ".agentflow/**"
+      - "tools/**"
+      - ".git/**"
+      - "node_modules/**"
+      - "package.json"
+      - "package-lock.json"
+      - "eslint.config.js"
+      - ".gitignore"
+    shell: [lint, unit]
+  code-reviewer:
+    write: []
+    shell: []
+  acceptance-tester:
+    write: ["e2e/**"]
+    shell: [e2e]
+
+# Запрещено всем ролям в любой фазе. Уходит в excludeTools каждой сессии
+# поверх deny из .qwen/settings.json.
+denyAll:
+  - "Edit(.qwen/**)"
+  - "Edit(.agentflow/**)"
+  - "Edit(tools/agentflow/**)"
+  - "Read(.env*)"
+  - "Bash(git *)"
+  - "Bash(rm -rf*)"

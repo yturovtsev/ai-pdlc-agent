@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agentflow/review.schema.json",
+  "title": "Ответ ревьюера agentflow",
+  "description": "Общий контракт spec-reviewer, code-reviewer и acceptance-tester. specCompliance и codeQuality заполняет только code-reviewer, traceability — финальное ревью и acceptance-tester. Валидатор контракта: tools/agentflow/review-validator.ts.",
+  "type": "object",
+  "required": ["status", "role", "target", "snapshotId", "round", "checks", "findings"],
+  "properties": {
+    "status": { "enum": ["PASS", "REVISE", "BLOCKED"] },
+    "role": { "enum": ["spec-reviewer", "code-reviewer", "acceptance-tester"] },
+    "target": { "type": "string", "description": "id артефакта, change, batch-<id>, acceptance или final" },
+    "snapshotId": { "type": "string", "pattern": "^sha256:" },
+    "round": { "type": "integer", "minimum": 1 },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "result"],
+        "properties": {
+          "id": { "type": "string" },
+          "result": { "enum": ["PASS", "FAIL", "NOT_VERIFIED"] },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "specCompliance": { "$ref": "#/$defs/assessment" },
+    "codeQuality": { "$ref": "#/$defs/assessment" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "location", "problem", "evidence"],
+        "properties": {
+          "id": { "type": "string", "description": "F-001; при повторе в следующем раунде — тот же id" },
+          "severity": { "enum": ["critical", "major", "minor", "nit"] },
+          "requirementId": { "type": ["string", "null"] },
+          "artifact": { "type": ["string", "null"], "description": "сквозное и финальное ревью: какой артефакт или область исправлять" },
+          "category": { "enum": ["spec", "behavior", "security", "quality", "test", "scope", "other"] },
+          "location": { "type": "string", "description": "path:line" },
+          "problem": { "type": "string" },
+          "evidence": { "type": "string", "description": "цитата или path:line" },
+          "requiredChange": { "type": "string" },
+          "verification": { "type": "string" },
+          "needsHuman": { "type": "boolean" }
+        }
+      }
+    },
+    "traceability": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["requirementId", "result"],
+        "properties": {
+          "requirementId": { "type": "string" },
+          "scenarioId": { "type": "string" },
+          "code": { "type": "array", "items": { "type": "string" } },
+          "tests": { "type": "array", "items": { "type": "string" } },
+          "evidence": { "type": "string" },
+          "result": { "enum": ["PASS", "FAIL", "NOT_VERIFIED"] }
+        }
+      }
+    },
+    "missingContext": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "assessment": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["result", "summary"],
+          "properties": {
+            "result": { "enum": ["PASS", "FAIL", "NOT_VERIFIED"] },
+            "summary": { "type": "string" }
+          }
+        }
+      ]
+    }
+  }
+}

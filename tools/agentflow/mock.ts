@@ -1,0 +1,266 @@
+// Mock-раннер ролей (--mock): проходит весь конвейер без моделей на заготовленной
+// задаче slugify. Нужен, чтобы проверить контроллер, петли, ACL, гейты и git до подключения
+// корпоративного CLI. Запись файлов идёт через тот же ACL, что и у настоящих ролей.
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { c, log } from './log.ts';
+import { decideAcl, toolsFor, type RoleCall, type RoleResult, type RoleRuntime } from './roles.ts';
+import { exec } from './util.ts';
+
+const ARTIFACTS: Record<string, Record<string, string>> = {
+  proposal: {
+    'proposal.md': `# Proposal
+
+## Why
+
+Ссылкам и именам файлов нужны URL-совместимые идентификаторы из произвольных строк.
+
+## What Changes
+
+- Новая функция \`slugify(text)\` в \`src/strings.js\` и её реэкспорт из \`src/index.js\`.
+- Вне scope: транслитерация кириллицы и настраиваемый разделитель.
+
+## Capabilities
+
+### New Capabilities
+
+- \`text-slug\`: преобразование строк в slug для URL
+
+### Modified Capabilities
+
+## Impact
+
+\`src/strings.js\`, \`src/index.js\`, \`test/\`.
+`,
+  },
+  specs: {
+    'specs/text-slug/spec.md': `# Spec Delta
+
+## Purpose
+
+Преобразование произвольных строк в URL-совместимые идентификаторы для ссылок и имён файлов.
+
+## ADDED Requirements
+
+### Requirement: Slug из произвольной строки
+Функция \`slugify(text)\` SHALL возвращать строку из латинских букв нижнего регистра и цифр, где слова разделены одним дефисом.
+
+#### Scenario: Пробелы и регистр
+- **WHEN** вызывается \`slugify("Hello World")\`
+- **THEN** результат равен \`"hello-world"\`
+
+#### Scenario: Только нелатинские символы
+- **WHEN** вызывается \`slugify("!!!")\`
+- **THEN** результат равен \`""\`
+
+### Requirement: Отказ на нестроковый вход
+Функция \`slugify\` SHALL выбрасывать \`TypeError\`, если аргумент не строка.
+
+#### Scenario: Число на входе
+- **WHEN** вызывается \`slugify(42)\`
+- **THEN** выбрасывается \`TypeError\`
+`,
+  },
+  design: {
+    'design.md': `# Design
+
+## Context
+
+Библиотека — ESM-модули в \`src/\`, см. proposal.md.
+
+## Goals / Non-Goals
+
+**Goals:** публичная функция \`slugify\` из \`src/index.js\`.
+
+**Non-Goals:** транслитерация.
+
+## Decisions
+
+- Реализация в \`src/strings.js\` рядом с \`capitalize\`: тот же модуль строковых утилит. Альтернатива — отдельный модуль; отклонена, функция одна.
+- Нелатинские символы считаются разделителями и отбрасываются регулярным выражением \`/[^a-z0-9]+/g\`.
+
+## Risks / Trade-offs
+
+- [Кириллица теряется] → явно вне scope в proposal.
+`,
+  },
+  'test-plan': {
+    'test-plan.md': `# Test Plan
+
+## Scope
+
+text-slug: «Slug из произвольной строки», «Отказ на нестроковый вход».
+
+## Environment
+
+\`import { slugify } from '../src/index.js'\`.
+
+## Scenarios
+
+| Requirement | Scenario | Steps (inputs) | Expected result | Evidence |
+| --- | --- | --- | --- | --- |
+| Slug из произвольной строки | Пробелы и регистр | \`slugify("Hello World")\` | \`"hello-world"\` | e2e/evidence/e2e-run.txt |
+| Slug из произвольной строки | Только нелатинские символы | \`slugify("!!!")\` | \`""\` | e2e/evidence/e2e-run.txt |
+| Отказ на нестроковый вход | Число на входе | \`slugify(42)\` | \`TypeError\` | e2e/evidence/e2e-run.txt |
+
+## Evidence
+
+Вывод \`run.sh e2e\` в e2e/evidence/e2e-run.txt.
+
+## Manual check
+
+1. \`node -e "import('./src/index.js').then(m => console.log(m.slugify('Hello World')))"\` печатает \`hello-world\`.
+`,
+  },
+  tasks: {
+    'tasks.md': `# Tasks
+
+## 1. Функция slugify
+
+- [ ] 1.1 Добавить \`slugify\` в src/strings.js с unit-тестами в test/slugify.test.js; проверка: run.sh unit зелёный
+
+## 2. Публичный экспорт
+
+- [ ] 2.1 Реэкспортировать \`slugify\` из src/index.js; проверка: unit-тест импортирует slugify из src/index.js
+`,
+  },
+};
+
+const SLUGIFY = `
+/**
+ * Превращает строку в slug для URL: латиница нижнего регистра и цифры через дефис.
+ * @param {string} text
+ * @returns {string}
+ */
+export function slugify(text) {
+  if (typeof text !== 'string') {
+    throw new TypeError('slugify: ожидается строка');
+  }
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+`;
+
+function json(v: unknown): string {
+  return 'Готово.\n```json\n' + JSON.stringify(v, null, 2) + '\n```';
+}
+
+export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResult> {
+  const { role, meta } = call;
+  const session = call.resume ?? randomUUID();
+  log.spawn(role.name, { model: `${role.model} (mock)`, effort: role.effort, session, resume: !!call.resume, tools: toolsFor(role, call.readOnly) });
+  log.role(role.name, c.gray('сессия открыта · mock'));
+
+  const write = (rel: string, content: string) => {
+    log.role(role.name, `→ write_file ${rel}`);
+    const d = decideAcl(rt, role.name, !!call.readOnly, 'write_file', { file_path: rel });
+    log.acl(role.name, 'write_file', d.target, d.ok, d.reason);
+    if (!d.ok) return;
+    const abs = join(rt.worktree, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, content);
+  };
+  const read = (rel: string) => {
+    log.role(role.name, `→ read_file ${rel}`);
+    return readFileSync(join(rt.worktree, rel), 'utf8');
+  };
+  const pass = (target: string, extra: Record<string, unknown> = {}) => ({
+    status: 'PASS',
+    role: role.name,
+    target,
+    snapshotId: meta.snapshotId,
+    round: meta.round ?? 1,
+    checks: (meta.checks ?? []).map((id) => ({ id, result: 'PASS', note: 'mock' })),
+    specCompliance: null,
+    codeQuality: null,
+    findings: [],
+    traceability: [],
+    missingContext: [],
+    ...extra,
+  });
+
+  let text: string;
+  switch (meta.kind) {
+    case 'clarify':
+      text = json({ questions: [{ question: 'Транслитерировать ли кириллицу или отбрасывать её?', why: 'меняет требования к slugify', options: ['отбрасывать', 'транслитерировать'] }] });
+      break;
+    case 'author': {
+      for (const [file, content] of Object.entries(ARTIFACTS[meta.artifact ?? ''] ?? {})) write(`${meta.changeDir}/${file}`, content);
+      const responses = (call.prompt.match(/^- ([A-Z]+-\d+) \[/gm) ?? []).map((m) => ({ id: m.slice(2, -2), resolution: 'fixed', evidence: 'mock: перечитано по рубрике' }));
+      text = json({ artifact: meta.artifact, files: Object.keys(ARTIFACTS[meta.artifact ?? ''] ?? {}), responses, questions: [] });
+      break;
+    }
+    case 'spec-review':
+    case 'holistic':
+      read(`${meta.changeDir}/proposal.md`);
+      text = json(pass(meta.target ?? ''));
+      break;
+    case 'implement': {
+      const strings = read('src/strings.js');
+      if (meta.batchId === '1' && !strings.includes('slugify')) {
+        write('src/strings.js', strings + SLUGIFY);
+        write(
+          'test/slugify.test.js',
+          "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { slugify } from '../src/strings.js';\n\n" +
+            "test('slugify: пробелы и регистр', () => {\n  assert.equal(slugify('Hello World'), 'hello-world');\n});\n\n" +
+            "test('slugify: нестроковый вход', () => {\n  assert.throws(() => slugify(42), TypeError);\n});\n",
+        );
+      }
+      if (meta.batchId === '2' && !read('src/index.js').includes('slugify')) {
+        write('src/index.js', "export { capitalize, slugify } from './strings.js';\n");
+        write(
+          'test/index.test.js',
+          "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { slugify } from '../src/index.js';\n\n" +
+            "test('slugify реэкспортируется из index', () => {\n  assert.equal(typeof slugify, 'function');\n});\n",
+        );
+      }
+      log.role(role.name, '→ run_shell_command ./tools/agentflow/run.sh lint');
+      const d = decideAcl(rt, role.name, false, 'run_shell_command', { command: './tools/agentflow/run.sh lint' });
+      log.acl(role.name, 'run_shell_command', d.target, d.ok, d.reason);
+      text = json({ status: 'DONE', tasks: [], responses: [], specIssue: null });
+      break;
+    }
+    case 'code-review':
+      text = json(pass(meta.target ?? '', { specCompliance: { result: 'PASS', summary: 'mock' }, codeQuality: { result: 'PASS', summary: 'mock' } }));
+      break;
+    case 'acceptance': {
+      const reqs = meta.requirements ?? [];
+      const body = reqs
+        .flatMap((r) => r.scenarios.map((s) => ({ r, s })))
+        .map(({ s }) => {
+          const assertion = s.name.includes('Число') ? 'assert.throws(() => slugify(42), TypeError);' : s.name.includes('нелатин') ? "assert.equal(slugify('!!!'), '');" : "assert.equal(slugify('Hello World'), 'hello-world');";
+          return `test('${s.id} ${s.name}', () => {\n  ${assertion}\n});\n`;
+        })
+        .join('\n');
+      write('e2e/text-slug.test.js', "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { slugify } from '../src/index.js';\n\n" + body);
+      log.role(role.name, '→ run_shell_command ./tools/agentflow/run.sh e2e');
+      const r = await exec('bash', ['tools/agentflow/run.sh', 'e2e'], { cwd: rt.worktree });
+      const scenarios = reqs.flatMap((rq) => rq.scenarios.map((s) => ({ rq, s })));
+      const result = r.code === 0 ? 'PASS' : 'FAIL';
+      text = json({
+        ...pass('acceptance'),
+        status: r.code === 0 ? 'PASS' : 'REVISE',
+        checks: scenarios.map(({ s }) => ({ id: s.id, result, note: 'e2e/evidence/e2e-run.txt' })),
+        traceability: scenarios.map(({ rq, s }) => ({ requirementId: rq.id, scenarioId: s.id, tests: ['e2e/text-slug.test.js'], evidence: 'e2e/evidence/e2e-run.txt', result })),
+      });
+      break;
+    }
+    case 'final-review':
+      text = json(
+        pass('final', {
+          specCompliance: { result: 'PASS', summary: 'mock' },
+          codeQuality: { result: 'PASS', summary: 'mock' },
+          traceability: (meta.requirements ?? []).map((r) => ({ requirementId: r.id, code: ['src/strings.js'], tests: ['test/slugify.test.js', 'e2e/text-slug.test.js'], evidence: 'e2e/evidence/e2e-run.txt', result: 'PASS' })),
+        }),
+      );
+      break;
+    default:
+      text = json({});
+  }
+  log.role(role.name, '«' + text.split('\n')[0] + ' …»');
+  log.roleDone(role.name, { turns: 1, seconds: 0, models: [`${role.model} (mock)`], denials: 0 });
+  return { ok: true, sessionId: session, text, turns: 1, seconds: 0, models: [`${role.model} (mock)`], denials: 0 };
+}
