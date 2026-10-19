@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { now } from './util.ts';
 
 export type Severity = 'critical' | 'major' | 'minor' | 'nit';
-export type FindingStatus = 'open' | 'fixed' | 'disputed' | 'closed' | 'logged';
+export type FindingStatus = 'open' | 'fixed' | 'disputed' | 'closed' | 'logged' | 'waived';
 
 export interface Finding {
   id: string;
@@ -26,13 +26,18 @@ export interface Finding {
   round: number;
   status: FindingStatus;
   response?: { resolution: 'fixed' | 'disputed'; evidence: string };
+  /** Снято человеком с причиной; действует только на этом snapshot. */
+  waiver?: { reason: string; at: string; snapshot: string };
 }
 
 export interface Question {
   id: string;
   question: string;
   why?: string;
-  options?: string[];
+  options?: { label: string; description?: string }[];
+  /** Индекс рекомендуемого варианта и обоснование — от автора вопроса. */
+  recommended?: number;
+  rationale?: string;
   artifact: string;
   from: string;
   answer?: string;
@@ -118,6 +123,8 @@ export interface RunState {
     order: string[];
     artifacts: Record<string, ArtifactState>;
     holisticPassed: boolean;
+    /** Digest пакета, на котором сквозное ревью дало PASS. */
+    holisticDigest?: string;
     questions: Question[];
     freeze?: { digest: string; at: string; commit: string };
   };
@@ -132,6 +139,8 @@ export interface RunState {
   usage: Record<string, { calls: number; turns: number; inputTokens: number; outputTokens: number; seconds: number }>;
   decisions: { at: string; gate: string; decision: string; comment?: string }[];
   injected: string[];
+  /** Счётчики повторяющихся точек fault injection (…-stuck). */
+  injectCounts?: Record<string, number>;
 }
 
 export class RunStore {

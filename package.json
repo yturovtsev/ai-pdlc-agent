@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@fission-ai/openspec": "1.14.0",
+    "@inquirer/prompts": "8.7.3",
     "@qwen-code/sdk": "0.1.8",
     "yaml": "^2.8.0"
   },

@@ -182,6 +182,18 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   const timer = minutes > 0 ? setTimeout(() => abortController.abort(), minutes * 60_000) : undefined;
   const exe = qwenExecutable(rt.policy);
   const authType = qwenAuthType(rt.policy);
+  // SDK 0.1.8 пересылает stderr CLI в callback только на уровне debug: без этого причина
+  // падения CLI ("exited with code 1") теряется. Хвост держим для сообщения об ошибке.
+  const stderrTail: string[] = [];
+  let spawnLine = '';
+  const onStderr = (text: string) => {
+    rt.ledger({ ev: 'stderr', role: role.name, text });
+    if (text.includes('Spawning CLI')) spawnLine = text.slice(text.indexOf('Spawning CLI'));
+    else if (!/\[(Query|SdkControl|McpTransport)\]|Writing to stdin|Write successful|started successfully/.test(text)) {
+      stderrTail.push(oneLine(text, 400));
+      if (stderrTail.length > 12) stderrTail.shift();
+    }
+  };
   const options: QueryOptions = {
     cwd: call.cwd,
     model: role.model,
@@ -194,7 +206,8 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
     includeDirectories: [rt.contextsDir],
     abortController,
     debug: rt.policy.qwen.debug,
-    stderr: (text) => rt.ledger({ ev: 'stderr', role: role.name, text }),
+    logLevel: 'debug',
+    stderr: onStderr,
     ...(call.resume ? { resume: call.resume } : { sessionId }),
     ...(effort ? { effort } : {}),
     ...(exe ? { pathToQwenExecutable: exe } : {}),
@@ -234,7 +247,14 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
 
   const seconds = Math.round((Date.now() - started) / 1000);
   const base = { sessionId, seconds, models: [...models] };
-  if (!result) return { ...base, ok: false, text: '', error: error ?? 'сессия завершилась без result', turns: 0, denials: 0 };
+  if (!result) {
+    // CLI упал до ответа: показываем его stderr и команду запуска, чтобы причину было видно сразу.
+    log.error(`${role.name}: CLI завершился без ответа: ${error ?? 'нет result'}`);
+    if (spawnLine) log.info(c.gray(`  команда: ${oneLine(spawnLine, 600)}`));
+    for (const l of stderrTail) log.info(c.gray(`  stderr: ${l}`));
+    const tail = stderrTail.slice(-3).join(' | ');
+    return { ...base, ok: false, text: '', error: `${error ?? 'сессия завершилась без result'}${tail ? ` — stderr: ${tail}` : ''}`, turns: 0, denials: 0 };
+  }
   const info = {
     turns: result.num_turns,
     denials: result.permission_denials.length,

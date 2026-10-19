@@ -26,6 +26,7 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
   const acc = s.acceptance?.report as { checks?: { id: string; result: string; note?: string }[] } | undefined;
   const logged = s.findings.filter((f) => f.status === 'logged');
   const open = s.findings.filter((f) => f.status === 'open');
+  const waived = s.findings.filter((f) => f.status === 'waived');
   const usage = Object.entries(s.usage);
   const md = [
     `# Приёмка: ${s.change}`,
@@ -58,6 +59,10 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
     '## Открытые находки',
     '',
     open.length ? open.map((f) => `- ${f.id} [${f.severity}] ${f.step}: ${f.problem} (${f.location})`).join('\n') : '(нет)',
+    '',
+    '## Снятые находки (waiver)',
+    '',
+    waived.length ? waived.map((f) => `- ${f.id} [${f.severity}] ${f.step}: ${f.problem} — причина: ${f.waiver?.reason} (${f.waiver?.at}, snapshot ${short(f.waiver?.snapshot ?? '')})`).join('\n') : '(нет)',
     '',
     '## Журнал minor и nit',
     '',

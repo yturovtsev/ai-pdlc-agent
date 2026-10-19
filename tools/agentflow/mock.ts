@@ -153,6 +153,8 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   const session = call.resume ?? randomUUID();
   log.spawn(role.name, { model: `${role.model} (mock)`, effort: role.effort, session, resume: !!call.resume, tools: toolsFor(role, call.readOnly) });
   log.role(role.name, c.gray('сессия открыта · mock'));
+  // Те же сообщения потока, что у настоящей сессии, чтобы `agentflow agents` работал и в mock.
+  rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'system', subtype: 'init', session_id: session, model: `${role.model} (mock)`, tools: toolsFor(role, call.readOnly), permission_mode: 'default' } });
 
   const write = (rel: string, content: string) => {
     log.role(role.name, `→ write_file ${rel}`);
@@ -185,12 +187,41 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   let text: string;
   switch (meta.kind) {
     case 'clarify':
-      text = json({ questions: [{ question: 'Транслитерировать ли кириллицу или отбрасывать её?', why: 'меняет требования к slugify', options: ['отбрасывать', 'транслитерировать'] }] });
+      text = json({
+        questions: [
+          {
+            question: 'Транслитерировать ли кириллицу или отбрасывать её?',
+            why: 'меняет требования к slugify',
+            options: [
+              { label: 'Отбрасывать', description: 'как в примерах intent, без зависимостей' },
+              { label: 'Транслитерировать', description: 'нужна таблица транслитерации' },
+            ],
+            recommended: 0,
+            rationale: 'в intent пример «Привет, Code» → «code»',
+          },
+        ],
+      });
       break;
     case 'author': {
       for (const [file, content] of Object.entries(ARTIFACTS[meta.artifact ?? ''] ?? {})) write(`${meta.changeDir}/${file}`, content);
       const responses = (call.prompt.match(/^- ([A-Z]+-\d+) \[/gm) ?? []).map((m) => ({ id: m.slice(2, -2), resolution: 'fixed', evidence: 'mock: перечитано по рубрике' }));
-      text = json({ artifact: meta.artifact, files: Object.keys(ARTIFACTS[meta.artifact ?? ''] ?? {}), responses, questions: [] });
+      // Один вопрос на первом раунде specs — чтобы был виден диалог на твоём ревью артефакта.
+      const questions =
+        meta.artifact === 'specs' && meta.round === 1
+          ? [
+              {
+                question: 'Что возвращать, если после очистки строка пустая?',
+                why: 'сценарий «Только нелатинские символы»',
+                options: [
+                  { label: 'Пустую строку', description: 'совпадает с примером intent "!!!" → ""' },
+                  { label: 'Бросать RangeError', description: 'явная ошибка вызывающему коду' },
+                ],
+                recommended: 0,
+                rationale: 'так в примере intent',
+              },
+            ]
+          : [];
+      text = json({ artifact: meta.artifact, files: Object.keys(ARTIFACTS[meta.artifact ?? ''] ?? {}), responses, questions });
       break;
     }
     case 'spec-review':
@@ -261,6 +292,8 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
       text = json({});
   }
   log.role(role.name, '«' + text.split('\n')[0] + ' …»');
+  rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'assistant', session_id: session, message: { model: `${role.model} (mock)` } } });
+  rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'result', session_id: session, num_turns: 1 } });
   log.roleDone(role.name, { turns: 1, seconds: 0, models: [`${role.model} (mock)`], denials: 0 });
   return { ok: true, sessionId: session, text, turns: 1, seconds: 0, models: [`${role.model} (mock)`], denials: 0 };
 }

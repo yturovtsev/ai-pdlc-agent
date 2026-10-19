@@ -92,6 +92,7 @@ export function formatFindings(findings: Finding[]): string {
       if (f.requiredChange) lines.push(`  требуется: ${f.requiredChange}`);
       if (f.verification) lines.push(`  проверка: ${f.verification}`);
       if (f.response) lines.push(`  ответ автора: ${f.response.resolution} — ${f.response.evidence}`);
+      if (f.waiver) lines.push(`  СНЯТО ЧЕЛОВЕКОМ (waiver): ${f.waiver.reason} — не поднимай повторно без новых оснований`);
       lines.push(`  источник: ${f.source}, раунд ${f.round}`);
       return lines.join('\n');
     })
@@ -130,6 +131,13 @@ function intentBlock(ctx: BaseCtx): string {
   return `## Intent пользователя\n\n${ctx.intent.trim()}${cl}`;
 }
 
+const QUESTION_ITEM =
+  '[{"question":"...","why":"что зависит от ответа","options":[{"label":"вариант 1","description":"последствия"},{"label":"вариант 2","description":"последствия"}],"recommended":0,"rationale":"почему рекомендуешь этот вариант"}]';
+const QUESTION_EXAMPLE = `{"questions":${QUESTION_ITEM}}`;
+const QUESTION_RULES =
+  'Человек выбирает ответ стрелками из options: дай 2-4 взаимоисключающих варианта с коротким label, ' +
+  'в recommended — индекс рекомендуемого, в rationale — одно предложение, почему именно он.';
+
 export function clarifyPrompt(ctx: BaseCtx): string {
   return [
     header('уточнение intent', ctx),
@@ -142,8 +150,9 @@ export function clarifyPrompt(ctx: BaseCtx): string {
     '',
     '## Формат ответа',
     '```json',
-    '{"questions":[{"question":"...","why":"что зависит от ответа","options":["вариант 1","вариант 2"]}]}',
+    QUESTION_EXAMPLE,
     '```',
+    QUESTION_RULES,
   ]
     .join('\n')
     .replace(/\n{3,}/g, '\n\n');
@@ -200,10 +209,11 @@ export function authorPrompt(
     '## Формат ответа',
     'Закончи ответ одним JSON-блоком:',
     '```json',
-    `{"artifact":"${a.id}","files":["${ctx.changeDir}/..."],"responses":[{"id":"F-001","resolution":"fixed","evidence":"что изменено"}],"questions":[{"question":"...","why":"...","options":["..."]}]}`,
+    `{"artifact":"${a.id}","files":["${ctx.changeDir}/..."],"responses":[{"id":"F-001","resolution":"fixed","evidence":"что изменено"}],"questions":${QUESTION_ITEM}}`,
     '```',
     'questions — только продуктовые развилки, которые нельзя решить из intent. Они не блокируют шаг:',
-    'контроллер копит их и задаёт человеку пакетом при согласовании спеки.',
+    'в артефакте прими рекомендуемый вариант как допущение, а человек ответит на твоём ревью артефакта.',
+    QUESTION_RULES,
   ]
     .join('\n')
     .replace(/\n{3,}/g, '\n\n');

@@ -50,6 +50,14 @@ async function main(): Promise<void> {
     const v = await exec(exe, ['--version'], { cwd: wt });
     check('CLI найден', v.code === 0, v.code === 0 ? `${exe} ${v.stdout.trim()}` : `${exe}: код ${v.code} ${v.stderr.trim()}`);
     if (v.code !== 0) return finish(dir, checks);
+    // Флаги, которые SDK 0.1.8 передаёт CLI в сессиях контроллера. Форк без них падает с кодом 1.
+    const help = await exec(exe, ['--help'], { cwd: wt });
+    const helpText = help.stdout + help.stderr;
+    writeFileSync(join(dir, 'cli-help.txt'), helpText);
+    const flags = ['--input-format', '--output-format', '--channel', '--model', '--approval-mode', '--append-system-prompt', '--core-tools', '--exclude-tools', '--include-directories', '--max-session-turns', '--session-id', '--resume'];
+    const missing = flags.filter((f) => !helpText.includes(f));
+    check('CLI понимает флаги SDK', missing.length === 0, missing.length ? `нет в --help: ${missing.join(', ')} (см. ${dir}/cli-help.txt)` : flags.join(' '));
+    if (missing.includes('--input-format')) return finish(dir, checks);
   } else {
     check('CLI найден', true, 'встроенный в @qwen-code/sdk (policy qwen.executable: bundled)');
   }

@@ -10,6 +10,8 @@ export const INJECT_ALL = [
   'gate-red:1', // красный гейт батча 1 → петля «гейты → implementer»
   'batch-revise:1', // REVISE ревью батча 1 → раунд исправлений в той же сессии implementer
   'final-revise', // REVISE финального ревью → исправление через implementer, гейты и ревью заново
+  'artifact-stuck:specs', // одна и та же находка все автоматические раунды → диалог «лимит исчерпан»
+  'batch-stuck:2', // то же для task batch 2 в apply
 ];
 
 export const INJECT_HELP = [...INJECT_ALL, 'kill-after:<stage> — убить контроллер после этапа (проверка resume)'];
@@ -32,6 +34,18 @@ export class Injector {
     s.injected.push(point);
     this.store.save();
     log.inject(point);
+    return true;
+  }
+
+  /** Точка срабатывает times раз подряд (имитация автора, который не сходится). */
+  repeat(point: string, times: number): boolean {
+    const s = this.store.state;
+    if (!s.options.inject.includes(point)) return false;
+    const counts = (s.injectCounts ??= {});
+    if ((counts[point] ?? 0) >= times) return false;
+    counts[point] = (counts[point] ?? 0) + 1;
+    this.store.save();
+    log.inject(`${point} (${counts[point]}/${times})`);
     return true;
   }
 }
