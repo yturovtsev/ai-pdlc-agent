@@ -1,7 +1,8 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AuthType } from '@qwen-code/sdk';
 import { parse } from 'yaml';
+import { KIT, KIT_BIN, deepMerge } from './config.ts';
 import { sha256 } from './util.ts';
 
 export type GateOp = string;
@@ -26,19 +27,45 @@ export interface Policy {
     roleTimeoutMinutes: number;
   };
   git: { branchPrefix: string };
-  gates: { batch: GateOp[]; full: GateOp[] };
+  gates: {
+    /** Операция → shell-команда проекта, выполняется в worktree. */
+    ops: Record<GateOp, string>;
+    batch: GateOp[];
+    full: GateOp[];
+  };
+  /** Где acceptance-tester пишет тесты и evidence, и на чём. */
+  acceptance: { dir: string; framework: string };
   roles: Record<string, RolePolicy>;
   denyAll: string[];
+  /** Файлы, из которых собрана policy: kit и, если есть, целевой репозиторий. */
+  sources: string[];
   sha: string;
 }
 
-export function loadPolicy(repoRoot: string): Policy {
-  const text = readFileSync(join(repoRoot, '.agentflow/policy.yaml'), 'utf8');
-  const p = parse(text) as Omit<Policy, 'sha'>;
-  for (const key of ['qwen', 'openspec', 'limits', 'git', 'gates', 'roles'] as const) {
-    if (!p[key]) throw new Error(`.agentflow/policy.yaml: нет секции ${key}`);
+/** Policy kit, поверх неё .agentflow/policy.yaml целевого репозитория (объекты сливаются, списки заменяются). */
+export function loadPolicy(repo: string): Policy {
+  const files = [join(KIT, '.agentflow/policy.yaml')];
+  const own = join(repo, '.agentflow/policy.yaml');
+  if (own !== files[0] && existsSync(own)) files.push(own);
+  const texts = files.map((f) => readFileSync(f, 'utf8'));
+  const p = texts.map((t) => parse(t) ?? {}).reduce((acc, x) => deepMerge(acc, x)) as Omit<Policy, 'sha' | 'sources'>;
+  for (const key of ['qwen', 'openspec', 'limits', 'git', 'gates', 'roles', 'acceptance'] as const) {
+    if (!p[key]) throw new Error(`policy: нет секции ${key} (${files.join(' + ')})`);
   }
-  return { ...p, denyAll: p.denyAll ?? [], sha: sha256(text) };
+  for (const op of [...p.gates.batch, ...p.gates.full]) {
+    if (!p.gates.ops?.[op]) throw new Error(`policy: гейт ${op} не описан в gates.ops`);
+  }
+  return { ...p, denyAll: p.denyAll ?? [], sources: files, sha: sha256(texts.join('\n---\n')) };
+}
+
+/**
+ * Окружение сессий ролей и гейтов: agentflow-gate в PATH и команды операций.
+ * Роль вызывает `agentflow-gate lint`, скрипт исполняет AGENTFLOW_GATE_LINT.
+ */
+export function gateEnv(policy: Policy): Record<string, string> {
+  const env: Record<string, string> = { PATH: `${KIT_BIN}:${process.env['PATH'] ?? ''}`, AGENTFLOW_KIT: KIT };
+  for (const [op, cmd] of Object.entries(policy.gates.ops)) env[`AGENTFLOW_GATE_${op.toUpperCase().replace(/-/g, '_')}`] = cmd;
+  return env;
 }
 
 /** --auth-type для SDK: только если задан в policy (корпоративный CLI обычно преднастроен). */

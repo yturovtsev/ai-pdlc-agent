@@ -1,15 +1,31 @@
 schema: agentflow
 
 context: |
-  Артефакты пиши на русском языке. Заголовки дельт и ключевые слова OpenSpec
-  оставляй на английском: "## ADDED Requirements", "### Requirement:",
-  "#### Scenario:", SHALL/MUST, WHEN/THEN.
-  Проект — небольшая ESM-библиотека на JavaScript (src/), unit-тесты на node:test
-  в test/, acceptance-тесты в e2e/. Сборки нет; проверки — tools/agentflow/run.sh.
+  Артефакты пиши на русском языке. Заголовки дельт и ключевые слова OpenSpec оставляй на
+  английском: "## ADDED Requirements", "### Requirement:", "#### Scenario:", SHALL/MUST, WHEN/THEN.
+
+  В репозитории две части; change почти всегда затрагивает одну из них.
+  1. Конвейер agentflow (tools/agentflow/, TypeScript ESM на tsx, без сборки) — контроллер
+     spec-driven разработки на @qwen-code/sdk 0.1.8 и корпоративном CLI gigacode. Поведение
+     описано в openspec/specs/ (pipeline-orchestration, role-sessions, spec-phase,
+     review-contract, apply-phase, human-decisions, target-repo); устройство и неочевидные
+     факты — в AGENTS.md. Проверки: npm run typecheck, npm run lint, npm run test:agentflow
+     (node:test, офлайн), mock-прогон run --mock --auto-approve --inject all.
+  2. Демо-библиотека (src/, ESM JavaScript) — цель конвейера для тестовых задач из tasks/.
+     Unit-тесты — node:test в test/, acceptance — e2e/, гейты — tools/agentflow/run.sh
+     (eslint, node --test). Публичный API реэкспортируется из src/index.js.
+
+  Тексты для человека и комментарии в коде — по-русски. Решения человека в конвейере — меню
+  с рекомендуемым вариантом и обоснованием; новый цикл обязан иметь диалог после авто-лимита.
 
 rules:
   proposal:
     - Явно перечисли, что вне scope
+    - Укажи, какую часть репозитория меняет change — конвейер или демо-библиотеку
+  specs:
+    - Для конвейера — дельты к существующим capability в openspec/specs/, а не новые дубли
+  design:
+    - Для конвейера назови модули tools/agentflow/, которые меняются, и как изменение проверяется mock-прогоном
   tasks:
     - Одна группа "## N." — один task batch из 1-4 задач
     - Не планируй e2e-тесты, их пишет acceptance-tester по test-plan.md

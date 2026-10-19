@@ -2,7 +2,11 @@
 //   npm run test:agentflow
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTasks } from './context-builder.ts';
+import { batchesFromTasks, parseTasks } from './context-builder.ts';
+import { deepMerge } from './config.ts';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { decide, validateReview, type Expectation } from './review-validator.ts';
 import { decideAcl, type RoleRuntime } from './roles.ts';
 import { normalize } from './snapshot.ts';
@@ -83,9 +87,10 @@ const rt = {
   contextsDir: '/w/ctx',
   ledger: () => {},
   policy: {
+    acceptance: { dir: 'e2e', framework: '' },
     roles: {
       'spec-author': { write: ['openspec/changes/{change}/**'], shell: [] },
-      implementer: { write: ['**'], denyWrite: ['openspec/**', 'e2e/**'], shell: ['lint', 'unit'] },
+      implementer: { write: ['**'], denyWrite: ['openspec/**', '{acceptance}/**'], shell: ['lint', 'unit'] },
       'code-reviewer': { write: [], shell: [] },
     },
   },
@@ -100,9 +105,11 @@ test('ACL: implementer не пишет в спеку и e2e, вне worktree и 
   assert.ok(decideAcl(rt, 'implementer', false, 'edit', { file_path: 'src/a.js' }).ok);
   assert.equal(decideAcl(rt, 'implementer', false, 'edit', { file_path: 'openspec/changes/add-x/tasks.md' }).ok, false);
   assert.equal(decideAcl(rt, 'implementer', false, 'write_file', { file_path: '/etc/passwd' }).ok, false);
-  assert.ok(decideAcl(rt, 'implementer', false, 'run_shell_command', { command: './tools/agentflow/run.sh lint' }).ok);
-  assert.equal(decideAcl(rt, 'implementer', false, 'run_shell_command', { command: './tools/agentflow/run.sh e2e' }).ok, false);
-  assert.equal(decideAcl(rt, 'implementer', false, 'run_shell_command', { command: './tools/agentflow/run.sh lint && git push' }).ok, false);
+  assert.equal(decideAcl(rt, 'implementer', false, 'edit', { file_path: 'e2e/a.test.js' }).ok, false);
+  assert.ok(decideAcl(rt, 'implementer', false, 'run_shell_command', { command: 'agentflow-gate lint' }).ok);
+  assert.equal(decideAcl(rt, 'implementer', false, 'run_shell_command', { command: 'agentflow-gate e2e' }).ok, false);
+  assert.equal(decideAcl(rt, 'implementer', false, 'run_shell_command', { command: 'agentflow-gate lint && git push' }).ok, false);
+  assert.equal(decideAcl(rt, 'implementer', false, 'run_shell_command', { command: 'npm run lint' }).ok, false);
 });
 
 test('ACL: ревьюер не пишет, шаг readOnly не пишет никому', () => {
@@ -123,4 +130,24 @@ test('glob', () => {
   assert.ok(globToRegExp('openspec/changes/a/**').test('openspec/changes/a/specs/x/spec.md'));
   assert.ok(globToRegExp('specs/**/*.md').test('specs/x/spec.md'));
   assert.equal(globToRegExp('e2e/**').test('src/e2e.js'), false);
+});
+
+test('батчи из задач OpenSpec: по заголовкам, выполненные задачи сохраняют done', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agentflow-'));
+  const file = join(dir, 'tasks.md');
+  writeFileSync(file, '# Tasks\n\n## 1. Ядро\n\n- [ ] 1.1 Сделать a\n- [x] 1.2 Сделать b\n\n## Экспорт\n- [ ] Экспорт без номера\n');
+  const b = batchesFromTasks([
+    { id: '1', description: '1.1 Сделать a', done: false, sourcePath: file, line: 5 },
+    { id: '2', description: '1.2 Сделать b', done: true, sourcePath: file, line: 6 },
+    { id: '3', description: 'Экспорт без номера', done: false, sourcePath: file, line: 9 },
+  ]);
+  assert.deepEqual(b.map((x) => [x.id, x.title, x.tasks.map((t) => [t.id, !!t.done])]), [
+    ['1', 'Ядро', [['1.1', false], ['1.2', true]]],
+    ['2', 'Экспорт', [['2.1', false]]],
+  ]);
+});
+
+test('policy репозитория сливается с policy kit: объекты — по ключам, списки — заменой', () => {
+  const merged = deepMerge({ gates: { ops: { lint: 'a', unit: 'b' }, batch: ['lint', 'unit'] }, x: 1 }, { gates: { ops: { lint: 'npm run lint' }, batch: ['lint'] } });
+  assert.deepEqual(merged, { gates: { ops: { lint: 'npm run lint', unit: 'b' }, batch: ['lint'] }, x: 1 });
 });

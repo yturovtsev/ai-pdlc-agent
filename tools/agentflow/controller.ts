@@ -7,7 +7,7 @@
 //   npm run agentflow -- status [<run-id>]
 //   npm run agentflow -- agents [<run-id>]
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { stringify } from 'yaml';
 import {
@@ -20,7 +20,7 @@ import {
   implementerPrompt,
   indexRequirements,
   loadRubric,
-  parseTasks,
+  batchesFromTasks,
   specReviewPrompt,
   writeContext,
   type BaseCtx,
@@ -28,6 +28,7 @@ import {
   type TaskBatch,
 } from './context-builder.ts';
 import { showAgents } from './agents.ts';
+import { KIT, resolveRepo } from './config.ts';
 import { runGates, gatesSummary, type GateResult } from './gates.ts';
 import { addWorktree, changedPaths, commitAll, diff, diffNoIndex, ensureRepo, head } from './git.ts';
 import { Human } from './human.ts';
@@ -38,12 +39,13 @@ import { OpenSpec, topoOrder, type ArtifactNode } from './openspec.ts';
 import { loadPolicy, qwenExecutable, type Policy } from './policy.ts';
 import { printLoopSummary, writeAcceptanceReport } from './report.ts';
 import { decide, countBySeverity, validateReview, type Decision, type Expectation, type Review, type ReviewFinding } from './review-validator.ts';
-import { loadRoles, runRole, type RoleDef, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
+import { expandGlob, loadRoles, roleFiles, runRole, type RoleDef, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
 import { artifactFiles, artifactSnapshot, artifactText, codeSnapshot, specDigest } from './snapshot.ts';
 import { RunStore, STAGES, type BatchState, type Finding, type RunState, type Stage } from './state.ts';
 import { Blocked, exec, extractJson, matchesAny, now, oneLine, sha256, short, stamp } from './util.ts';
 
-const ROOT = resolve(import.meta.dirname, '../..');
+/** Целевой репозиторий: git-корень, из которого запущен agentflow (или --repo). Задаётся в main. */
+let ROOT = KIT;
 const ROLE_NAMES = ['spec-author', 'spec-reviewer', 'implementer', 'code-reviewer', 'acceptance-tester'];
 
 interface Ctx {
@@ -61,6 +63,8 @@ interface Ctx {
   human: Human;
   inject: Injector;
   graph: ArtifactNode[];
+  /** Артефакты, которые требует apply (файл задач) — из схемы репозитория. */
+  tracked: Set<string>;
 }
 
 const st = (ctx: Ctx): RunState => ctx.store.state;
@@ -269,6 +273,11 @@ function honorWaivers(ctx: Ctx, loop: string, snapshot: string, d: Decision): De
   return { ...d, blocking, verdict: d.verdict === 'REVISE' && !blocking.length ? 'PASS' : d.verdict, reason: `${d.reason}; снято waiver: ${d.blocking.length - blocking.length}` };
 }
 
+/** Сколько раз по этой петле уже открывался диалог исчерпания: с третьего раза рекомендуется остановиться. */
+function exhaustedBefore(ctx: Ctx, gate: string): number {
+  return st(ctx).decisions.filter((d) => d.gate === gate).length;
+}
+
 /** Одни и те же находки два раунда подряд — автор не сходится. */
 function stuck(history: string[][]): boolean {
   const [a, b] = history.slice(-2);
@@ -315,7 +324,9 @@ async function validateArtifact(ctx: Ctx, n: ArtifactNode, loop: string, round: 
   if (!files.length) out.push(vf(`не создан ни один файл ${n.outputPath}`, `${changeDir(ctx)}/${n.outputPath}`));
   const status = (await ctx.os.artifacts(st(ctx).change)).find((a) => a.id === n.id);
   if (files.length && status?.status !== 'done') out.push(vf(`openspec status: артефакт в статусе ${status?.status}`, `${changeDir(ctx)}/${n.outputPath}`));
-  const specsReady = n.id === 'specs' || st(ctx).spec.artifacts['specs']?.status === 'accepted';
+  // openspec validate осмыслен, когда в change есть дельты specs/ (артефакт схемы, пишущий в specs/).
+  const specsNode = ctx.graph.find((x) => x.outputPath.startsWith('specs/'));
+  const specsReady = !!specsNode && (n.id === specsNode.id || st(ctx).spec.artifacts[specsNode.id]?.status === 'accepted');
   if (files.length && specsReady) {
     const v = await ctx.os.validate(st(ctx).change);
     if (!v.valid) {
@@ -323,9 +334,8 @@ async function validateArtifact(ctx: Ctx, n: ArtifactNode, loop: string, round: 
       for (const i of errors.length ? errors : v.issues) out.push(vf(`openspec validate --strict: ${i.message}`, `${changeDir(ctx)}/${i.path}`));
     }
   }
-  if (n.id === 'tasks' && files.length) {
-    const batches = parseTasks(readFileSync(join(changeDirAbs(ctx), 'tasks.md'), 'utf8'));
-    if (!batches.length) out.push(vf('tasks.md: нет групп "## N. Название" с задачами "- [ ] N.M описание"', `${changeDir(ctx)}/tasks.md`));
+  if (ctx.tracked.has(n.id) && files.length && !(await ctx.os.applyTasks(st(ctx).change)).length) {
+    out.push(vf(`openspec instructions apply: в ${n.outputPath} не найдено ни одной задачи-чекбокса`, `${changeDir(ctx)}/${n.outputPath}`));
   }
   return out;
 }
@@ -423,7 +433,10 @@ async function artifactExhausted(ctx: Ctx, n: ArtifactNode, round: number, toFix
   const validatorOnly = toFix.length > 0 && toFix.every((f) => f.source === 'validator');
   const reviewerFs = toFix.filter((f) => f.source === 'spec-reviewer' || f.source === 'inject');
   const disputed = reviewerFs.length > 0 && reviewerFs.every((f) => f.response?.resolution === 'disputed');
-  const [recommended, rationale] = validatorOnly
+  const repeated = exhaustedBefore(ctx, `exhausted:${n.id}`);
+  const [recommended, rationale] = repeated >= 2
+    ? (['stop', `лимит исчерпан уже ${repeated + 1}-й раз — продление не помогает, нужен разбор человеком`] as const)
+    : validatorOnly
     ? (['hint', 'не проходит детерминированная валидация OpenSpec — автору нужен точный ориентир'] as const)
     : disputed
       ? (['waive', 'автор оспорил все оставшиеся находки с доказательствами — спор решаешь ты'] as const)
@@ -490,7 +503,7 @@ async function artifactLoop(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { 
     const before = artifactText(changeDirAbs(ctx), n.outputPath);
 
     if (reviewOnly) {
-      log.step('редакция изменилась вне автора (ты или upstream): ревью без генерации');
+      log.step('артефакт уже написан (существующий change, твоя правка или изменённый upstream): сначала ревью, без генерации');
     } else {
       ctx.store.setStep(`spec:${n.id}:generate`);
       const instructions = await ctx.os.instructions(n.id, s.change);
@@ -501,9 +514,10 @@ async function artifactLoop(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { 
         max: Math.max(budget, round),
         instructions,
         upstream: upstreamOf(ctx, n),
-        rubric: loadRubric(ctx.wt, n.id),
+        rubric: loadRubric(ctx.root, n.id),
         findings: toFix,
         exists: artifactFiles(changeDirAbs(ctx), n.outputPath).length > 0,
+        tracked: ctx.tracked.has(n.id),
       });
       const res = await callRole(ctx, 'spec-author', prompt, { kind: 'author', artifact: n.id, generates: n.outputPath, changeDir: changeDir(ctx), round }, {
         label: `spec-${n.id}-r${a.rounds}-author`,
@@ -542,7 +556,7 @@ async function artifactLoop(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { 
       }
 
       ctx.store.setStep(`spec:${n.id}:review`);
-      const rubric = loadRubric(ctx.wt, n.id);
+      const rubric = loadRubric(ctx.root, n.id);
       const files = artifactFiles(changeDirAbs(ctx), n.outputPath);
       let review = await callReviewer(
         ctx,
@@ -685,7 +699,7 @@ async function holisticLoop(ctx: Ctx): Promise<void> {
     ctx.store.setStep('spec:holistic:review');
     const snap = currentDigest(ctx);
     log.step(`digest пакета ${short(snap)}`);
-    const rubric = loadRubric(ctx.wt, 'holistic');
+    const rubric = loadRubric(ctx.root, 'holistic');
     const reqs = indexRequirements(changeDirAbs(ctx), changeDir(ctx));
     const artifacts = ctx.graph.map((n) => ({ id: n.id, files: artifactFiles(changeDirAbs(ctx), n.outputPath) }));
     let review = await callReviewer(
@@ -735,8 +749,13 @@ async function holisticLoop(ctx: Ctx): Promise<void> {
           { key: 'waive', label: 'Снять оставшиеся находки сквозного ревью с причиной (waiver)' },
           { key: 'stop', label: 'Остановить run (BLOCKED, потом resume)' },
         ],
-        recommended: stuck(history) ? 'waive' : 'more',
-        rationale: stuck(history) ? 'те же находки повторяются после исправлений — вероятно, спорные; реши сам' : 'находки меняются — пакет сходится',
+        recommended: exhaustedBefore(ctx, 'exhausted:holistic') >= 2 ? 'stop' : stuck(history) ? 'waive' : 'more',
+        rationale:
+          exhaustedBefore(ctx, 'exhausted:holistic') >= 2
+            ? 'лимит исчерпан уже не первый раз — продление не помогает, нужен разбор человеком'
+            : stuck(history)
+              ? 'те же находки повторяются после исправлений — вероятно, спорные; реши сам'
+              : 'находки меняются — пакет сходится',
       });
       s.decisions.push({ at: now(), gate: 'exhausted:holistic', decision: k });
       if (k === 'stop') throw new Blocked(`сквозное ревью: остановлено человеком после ${round} раундов`);
@@ -756,6 +775,11 @@ async function holisticLoop(ctx: Ctx): Promise<void> {
 
 async function stageClarify(ctx: Ctx): Promise<void> {
   if (!st(ctx).options.clarify) return;
+  const written = ctx.graph.filter((n) => artifactFiles(changeDirAbs(ctx), n.outputPath).length);
+  if (written.length) {
+    log.step(`change уже содержит артефакты (${written.map((n) => n.id).join(', ')}) — уточнение intent пропущено`);
+    return;
+  }
   log.phase('ФАЗА СПЕКИ · уточнение intent');
   ctx.store.setStep('clarify');
   const res = await callRole(ctx, 'spec-author', clarifyPrompt(base(ctx)), { kind: 'clarify' }, { label: 'clarify', readOnly: true });
@@ -775,7 +799,8 @@ async function stageSpec(ctx: Ctx): Promise<void> {
   for (const n of ctx.graph) {
     const a = st(ctx).spec.artifacts[n.id];
     if (a?.status === 'accepted' && a.snapshot === snapshotOf(ctx, n)) continue;
-    await artifactLoop(ctx, n, [], { reviewFirst: a?.status === 'accepted' });
+    // Уже написанный артефакт (существующий change, resume) сначала ревьюится, а не пишется заново.
+    await artifactLoop(ctx, n, [], { reviewFirst: artifactFiles(changeDirAbs(ctx), n.outputPath).length > 0 });
   }
   log.info(c.green('все артефакты приняты тобой → сквозное ревью новым экземпляром spec-reviewer'));
   if (!st(ctx).spec.holisticPassed || st(ctx).spec.holisticDigest !== currentDigest(ctx)) await holisticLoop(ctx);
@@ -901,7 +926,7 @@ function specFiles(ctx: Ctx): string[] {
 /** Изменённые файлы против ACL роли: защита второй линии поверх canUseTool. */
 async function checkBoundary(ctx: Ctx, roleName: string): Promise<void> {
   const rp = ctx.policy.roles[roleName]!;
-  const sub = (g: string) => g.replaceAll('{change}', st(ctx).change);
+  const sub = (g: string) => expandGlob(g, st(ctx).change, ctx.policy);
   const bad = (await changedPaths(ctx.wt)).filter((p) => !matchesAny(p, rp.write.map(sub)) || matchesAny(p, (rp.denyWrite ?? []).map(sub)));
   if (bad.length) throw new Blocked(`${roleName} изменил файлы вне своих полномочий: ${bad.join(', ')}`);
 }
@@ -949,6 +974,7 @@ async function implementWithGates(
     log.step(`гейты ${ctx.policy.gates.batch.join(', ')} · попытка ${attempt}/${attempts}`);
     gates = await runGates(ctx.policy.gates.batch, {
       cwd: ctx.wt,
+      policy: ctx.policy,
       logDir: ctx.gatesDir,
       step: `${a.label}-a${attempt}`,
       injectRed: attempt === 1 && ctx.inject.take(`gate-red:${a.batch.id}`),
@@ -967,6 +993,18 @@ async function implementWithGates(
   return { green: false, session, gates };
 }
 
+/** Отметить задачи в файле задач, как принято в OpenSpec; digest спеки галочки нормализует. */
+function tickTasks(tasks: { done: boolean; file?: string; line?: number }[]): void {
+  const byFile = new Map<string, number[]>();
+  for (const t of tasks) if (t.done && t.file && t.line) byFile.set(t.file, [...(byFile.get(t.file) ?? []), t.line]);
+  for (const [file, lines] of byFile) {
+    if (!existsSync(file)) continue;
+    const src = readFileSync(file, 'utf8').split('\n');
+    for (const l of lines) if (src[l - 1] !== undefined) src[l - 1] = src[l - 1]!.replace(/^(\s*[-*]\s+)\[ \]/, '$1[x]');
+    writeFileSync(file, src.join('\n'));
+  }
+}
+
 /** Автоматические раунды батча или финала кончились: что дальше — решаешь ты. */
 async function applyExhausted(
   ctx: Ctx,
@@ -976,7 +1014,10 @@ async function applyExhausted(
   history: string[][],
   gateFailed: boolean,
 ): Promise<{ kind: 'more' | 'fresh'; hint?: string }> {
-  const [recommended, rationale] = gateFailed
+  const repeated = exhaustedBefore(ctx, `exhausted:${what}`);
+  const [recommended, rationale] = repeated >= 2
+    ? (['stop', `лимит исчерпан уже ${repeated + 1}-й раз — смена условий не помогает, нужен разбор человеком`] as const)
+    : gateFailed
     ? (['fresh', 'гейты красные после всех попыток — нужен свежий контекст и сводка провалов'] as const)
     : stuck(history)
       ? (['hint', 'одни и те же находки два раунда подряд — implementer не сходится без твоего ориентира'] as const)
@@ -1059,7 +1100,7 @@ async function batchLoop(ctx: Ctx, b: BatchState): Promise<void> {
       log.step(`коммит ${headSha.slice(0, 10)} · snapshot кода ${short(snap)} (base ${b.base.slice(0, 8)} → head ${headSha.slice(0, 8)})`);
 
       ctx.store.setStep(`apply:${b.id}:review`);
-      const rubric = loadRubric(ctx.wt, 'batch');
+      const rubric = loadRubric(ctx.root, 'batch');
       let review = await callReviewer(
         ctx,
         'code-reviewer',
@@ -1097,8 +1138,9 @@ async function batchLoop(ctx: Ctx, b: BatchState): Promise<void> {
       }
       if (d.verdict === 'PASS') {
         b.status = 'done';
-        b.head = headSha;
         for (const t of b.tasks) t.done = true;
+        tickTasks(b.tasks);
+        b.head = await commitAll(ctx.wt, `agentflow(${st(ctx).change}): batch ${b.id} выполнен`);
         ctx.store.save();
         log.verdict('PASS', counts, 'батч принят');
         log.loopClose(`batch ${b.id} принят на раунде ${round}`);
@@ -1120,29 +1162,41 @@ async function batchLoop(ctx: Ctx, b: BatchState): Promise<void> {
 }
 
 async function stageApply(ctx: Ctx): Promise<void> {
-  log.phase('ФАЗА APPLY · task batches по tasks.md');
+  log.phase('ФАЗА APPLY · task batches из файла задач схемы');
   verifyFreeze(ctx);
   const s = st(ctx);
   if (!s.apply.batches.length) {
-    const batches = parseTasks(readFileSync(join(changeDirAbs(ctx), 'tasks.md'), 'utf8'));
-    s.apply.batches = batches.map((b) => ({ id: b.id, title: b.title, tasks: b.tasks.map((t) => ({ ...t, done: false })), status: 'pending', rounds: 0 }));
+    // Задачи разбирает сам OpenSpec по apply.tracks схемы; уже отмеченные считаются выполненными.
+    const batches = batchesFromTasks(await ctx.os.applyTasks(s.change));
+    if (!batches.length) throw new Blocked('openspec instructions apply: в change нет задач');
+    s.apply.batches = batches.map((b) => {
+      const tasks = b.tasks.map((t) => ({ id: t.id, text: t.text, done: !!t.done, file: t.file, line: t.line }));
+      return { id: b.id, title: b.title, tasks, status: tasks.every((t) => t.done) ? 'done' : 'pending', rounds: 0 };
+    });
     ctx.store.save();
   }
-  log.info(`батчей: ${s.apply.batches.length} — ${s.apply.batches.map((b) => `${b.id}. ${b.title}`).join('; ')}`);
+  log.info(`батчей: ${s.apply.batches.length} — ${s.apply.batches.map((b) => `${b.id}. ${b.title}${b.status === 'done' ? ' (уже выполнен)' : ''}`).join('; ')}`);
   for (const b of s.apply.batches) if (b.status !== 'done') await batchLoop(ctx, b);
   log.info(c.green('все батчи PASS → acceptance'));
 }
 
 // ───────────────────────────── acceptance и финал ─────────────────────────────
 
+/** Артефакт схемы с планом приёмки (test-plan и подобные), если он есть. */
+function testPlanNode(ctx: Ctx): ArtifactNode | undefined {
+  return ctx.graph.find((n) => /test|acceptance|qa/i.test(n.id) || /test|acceptance/i.test(n.outputPath));
+}
+
 async function runAcceptance(ctx: Ctx, extra: Finding[], label: string): Promise<Decision> {
   verifyFreeze(ctx);
   const snap = st(ctx).spec.freeze!.digest;
   const reqs = requirements(ctx);
   const scenarioIds = reqs.flatMap((r) => r.scenarios.map((x) => x.id));
-  const rubric = loadRubric(ctx.wt, 'acceptance');
-  const testPlan = `${changeDir(ctx)}/test-plan.md`;
-  let prompt = acceptancePrompt(base(ctx), { reqs, specFiles: specFiles(ctx), testPlan, snapshotId: snap, rubric });
+  const rubric = loadRubric(ctx.root, 'acceptance');
+  const tp = testPlanNode(ctx);
+  const testPlan = tp ? filesOf(ctx, tp).join(', ') : undefined;
+  const acc = ctx.policy.acceptance;
+  let prompt = acceptancePrompt(base(ctx), { reqs, specFiles: specFiles(ctx), testPlan, snapshotId: snap, rubric, dir: acc.dir, framework: acc.framework, shell: ctx.policy.roles['acceptance-tester']?.shell ?? [] });
   if (extra.length) prompt += `\n\n## Находки финального ревью к твоим тестам\n${extra.map((f) => `- ${f.id} ${f.location}: ${f.problem}`).join('\n')}\nИсправь тесты, не ослабляя ожидаемое поведение.`;
   const review = await callReviewer(
     ctx,
@@ -1154,7 +1208,8 @@ async function runAcceptance(ctx: Ctx, extra: Finding[], label: string): Promise
   );
   await checkBoundary(ctx, 'acceptance-tester');
   const commit = await commitAll(ctx.wt, `agentflow(${st(ctx).change}): acceptance-тесты`);
-  if (existsSync(join(ctx.wt, 'e2e/evidence'))) cpSync(join(ctx.wt, 'e2e/evidence'), join(ctx.runDir, 'evidence'), { recursive: true });
+  const evidence = join(ctx.wt, ctx.policy.acceptance.dir, 'evidence');
+  if (existsSync(evidence)) cpSync(evidence, join(ctx.runDir, 'evidence'), { recursive: true });
   const d = decide(review, 'apply');
   applyReview(ctx, 'acceptance', 1, review, d);
   ctx.store.loop('acceptance', 1, d.verdict, d.reason);
@@ -1186,7 +1241,7 @@ async function stageFinal(ctx: Ctx): Promise<void> {
     verifyFreeze(ctx);
     ctx.store.setStep('final:gates');
     log.step(`полные гейты: ${ctx.policy.gates.full.join(', ')}`);
-    const gates = await runGates(ctx.policy.gates.full, { cwd: ctx.wt, logDir: ctx.gatesDir, step: `final-r${round}` });
+    const gates = await runGates(ctx.policy.gates.full, { cwd: ctx.wt, logDir: ctx.gatesDir, step: `final-r${round}`, policy: ctx.policy });
     recordGates(ctx, gates);
     const headSha = await commitAll(ctx.wt, `agentflow(${s.change}): финальные гейты`);
     const diffText = await diff(ctx.wt, s.apply.base!, headSha);
@@ -1195,7 +1250,7 @@ async function stageFinal(ctx: Ctx): Promise<void> {
     const snap = codeSnapshot(s.apply.base!, headSha, diffText);
     log.step(`snapshot ${short(snap)} · head ${headSha.slice(0, 10)}`);
     const reqs = requirements(ctx);
-    const rubric = loadRubric(ctx.wt, 'final');
+    const rubric = loadRubric(ctx.root, 'final');
     ctx.store.setStep('final:review');
     let review = await callReviewer(
       ctx,
@@ -1210,6 +1265,7 @@ async function stageFinal(ctx: Ctx): Promise<void> {
         head: headSha,
         gates: gatesSummary(gates),
         acceptancePath: join(ctx.contextsDir, 'acceptance-report.json'),
+        acceptanceDir: ctx.policy.acceptance.dir,
         rubric,
         snapshotId: snap,
         prior: openFindings(ctx, loop),
@@ -1218,7 +1274,7 @@ async function stageFinal(ctx: Ctx): Promise<void> {
       { role: 'code-reviewer', target: 'final', snapshotId: snap, round, mandatoryChecks: rubric.mandatory, needAssessments: true, requireTrace: reqs.map((r) => r.id) },
       `final-r${round}-review`,
     );
-    if (ctx.inject.take('final-revise')) review = injectRevise(review, 'src/index.js:1', round);
+    if (ctx.inject.take('final-revise')) review = injectRevise(review, `${diffPath}:1`, round);
     const d = decide(review, 'apply');
     applyReview(ctx, loop, round, review, d);
     ctx.store.loop(loop, round, d.verdict, d.reason);
@@ -1244,8 +1300,9 @@ async function stageFinal(ctx: Ctx): Promise<void> {
     }
     if (hint) blocking.push(synthetic(ctx, loop, round, 'human', { problem: `Указание человека: ${hint}`, location: 'final', evidence: 'решение человека' }));
     hint = undefined;
-    const e2e = blocking.filter((f) => f.location.startsWith('e2e/'));
-    const code = blocking.filter((f) => !f.location.startsWith('e2e/'));
+    const accDir = ctx.policy.acceptance.dir.replace(/\/$/, '') + '/';
+    const e2e = blocking.filter((f) => f.location.startsWith(accDir));
+    const code = blocking.filter((f) => !f.location.startsWith(accDir));
     log.verdict('REVISE', countBySeverity(review.findings), `раунд исправлений ${round}/${Math.max(budget - 1, round)}: ${code.length ? 'implementer' : ''}${code.length && e2e.length ? ' + ' : ''}${e2e.length ? 'acceptance-tester' : ''}`);
     if (code.length) {
       const batch: TaskBatch = { id: `final-${round}`, title: 'исправления по финальному ревью', tasks: code.map((f, i) => ({ id: `F.${i + 1}`, text: `${f.id}: ${f.requiredChange ?? f.problem}` })) };
@@ -1259,10 +1316,12 @@ async function stageFinal(ctx: Ctx): Promise<void> {
 }
 
 function manualCheck(ctx: Ctx): string {
-  const p = join(changeDirAbs(ctx), 'test-plan.md');
-  if (!existsSync(p)) return '';
-  const m = readFileSync(p, 'utf8').split(/^## /m).find((x) => x.startsWith('Manual check'));
-  return m ? `В каталоге \`${ctx.wt}\`:\n\n${m.replace(/^Manual check\s*/, '').trim()}` : '';
+  const tp = ctx.graph.length ? testPlanNode(ctx) : undefined;
+  for (const f of tp ? filesOf(ctx, tp) : []) {
+    const m = readFileSync(join(ctx.wt, f), 'utf8').split(/^## /m).find((x) => /^(Manual check|Ручная проверка)/i.test(x));
+    if (m) return `В каталоге \`${ctx.wt}\`:\n\n${m.replace(/^(Manual check|Ручная проверка)\s*/i, '').trim()}`;
+  }
+  return '';
 }
 
 async function stageReport(ctx: Ctx): Promise<void> {
@@ -1308,10 +1367,7 @@ async function stageHumanAcceptance(ctx: Ctx): Promise<void> {
 
 async function stageArchive(ctx: Ctx): Promise<void> {
   log.phase('ARCHIVE');
-  const tasksPath = join(changeDirAbs(ctx), 'tasks.md');
-  const done = new Set(st(ctx).apply.batches.flatMap((b) => b.tasks.filter((t) => t.done).map((t) => t.id)));
-  // Прогресс жил в state.json; галочки ставятся только перед archive (digest их нормализует).
-  writeFileSync(tasksPath, readFileSync(tasksPath, 'utf8').replace(/^(\s*- )\[ \](\s+(\d+\.\d+))/gm, (m, a: string, b: string, id: string) => (done.has(id) ? `${a}[x]${b}` : m)));
+  tickTasks(st(ctx).apply.batches.flatMap((b) => b.tasks));
   const out = await ctx.os.archive(st(ctx).change);
   log.step(out.trim().split('\n').slice(-3).join(' · '));
   const commit = await commitAll(ctx.wt, `agentflow(${st(ctx).change}): archive`);
@@ -1337,17 +1393,16 @@ const STAGE_FN: Record<Stage, (ctx: Ctx) => Promise<void>> = {
 
 // ───────────────────────────── запуск, resume, manifest ─────────────────────────────
 
-function promptsRevision(root: string): string {
-  const files = [
-    ...readdirSync(join(root, '.qwen/agents')).map((f) => join(root, '.qwen/agents', f)),
-    ...readdirSync(join(root, '.agentflow/rubrics')).map((f) => join(root, '.agentflow/rubrics', f)),
-  ].sort();
+/** Ревизия промптов: роли и рубрики kit плюс переопределения целевого репозитория. */
+function promptsRevision(repo: string): string {
+  const rubricDirs = [join(KIT, '.agentflow/rubrics'), join(repo, '.agentflow/rubrics')].filter((d, i, a) => existsSync(d) && a.indexOf(d) === i);
+  const files = [...roleFiles(repo).map((r) => r.path), ...rubricDirs.flatMap((d) => readdirSync(d).map((f) => join(d, f)))].sort();
   return sha256(files.map((f) => readFileSync(f, 'utf8')).join('\n'));
 }
 
-function sdkVersion(root: string): string {
+function sdkVersion(): string {
   try {
-    return (JSON.parse(readFileSync(join(root, 'node_modules/@qwen-code/sdk/package.json'), 'utf8')) as { version: string }).version;
+    return (JSON.parse(readFileSync(join(KIT, 'node_modules/@qwen-code/sdk/package.json'), 'utf8')) as { version: string }).version;
   } catch {
     return 'unknown';
   }
@@ -1358,7 +1413,9 @@ function writeManifest(ctx: Ctx): void {
   const manifest = {
     run: { id: s.runId, change: s.change, createdAt: s.createdAt, mock: s.options.mock, inject: s.options.inject },
     qwen: { executable: qwenExecutable(ctx.policy) ?? 'bundled', sdkVersion: s.versions.sdk, effortViaSdk: ctx.policy.qwen.effortViaSdk },
-    openspec: { version: s.versions.openspec, schema: ctx.policy.openspec.schema },
+    openspec: { version: s.versions.openspec, schema: s.spec.schema ?? ctx.policy.openspec.schema, bin: ctx.os.bin },
+    kit: KIT,
+    policy_sources: ctx.policy.sources,
     git: { branch: s.branch, worktree: s.worktree, base: s.baseCommit },
     models: Object.fromEntries(
       ROLE_NAMES.map((n) => {
@@ -1402,13 +1459,18 @@ function makeCtx(root: string, runDir: string, store: RunStore, policy: Policy, 
     human: new Human(s.options.autoApprove),
     inject: new Injector(store),
     graph: [],
+    tracked: new Set(),
   };
 }
 
 async function pipeline(ctx: Ctx): Promise<void> {
   const s = st(ctx);
-  ctx.graph = topoOrder(await ctx.os.artifacts(s.change));
+  const status = await ctx.os.status(s.change);
+  ctx.graph = topoOrder(status.artifacts);
+  ctx.tracked = new Set(status.applyRequires);
   s.spec.order = ctx.graph.map((n) => n.id);
+  s.spec.schema = status.schemaName;
+  log.info(`схема OpenSpec: ${status.schemaName} · артефакты: ${ctx.graph.map((n) => n.id).join(' → ')} · apply требует: ${status.applyRequires.join(', ') || '—'}`);
   ctx.store.save();
   try {
     for (const stage of STAGES) {
@@ -1419,7 +1481,7 @@ async function pipeline(ctx: Ctx): Promise<void> {
       s.stagesDone.push(stage);
       ctx.store.save();
       if (ctx.inject.take(`kill-after:${stage}`)) {
-        log.error(`контроллер убит после этапа ${stage}; продолжи: npm run agentflow -- resume ${s.runId}`);
+        log.error(`контроллер убит после этапа ${stage}; продолжи: agentflow resume ${s.runId}`);
         process.exit(137);
       }
     }
@@ -1439,13 +1501,13 @@ async function pipeline(ctx: Ctx): Promise<void> {
     writeAcceptanceReport(ctx.runDir, s, manualCheck(ctx));
     writeManifest(ctx);
     printLoopSummary(s);
-    console.log(`\nпричина записана в ${ctx.store.statePath}; продолжить после исправления: npm run agentflow -- resume ${s.runId}`);
+    console.log(`\nпричина записана в ${ctx.store.statePath}; продолжить после исправления: agentflow resume ${s.runId}`);
     process.exitCode = 2;
   }
 }
 
 function readIntent(arg: string): { text: string; change?: string; source: string } {
-  const path = resolve(process.cwd(), arg);
+  const path = resolve(process.env['INIT_CWD'] ?? process.cwd(), arg);
   if (!existsSync(path)) return { text: arg, source: 'argv' };
   const raw = readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
   const m = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
@@ -1454,17 +1516,32 @@ function readIntent(arg: string): { text: string; change?: string; source: strin
   return { text: (m ? m[2]! : raw).trim(), change: change ?? fallback, source: arg };
 }
 
-async function startRun(args: { intent: string; change?: string; autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[] }): Promise<void> {
+/** Intent существующего change: его первый артефакт (обычно proposal) или README. */
+function intentFromChange(dir: string, change: string): string {
+  for (const f of ['proposal.md', 'README.md']) {
+    const p = join(dir, f);
+    if (existsSync(p)) return `Существующий change «${change}»: доведи его до приёмки по схеме репозитория.\n\n${readFileSync(p, 'utf8').trim()}`;
+  }
+  return `Существующий change «${change}»: доведи его до приёмки по схеме репозитория.`;
+}
+
+async function startRun(args: { intent?: string; change?: string; autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[] }): Promise<void> {
   await ensureRepo(ROOT);
+  if (!existsSync(join(ROOT, 'openspec'))) throw new Error(`в ${ROOT} нет openspec/: выполни agentflow init (или openspec init)`);
   const policy = loadPolicy(ROOT);
   const roles = loadRoles(ROOT);
-  for (const n of ROLE_NAMES) if (!roles.has(n)) throw new Error(`нет файла роли .qwen/agents/${n}.md`);
+  for (const n of ROLE_NAMES) if (!roles.has(n)) throw new Error(`нет файла роли ${n}.md ни в kit, ни в .agentflow/agents/`);
   const dirty = (await changedPaths(ROOT)).filter((p) => !p.startsWith('.agentflow-runs/'));
-  if (dirty.length) log.warn(`незакоммиченные изменения в основном репозитории не попадут в worktree: ${dirty.slice(0, 5).join(', ')}${dirty.length > 5 ? '…' : ''}`);
 
-  const intent = readIntent(args.intent);
-  const change = args.change ?? intent.change ?? 'change';
+  const intent = args.intent ? readIntent(args.intent) : undefined;
+  const change = args.change ?? intent?.change;
+  if (!change) throw new Error('укажи intent (файл или текст) и/или --change <id> существующего change');
   if (!/^[a-z0-9][a-z0-9-]*$/.test(change)) throw new Error(`id change "${change}" должен быть kebab-case`);
+  const mainChangeDir = join(ROOT, 'openspec/changes', change);
+  const existing = existsSync(mainChangeDir);
+  if (!intent && !existing) throw new Error(`change ${change} не найден в openspec/changes/: для нового change нужен intent`);
+  const intentText = intent?.text ?? intentFromChange(mainChangeDir, change);
+
   const runStamp = stamp();
   const runId = `${runStamp}-${change}`;
   const runDir = join(ROOT, '.agentflow-runs', runId);
@@ -1474,6 +1551,17 @@ async function startRun(args: { intent: string; change?: string; autoApprove: bo
   const branch = `${policy.git.branchPrefix}${change}${branchExists ? '-' + runStamp : ''}`;
   await addWorktree(ROOT, wt, branch);
   const baseCommit = await head(wt);
+
+  // Незакоммиченное состояние OpenSpec основного дерева (сам change, config, схемы) переносится в worktree.
+  const carry = dirty.filter((p) => p.startsWith('openspec/') && (!p.startsWith('openspec/changes/') || p.startsWith(`openspec/changes/${change}/`)));
+  for (const p of carry) {
+    const from = join(ROOT, p);
+    if (!existsSync(from)) continue;
+    mkdirSync(dirname(join(wt, p)), { recursive: true });
+    cpSync(from, join(wt, p));
+  }
+  const otherDirty = dirty.filter((p) => !carry.includes(p));
+  if (otherDirty.length) log.warn(`незакоммиченные изменения вне openspec/ не попадут в worktree: ${otherDirty.slice(0, 5).join(', ')}${otherDirty.length > 5 ? '…' : ''}`);
 
   const store = new RunStore(runDir);
   const os = new OpenSpec(ROOT, wt);
@@ -1490,9 +1578,9 @@ async function startRun(args: { intent: string; change?: string; autoApprove: bo
     branch,
     baseCommit,
     options: { autoApprove: args.autoApprove, mock: args.mock, clarify: args.clarify, inject: args.inject },
-    versions: { prompts: promptsRevision(ROOT), policy: policy.sha, sdk: sdkVersion(ROOT), openspec: await os.version() },
+    versions: { prompts: promptsRevision(ROOT), policy: policy.sha, sdk: sdkVersion(), openspec: await os.version() },
     stagesDone: [],
-    intent: { source: intent.source, text: intent.text, clarifications: [] },
+    intent: { source: intent?.source ?? `openspec/changes/${change}`, text: intentText, clarifications: [] },
     spec: { order: [], artifacts: {}, holisticPassed: false, questions: [] },
     apply: { batches: [] },
     findings: [],
@@ -1504,14 +1592,16 @@ async function startRun(args: { intent: string; change?: string; autoApprove: bo
     injected: [],
   };
   store.save();
-  writeFileSync(join(runDir, 'intent.md'), intent.text + '\n');
-  await os.newChange(change, policy.openspec.schema, intent.text.split('\n')[0]!.slice(0, 120));
+  writeFileSync(join(runDir, 'intent.md'), intentText + '\n');
+  if (!existing) await os.newChange(change, policy.openspec.schema || undefined, intentText.split('\n')[0]!.slice(0, 120));
 
   const ctx = makeCtx(ROOT, runDir, store, policy, roles);
   writeManifest(ctx);
   log.phase(`agentflow · run ${runId}`);
-  log.info(`change ${c.bold(change)} · ветка ${branch} · worktree ${wt}`);
-  log.info(`CLI: ${qwenExecutable(policy) ?? 'встроенный в SDK'} · SDK ${store.state.versions.sdk} · OpenSpec ${store.state.versions.openspec}${args.mock ? c.yellow(' · MOCK-роли') : ''}`);
+  log.info(`репозиторий ${c.bold(ROOT)} · change ${c.bold(change)}${existing ? ' (существующий)' : ' (новый)'} · ветка ${branch}`);
+  log.info(`worktree ${wt}${carry.length ? ` · перенесено незакоммиченное из openspec/: ${carry.length} файлов` : ''}`);
+  log.info(`kit ${KIT} · policy: ${policy.sources.join(' + ')}`);
+  log.info(`CLI: ${qwenExecutable(policy) ?? 'встроенный в SDK'} · SDK ${store.state.versions.sdk} · OpenSpec ${store.state.versions.openspec} (${os.bin})${args.mock ? c.yellow(' · MOCK-роли') : ''}`);
   for (const n of ROLE_NAMES) {
     const r = roles.get(n)!;
     log.info(`  ${n.padEnd(18)} → ${r.model} · effort ${policy.qwen.effortViaSdk ? r.effort ?? 'по умолчанию' : 'по умолчанию (effortViaSdk: false)'} · ${r.file}`);
@@ -1558,18 +1648,128 @@ function showStatus(runId?: string): void {
   printLoopSummary(s);
 }
 
-const USAGE = `agentflow — контроллер конвейера spec-driven разработки на Qwen Code
+function gateTemplate(repo: string): Record<string, string> {
+  const todo = (op: string) => `echo "TODO: задай gates.ops.${op} в .agentflow/policy.yaml" >&2; exit 1`;
+  let scripts: Record<string, string> = {};
+  try {
+    scripts = (JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8')) as { scripts?: Record<string, string> }).scripts ?? {};
+  } catch {
+    // не JS-проект: команды задаются вручную
+  }
+  const e2e = ['test:e2e', 'e2e', 'test:acceptance'].find((k) => scripts[k]);
+  return {
+    lint: scripts['lint'] ? 'npm run lint' : todo('lint'),
+    unit: scripts['test'] ? 'npm test' : todo('unit'),
+    e2e: e2e ? `npm run ${e2e}` : todo('e2e'),
+  };
+}
 
-  npm run agentflow -- run <intent.md | "текст intent"> [опции]
-      --change <id>      id change (по умолчанию из frontmatter или имени файла)
-      --auto-approve     человеческие шлюзы отвечают сами (для прогонов без участия)
+/** Подключить репозиторий к agentflow. Существующий OpenSpec (схема, changes) не трогается. */
+async function initRepo(withSchema: boolean): Promise<void> {
+  log.phase(`agentflow init · ${ROOT}`);
+  const os = new OpenSpec(ROOT, ROOT);
+  const configPath = join(ROOT, 'openspec/config.yaml');
+  if (existsSync(join(ROOT, 'openspec'))) {
+    const schema = existsSync(configPath) ? readFileSync(configPath, 'utf8').match(/^schema:\s*(\S+)/m)?.[1] : undefined;
+    const changes = (await os.list().catch(() => [])).map((x) => x.name);
+    log.info(`openspec/ уже есть — используется как есть: схема ${schema ?? 'по умолчанию OpenSpec'}, changes: ${changes.join(', ') || 'нет'}`);
+  } else {
+    const r = await exec(os.bin, ['init', '--tools', 'none', '--no-animation', '.'], { cwd: ROOT });
+    if (r.code !== 0) throw new Error(`openspec init: ${r.stderr || r.stdout}`);
+    log.step(`openspec init (${os.bin}): openspec/config.yaml, specs/, changes/`);
+  }
+  if (withSchema) {
+    const dest = join(ROOT, 'openspec/schemas/agentflow');
+    if (!existsSync(dest)) cpSync(join(KIT, 'openspec/schemas/agentflow'), dest, { recursive: true });
+    log.step(`схема agentflow (spec-driven + test-plan) скопирована в ${dest}; чтобы сделать её схемой по умолчанию, поставь schema: agentflow в openspec/config.yaml`);
+  }
+  const policyPath = join(ROOT, '.agentflow/policy.yaml');
+  if (existsSync(policyPath)) {
+    log.info(`${policyPath} уже есть — не трогаю`);
+  } else {
+    const ops = gateTemplate(ROOT);
+    mkdirSync(dirname(policyPath), { recursive: true });
+    writeFileSync(
+      policyPath,
+      [
+        '# Настройки agentflow для этого репозитория. Накладываются поверх policy kit:',
+        `#   ${join(KIT, '.agentflow/policy.yaml')}`,
+        '# Объекты сливаются, списки заменяются. Роли и рубрики переопределяются файлами',
+        '# .agentflow/agents/<роль>.md и .agentflow/rubrics/<id артефакта>.md (иначе — из kit).',
+        '',
+        '# Гейты: shell-команды проекта, выполняются в worktree. Роли вызывают их как agentflow-gate <op>.',
+        'gates:',
+        '  ops:',
+        ...Object.entries(ops).map(([op, cmd]) => `    ${op}: ${JSON.stringify(cmd)}`),
+        '  batch: [lint, unit]',
+        '  full: [lint, unit, e2e]',
+        '',
+        '# Acceptance-тесты: каталог (в нём же evidence/) и соглашения — уходят в промпт acceptance-tester.',
+        'acceptance:',
+        '  dir: e2e',
+        '  framework: "TODO: фреймворк, расположение и запуск acceptance-тестов проекта"',
+        '',
+        '# Схема OpenSpec нового change: пусто — схема по умолчанию из openspec/config.yaml.',
+        'openspec:',
+        '  schema: ""',
+        '',
+        '# Пути, куда роли могут писать, — при необходимости переопредели:',
+        '# roles:',
+        '#   implementer:',
+        '#     write: ["**"]',
+        '#     denyWrite: ["openspec/**", "{acceptance}/**", ".agentflow/**", ".git/**", "node_modules/**", "package.json", "package-lock.json"]',
+        '',
+      ].join('\n'),
+    );
+    log.step(`создан ${policyPath}: gates.ops — ${Object.values(ops).join(' · ')}`);
+  }
+  const gi = join(ROOT, '.gitignore');
+  const lines = ['.agentflow-runs/*/*', '!.agentflow-runs/*/ACCEPTANCE.md'];
+  const cur = existsSync(gi) ? readFileSync(gi, 'utf8') : '';
+  const add = lines.filter((l) => !cur.split('\n').includes(l));
+  if (add.length) writeFileSync(gi, cur + (cur && !cur.endsWith('\n') ? '\n' : '') + '# agentflow: каталоги запусков, в git только отчёт приёмки\n' + add.join('\n') + '\n');
+  log.step(add.length ? '.gitignore: добавлены .agentflow-runs' : '.gitignore уже содержит .agentflow-runs');
+  console.log(`\nДальше:\n  1. проверь gates.ops и acceptance в ${policyPath}\n  2. git add .agentflow .gitignore openspec && git commit -m "agentflow: init"\n  3. agentflow smoke  ·  agentflow run <intent.md>  ·  agentflow run --change <существующий-change>`);
+}
+
+/** Changes репозитория по OpenSpec и их прогоны конвейера. */
+async function showChanges(): Promise<void> {
+  const os = new OpenSpec(ROOT, ROOT);
+  const runsDir = join(ROOT, '.agentflow-runs');
+  const runs = existsSync(runsDir) ? readdirSync(runsDir).filter((d) => existsSync(join(runsDir, d, 'state.json'))) : [];
+  const changes = await os.list();
+  if (!changes.length) console.log('активных changes нет');
+  for (const ch of changes) {
+    const schema = (await os.status(ch.name).catch(() => undefined))?.schemaName ?? '?';
+    const own = runs.filter((r) => r.endsWith(`-${ch.name}`)).sort();
+    const last = own.length ? (JSON.parse(readFileSync(join(runsDir, own.at(-1)!, 'state.json'), 'utf8')) as RunState) : undefined;
+    console.log(
+      `${ch.name.padEnd(28)} схема ${schema.padEnd(14)} задачи ${ch.completedTasks}/${ch.totalTasks}  ` +
+        (last ? `последний run ${last.runId}: ${last.status}, этап ${last.stage}` : 'прогонов не было — agentflow run --change ' + ch.name),
+    );
+  }
+}
+
+const USAGE = `agentflow — конвейер spec-driven разработки на Qwen Code (kit: ${KIT})
+
+Работает в git-репозитории, из которого запущен (или --repo <путь>), с его OpenSpec:
+схема из openspec/config.yaml или .openspec.yaml change, существующие changes, его версия openspec.
+
+  agentflow init [--agentflow-schema]      подключить репозиторий: .agentflow/policy.yaml, .gitignore,
+                                           openspec init, если OpenSpec ещё нет
+  agentflow changes                        changes репозитория, их схемы и прогоны
+  agentflow run <intent.md | "текст"> [--change <id>]   новый change по intent
+  agentflow run --change <id>              существующий change: готовые артефакты — на ревью,
+                                           недостающие пишет spec-author, выполненные задачи пропускаются
+      --auto-approve     решения человека — рекомендуемые варианты (для прогонов без участия)
       --inject <точки>   fault injection: all или через запятую:
                            ${INJECT_HELP.join('\n                           ')}
-      --mock             роли без моделей (проверка контроллера, петель, гейтов, git)
+      --mock             роли без моделей (только демо-проект kit)
       --no-clarify       пропустить шаг уточнения intent
-  npm run agentflow -- resume <run-id>
-  npm run agentflow -- status [<run-id>]
-  npm run agentflow -- agents [<run-id>]   список субагентов: роль, сессия, модель из ответа API
+  agentflow resume <run-id>
+  agentflow status [<run-id>]
+  agentflow agents [<run-id>]              список субагентов: роль, сессия, модель из ответа API
+  agentflow smoke                          smoke-тесты корпоративного CLI в этом репозитории
 `;
 
 async function main(): Promise<void> {
@@ -1581,6 +1781,8 @@ async function main(): Promise<void> {
       inject: { type: 'string' },
       mock: { type: 'boolean', default: false },
       'no-clarify': { type: 'boolean', default: false },
+      'agentflow-schema': { type: 'boolean', default: false },
+      repo: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -1589,11 +1791,15 @@ async function main(): Promise<void> {
     console.log(USAGE);
     return;
   }
-  if (cmd === 'run') {
-    if (!arg) throw new Error('укажи intent: файл или текст');
+  ROOT = await resolveRepo(values.repo);
+  if (cmd === 'init') {
+    await initRepo(values['agentflow-schema']);
+  } else if (cmd === 'changes') {
+    await showChanges();
+  } else if (cmd === 'run') {
     await startRun({ intent: arg, change: values.change, autoApprove: values['auto-approve'], mock: values.mock, clarify: !values['no-clarify'], inject: parseInject(values.inject) });
   } else if (cmd === 'resume') {
-    if (!arg) throw new Error('укажи run-id (npm run agentflow -- status)');
+    if (!arg) throw new Error('укажи run-id (agentflow status)');
     await resumeRun(arg);
   } else if (cmd === 'status') {
     showStatus(arg);

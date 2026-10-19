@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# Runner с закрытым списком операций. Гейты контроллера и shell ролей идут только через него.
-# Использование: ./tools/agentflow/run.sh <lint|unit|e2e>
+# Реализация гейтов по умолчанию (gates.ops в policy kit) для JS-проектов: eslint и node --test.
+# Работает в текущем каталоге — worktree целевого репозитория. Другой проект задаёт свои
+# команды в .agentflow/policy.yaml, и этот файл ему не нужен.
+# Использование: bash run.sh <lint|unit|e2e>
 set -euo pipefail
 
 op="${1:-}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT"
+KIT="${AGENTFLOW_KIT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
-# Worktree конвейера лежит внутри основного репозитория: node_modules ищем вверх по дереву.
+# Бинарник из node_modules проекта (вверх от cwd), иначе из kit.
 find_bin() {
-  local dir="$ROOT"
+  local dir="$PWD"
   while [ "$dir" != "/" ]; do
     if [ -x "$dir/node_modules/.bin/$1" ]; then echo "$dir/node_modules/.bin/$1"; return 0; fi
     dir="$(dirname "$dir")"
   done
+  if [ -x "$KIT/node_modules/.bin/$1" ]; then echo "$KIT/node_modules/.bin/$1"; return 0; fi
   command -v "$1" || { echo "run.sh: не найден $1 (npm install?)" >&2; return 127; }
 }
 

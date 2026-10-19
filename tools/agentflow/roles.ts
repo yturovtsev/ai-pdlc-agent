@@ -1,7 +1,7 @@
 // Роли = файлы .qwen/agents/*.md (единственный источник истины). Контроллер читает их сам
 // и превращает в параметры отдельной сессии query() из @qwen-code/sdk.
 import { randomUUID } from 'node:crypto';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   isSDKAssistantMessage,
@@ -15,7 +15,8 @@ import {
 } from '@qwen-code/sdk';
 import { parse } from 'yaml';
 import { c, log } from './log.ts';
-import { qwenAuthType, qwenExecutable, type Policy } from './policy.ts';
+import { KIT } from './config.ts';
+import { gateEnv, qwenAuthType, qwenExecutable, type Policy } from './policy.ts';
 import { matchesAny, oneLine, sha256 } from './util.ts';
 
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -36,11 +37,21 @@ export const READ_TOOLS = ['read_file', 'grep_search', 'glob', 'list_directory']
 const WRITE_TOOLS = new Set(['write_file', 'edit', 'notebook_edit']);
 const SHELL_TOOLS = new Set(['run_shell_command']);
 
-export function loadRoles(repoRoot: string): Map<string, RoleDef> {
-  const dir = join(repoRoot, '.qwen/agents');
+/** Роли kit (.qwen/agents/), поверх них одноимённые файлы целевого репозитория (.agentflow/agents/). */
+export function roleFiles(repo: string): { file: string; path: string }[] {
+  const kitDir = join(KIT, '.qwen/agents');
+  const ownDir = join(repo, '.agentflow/agents');
+  const names = new Set([...readdirSync(kitDir), ...(existsSync(ownDir) ? readdirSync(ownDir) : [])].filter((f) => f.endsWith('.md')));
+  return [...names].sort().map((file) => {
+    const own = join(ownDir, file);
+    return { file, path: existsSync(own) ? own : join(kitDir, file) };
+  });
+}
+
+export function loadRoles(repo: string): Map<string, RoleDef> {
   const roles = new Map<string, RoleDef>();
-  for (const file of readdirSync(dir).filter((f) => f.endsWith('.md')).sort()) {
-    const text = readFileSync(join(dir, file), 'utf8').replace(/\r\n/g, '\n');
+  for (const { file, path } of roleFiles(repo)) {
+    const text = readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
     const m = text.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
     if (!m) throw new Error(`${file}: нет YAML frontmatter`);
     const fm = parse(m[1]!) as Record<string, unknown>;
@@ -56,7 +67,7 @@ export function loadRoles(repoRoot: string): Map<string, RoleDef> {
       tools: Array.isArray(fm['tools']) ? (fm['tools'] as string[]) : String(fm['tools'] ?? '').split(',').map((s) => s.trim()).filter(Boolean),
       maxTurns: typeof fm['maxTurns'] === 'number' ? fm['maxTurns'] : undefined,
       prompt: m[2]!.trim(),
-      file: `.qwen/agents/${file}`,
+      file: path.startsWith(KIT + '/') ? `kit:${path.slice(KIT.length + 1)}` : path.slice(repo.length + 1),
       sha: sha256(text),
     });
   }
@@ -118,10 +129,15 @@ export interface AclDecision {
   reason: string;
 }
 
+/** Подстановки в glob policy: {change} — id change, {acceptance} — каталог acceptance-тестов. */
+export function expandGlob(glob: string, change: string, policy: Policy): string {
+  return glob.replaceAll('{change}', change).replaceAll('{acceptance}', policy.acceptance.dir.replace(/\/$/, ''));
+}
+
 /** Решение ACL роли по вызову инструмента. Всё, что не разрешено явно, отклоняется. */
 export function decideAcl(rt: RoleRuntime, roleName: string, readOnly: boolean, toolName: string, input: Record<string, unknown>): AclDecision {
   const rp = rt.policy.roles[roleName] ?? { write: [], shell: [] };
-  const sub = (g: string) => g.replaceAll('{change}', rt.change);
+  const sub = (g: string) => expandGlob(g, rt.change, rt.policy);
   if (WRITE_TOOLS.has(toolName)) {
     const raw = String(input['file_path'] ?? input['path'] ?? input['absolute_path'] ?? '');
     const abs = isAbsolute(raw) ? raw : resolve(rt.worktree, raw);
@@ -135,10 +151,10 @@ export function decideAcl(rt: RoleRuntime, roleName: string, readOnly: boolean, 
   }
   if (SHELL_TOOLS.has(toolName)) {
     const cmd = String(input['command'] ?? '').trim();
-    const m = cmd.match(/^(?:\.\/)?tools\/agentflow\/run\.sh\s+([a-z0-9-]+)$/);
-    if (!m) return { ok: false, target: cmd, reason: 'разрешён только ./tools/agentflow/run.sh <операция>' };
+    const m = cmd.match(/^agentflow-gate\s+([a-z0-9-]+)$/);
+    if (!m) return { ok: false, target: cmd, reason: 'разрешена только команда agentflow-gate <операция>' };
     if (readOnly || !rp.shell.includes(m[1]!)) return { ok: false, target: cmd, reason: `операция ${m[1]} роли не разрешена` };
-    return { ok: true, target: cmd, reason: 'операция runner из policy' };
+    return { ok: true, target: cmd, reason: 'операция gates.ops из policy' };
   }
   return { ok: false, target: toolName, reason: 'инструмент не в политике роли' };
 }
@@ -208,6 +224,7 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
     debug: rt.policy.qwen.debug,
     logLevel: 'debug',
     stderr: onStderr,
+    env: gateEnv(rt.policy),
     ...(call.resume ? { resume: call.resume } : { sessionId }),
     ...(effort ? { effort } : {}),
     ...(exe ? { pathToQwenExecutable: exe } : {}),

@@ -5,9 +5,10 @@
 //
 //   npm run smoke [-- --only spec-reviewer,implementer]
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { query } from '@qwen-code/sdk';
+import { resolveRepo } from './config.ts';
 import { addWorktree } from './git.ts';
 import { c, setLogSink } from './log.ts';
 import { loadPolicy, qwenAuthType, qwenExecutable } from './policy.ts';
@@ -16,7 +17,6 @@ import { loadRoles, runRole, type RoleRuntime } from './roles.ts';
 import { RunStore } from './state.ts';
 import { exec, stamp } from './util.ts';
 
-const ROOT = resolve(import.meta.dirname, '../..');
 
 interface Check {
   name: string;
@@ -25,7 +25,8 @@ interface Check {
 }
 
 async function main(): Promise<void> {
-  const { values } = parseArgs({ options: { only: { type: 'string' } } });
+  const { values } = parseArgs({ options: { only: { type: 'string' }, repo: { type: 'string' } } });
+  const ROOT = await resolveRepo(values.repo);
   const only = values.only?.split(',').map((s) => s.trim());
   const policy = loadPolicy(ROOT);
   const roles = loadRoles(ROOT);
@@ -84,7 +85,7 @@ async function main(): Promise<void> {
       cwd: wt,
       readOnly: true,
       meta: { kind: 'clarify' },
-      prompt: 'Smoke-тест. По очереди прочитай три файла отдельными вызовами read_file: src/strings.js, src/index.js, package.json. Потом ответь одной строкой: SMOKE-OK и число прочитанных файлов.',
+      prompt: 'Smoke-тест. Посмотри список файлов в корне репозитория и по очереди прочитай три любых текстовых файла отдельными вызовами read_file. Потом ответь одной строкой: SMOKE-OK и число прочитанных файлов.',
     });
     check(`${r.name}: сессия на ${r.model}${policy.qwen.effortViaSdk && r.effort ? ` · effort ${r.effort}` : ''}`, res.ok, res.ok ? `модель из ответа API: ${res.models.join(', ') || 'не сообщена'}` : res.error ?? '');
     check(`${r.name}: несколько tool calls подряд в thinking mode`, res.ok && res.text.includes('SMOKE-OK') && res.turns >= 2, `ходов ${res.turns}`);
@@ -118,12 +119,12 @@ async function main(): Promise<void> {
       label: 'smoke-implementer-acl',
       cwd: wt,
       meta: { kind: 'implement' },
-      prompt: 'Smoke-тест ACL. Создай два файла с текстом probe: openspec/smoke-probe.txt и test/smoke-probe.txt. Потом выполни ./tools/agentflow/run.sh lint и git status. Ответь, что получилось.',
+      prompt: 'Smoke-тест ACL. Создай два файла с текстом probe: openspec/smoke-probe.txt и agentflow-smoke-probe.txt в корне. Потом выполни agentflow-gate lint и git status. Ответь, что получилось.',
     });
     check('implementer: запись в openspec/ отклонена ACL', !existsSync(join(wt, 'openspec/smoke-probe.txt')), '');
-    check('implementer: запись в test/ разрешена', existsSync(join(wt, 'test/smoke-probe.txt')), '');
+    check('implementer: запись в разрешённый путь проходит', existsSync(join(wt, 'agentflow-smoke-probe.txt')), '');
     rmSync(join(wt, 'openspec/smoke-probe.txt'), { force: true });
-    rmSync(join(wt, 'test/smoke-probe.txt'), { force: true });
+    rmSync(join(wt, 'agentflow-smoke-probe.txt'), { force: true });
   }
 
   // 5. Unattended-сессия ничего не спрашивает: ask_user_question не регистрируется.

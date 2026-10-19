@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Единственная shell-команда ролей и гейтов контроллера: agentflow-gate <операция>.
+# Команды операций приходят из policy (gates.ops) через AGENTFLOW_GATE_<OP>; выполняются в cwd.
+set -euo pipefail
+op="${1:-}"
+if [ "$#" -ne 1 ] || ! [[ "$op" =~ ^[a-z0-9-]+$ ]]; then
+  echo "agentflow-gate: использование — agentflow-gate <операция>" >&2
+  exit 2
+fi
+var="AGENTFLOW_GATE_$(printf '%s' "$op" | tr 'a-z-' 'A-Z_')"
+cmd="${!var:-}"
+if [ -z "$cmd" ]; then
+  echo "agentflow-gate: операция '$op' не описана в gates.ops policy" >&2
+  exit 2
+fi
+exec bash -c "$cmd"

@@ -9,4 +9,4 @@
 - `FINAL-ACCEPTANCE` — все сценарии acceptance PASS; упавший сценарий — находка с requirementId.
 - `FINAL-SCOPE` — нет изменений вне scope proposal и вне разрешённых путей.
 
-Поля `specCompliance` и `codeQuality` обязательны. Находка про e2e-тест (location в e2e/) уходит acceptance-tester, остальные — implementer.
+Поля `specCompliance` и `codeQuality` обязательны. Находка про acceptance-тест (location в каталоге acceptance-тестов) уходит acceptance-tester, остальные — implementer.

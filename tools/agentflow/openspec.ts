@@ -1,6 +1,7 @@
 // Обёртка над OpenSpec CLI: граф артефактов, инструкции, валидация, archive.
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { KIT } from './config.ts';
 import { exec } from './util.ts';
 
 export interface ArtifactNode {
@@ -21,12 +22,22 @@ export interface Instructions {
   [key: string]: unknown;
 }
 
-export class OpenSpec {
-  private readonly bin: string;
+export interface ApplyTask {
+  id: string;
+  description: string;
+  done: boolean;
+  sourcePath: string;
+  line: number;
+}
 
-  constructor(repoRoot: string, private readonly cwd: string) {
-    const local = join(repoRoot, 'node_modules/.bin/openspec');
-    this.bin = existsSync(local) ? local : 'openspec';
+export class OpenSpec {
+  readonly bin: string;
+
+  /** OpenSpec целевого репозитория (его версия и конфигурация), иначе из kit, иначе из PATH. */
+  constructor(repo: string, private readonly cwd: string) {
+    const own = join(repo, 'node_modules/.bin/openspec');
+    const kit = join(KIT, 'node_modules/.bin/openspec');
+    this.bin = existsSync(own) ? own : existsSync(kit) ? kit : 'openspec';
   }
 
   private async run(args: string[]): Promise<{ code: number; out: string; err: string }> {
@@ -48,15 +59,31 @@ export class OpenSpec {
     return r.out.trim() || 'unknown';
   }
 
-  async newChange(change: string, schema: string, description: string): Promise<void> {
+  /** Новый change; схема — из openspec/config.yaml репозитория, если не задана явно. */
+  async newChange(change: string, schema: string | undefined, description: string): Promise<void> {
     if (existsSync(join(this.cwd, 'openspec/changes', change))) return;
-    const r = await this.run(['new', 'change', change, '--schema', schema, '--description', description]);
+    const r = await this.run(['new', 'change', change, ...(schema ? ['--schema', schema] : []), '--description', description]);
     if (r.code !== 0) throw new Error(`openspec new change: ${r.err || r.out}`);
   }
 
+  /** Граф артефактов схемы change (схема change из .openspec.yaml или config.yaml). */
+  async status(change: string): Promise<{ schemaName: string; artifacts: ArtifactNode[]; applyRequires: string[] }> {
+    const s = await this.json<{ schemaName: string; artifacts: ArtifactNode[]; applyRequires?: string[] }>(['status', '--change', change]);
+    return { schemaName: s.schemaName, artifacts: s.artifacts.map((a) => ({ ...a, requires: a.requires ?? [] })), applyRequires: s.applyRequires ?? [] };
+  }
+
   async artifacts(change: string): Promise<ArtifactNode[]> {
-    const s = await this.json<{ artifacts: ArtifactNode[] }>(['status', '--change', change]);
-    return s.artifacts.map((a) => ({ ...a, requires: a.requires ?? [] }));
+    return (await this.status(change)).artifacts;
+  }
+
+  /** Задачи apply в разборе самого OpenSpec: файл и строка каждой задачи (apply.tracks схемы). */
+  async applyTasks(change: string): Promise<ApplyTask[]> {
+    const a = await this.json<{ tasks?: ApplyTask[] }>(['instructions', 'apply', '--change', change]);
+    return a.tasks ?? [];
+  }
+
+  async list(): Promise<{ name: string; completedTasks: number; totalTasks: number; status: string; lastModified: string }[]> {
+    return (await this.json<{ changes: { name: string; completedTasks: number; totalTasks: number; status: string; lastModified: string }[] }>(['list'])).changes;
   }
 
   instructions(artifact: string, change: string): Promise<Instructions> {

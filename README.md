@@ -24,6 +24,51 @@ npm install                      # Node >= 22.13; @qwen-code/sdk 0.1.8, @fission
 git init && git add -A && git commit -m "agentflow: init"   # контроллер работает в git worktree
 ```
 
+## Запуск в других репозиториях
+
+Этот репозиторий — **kit**: код контроллера, роли, рубрики, policy по умолчанию и демо-проект.
+Конвейер работает в любом локальном git-репозитории, из которого его запустили, и использует
+**OpenSpec этого репозитория как есть**: схему из `openspec/config.yaml` (или `.openspec.yaml`
+конкретного change), её артефакты, существующие changes, файл задач из `apply.tracks` схемы и
+версию `openspec` из `node_modules` репозитория, если она там установлена.
+
+```bash
+# один раз, в kit
+npm install && npm link          # глобальная команда agentflow (или: alias agentflow="node <kit>/tools/agentflow/bin/agentflow.mjs")
+
+# в целевом репозитории
+cd ~/work/other-repo
+agentflow init                   # .agentflow/policy.yaml (гейты проекта), .gitignore; существующий openspec/ не трогает,
+                                 # если его нет — openspec init со схемой по умолчанию (--agentflow-schema добавит схему kit)
+#   проверь gates.ops и acceptance в .agentflow/policy.yaml, закоммить .agentflow и .gitignore
+agentflow smoke                  # CLI, модели, ACL — в этом репозитории
+agentflow changes                # changes репозитория: схема, задачи, прогоны
+agentflow run --change <id>      # довести существующий change
+agentflow run intent.md          # новый change по intent (схема — по умолчанию репозитория)
+```
+
+| Что | Откуда берётся |
+| --- | --- |
+| схема, артефакты, changes, specs | `openspec/` целевого репозитория |
+| `openspec` CLI | `node_modules/.bin/openspec` репозитория, иначе kit |
+| гейты (`lint`, `unit`, `e2e`) | `gates.ops` в `.agentflow/policy.yaml` репозитория — команды проекта |
+| остальная policy | policy kit + `.agentflow/policy.yaml` репозитория (объекты сливаются, списки заменяются) |
+| роли | `.agentflow/agents/<роль>.md` репозитория, иначе `.qwen/agents/` kit |
+| рубрики | `.agentflow/rubrics/<id артефакта>.md` репозитория, иначе kit; для артефакта без рубрики — `artifact.md` |
+| прогоны | `.agentflow-runs/` в репозитории (в git — только `ACCEPTANCE.md`) |
+
+**Существующий change.** Незакоммиченное состояние `openspec/` (сам change, config, схемы)
+переносится в worktree. Уже написанные артефакты сначала идут на ревью (spec-author их не
+переписывает), недостающие пишет spec-author, уточнение intent пропускается. Задачи, отмеченные
+`[x]`, считаются выполненными; принятый батч отмечается в файле задач так же — как принято в OpenSpec.
+
+**Схема без test-plan** (например, `spec-driven`): acceptance-tester строит проверки из сценариев specs.
+
+Роли вызывают гейты одинаково в любом репозитории — `agentflow-gate <операция>`; контроллер кладёт
+эту команду в PATH сессий и передаёт ей команды из `gates.ops`. Worktree лежит внутри репозитория,
+поэтому `node_modules` основного дерева находятся автоматически. Если инструменты проекта сканируют
+всё дерево (tsc `include`, jest), добавь им в исключения `.agentflow-runs/`.
+
 ## 2. Настройка (два места)
 
 1. **CLI.** В `.agentflow/policy.yaml` → `qwen.executable` — имя корпоративного CLI в PATH или
@@ -45,6 +90,9 @@ npm run agentflow -- run tasks/01-slugify.md --mock --auto-approve --inject all
 npm run smoke              # корпоративный CLI: модели из /model, effort, tool calls в thinking mode,
                            # ревьюер не пишет, ACL implementer, resume
 ```
+
+В kit команды доступны и как `npm run agentflow -- <команда>` / `npm run smoke`, в любом репозитории —
+как `agentflow <команда>` / `agentflow smoke`.
 
 Если smoke пишет `No auth type is selected`, укажи `qwen.authType` в policy (тип из настроек CLI,
 обычно `openai`). Результат smoke — в `.agentflow-runs/smoke-*/smoke.json`.
@@ -129,15 +177,18 @@ BLOCKED (твой выбор «остановить», `needsHuman` в apply, с
 ## 6. Что где лежит
 
 ```text
+AGENTS.md                    контекст для агента: карта, команды, соглашения, неочевидные факты, решения
 .qwen/agents/*.md            пять ролей — единственный источник истины (model, effort, tools, maxTurns, промпт)
 .qwen/settings.json          общие запреты для интерактивного qwen
 .agentflow/policy.yaml       CLI, лимиты петель, ACL ролей, гейты, denyAll
 .agentflow/rubrics/*.md      рубрики артефактов и ревью; обязательные checks — в разделе «Обязательные проверки»
 .agentflow/review.schema.json  контракт ответа ревьюера
-openspec/                    config.yaml, schemas/agentflow (spec-driven + test-plan), specs/, changes/
-tools/agentflow/             controller.ts roles.ts context-builder.ts review-validator.ts snapshot.ts
-                             gates.ts run.sh openspec.ts git.ts state.ts human.ts inject.ts report.ts
-                             mock.ts smoke.ts agentflow.test.ts
+openspec/                    config.yaml (context/rules для артефактов), schemas/agentflow (spec-driven + test-plan),
+                             specs/ — базовые спеки конвейера (7 capability), changes/
+tools/agentflow/             controller.ts roles.ts config.ts context-builder.ts review-validator.ts
+                             snapshot.ts gates.ts openspec.ts git.ts state.ts human.ts inject.ts report.ts
+                             agents.ts mock.ts smoke.ts agentflow.test.ts
+                             run.sh — гейты демо-проекта; bin/agentflow.mjs, bin/agentflow-gate
 src/ test/ e2e/              демо-библиотека, на которой решаются тестовые задачи
 tasks/                       тестовые intent: 01-slugify, 02-parse-duration, 03-incomplete
 .agentflow-runs/<run-id>/    manifest.yaml state.json events.jsonl contexts/ reviews/ gates/ evidence/
@@ -152,11 +203,11 @@ Merge ветки — вне конвейера, после твоей приём
 
 - Route моделей, `envKey` и `extra_body` не используются: модели берутся из `/model` корпоративного CLI,
   effort передаётся через `query({ effort })` (SDK 0.1.8), без доработки форка.
-- Вместо корпоративной схемы — проектная `openspec/schemas/agentflow`: `spec-driven` плюс `test-plan`.
+- В демо-проекте kit — схема `openspec/schemas/agentflow` (`spec-driven` плюс `test-plan`); в других репозиториях — их собственная схема.
 - Запуск локальный: git worktree без контейнера, sandbox и сетевого allowlist. Fail-closed граница — ACL
   контроллера в `canUseTool` плюс сверка изменённых путей после каждой роли.
 - Лимитов бюджета и времени нет (`roleTimeoutMinutes: 0`); расход пишется в `state.json` для информации.
-- Гейты — только `lint` (eslint), `unit` и `e2e` (`node --test`) в `run.sh`.
+- Гейты демо-проекта — `lint` (eslint), `unit` и `e2e` (`node --test`) в `run.sh`; другие репозитории задают свои в `gates.ops`.
 - Хуки Qwen Code и MCP-источники требований не подключены.
 - Спеку пишет spec-author, а не ты: ты ревьюишь каждый артефакт после PASS ревьюера и решаешь по
   исчерпанным раундам. Команды `/opsx:*`, `/spec-review`, `/spec-waive`, `/spec-approve` не нужны —

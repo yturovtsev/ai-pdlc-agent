@@ -35,14 +35,27 @@ limits:
 git:
   branchPrefix: agentflow/
 
-# Операции tools/agentflow/run.sh, которые контроллер запускает как гейты.
+# Гейты. ops — операция → shell-команда проекта; выполняется в worktree целевого репозитория.
+# Роли и контроллер вызывают их одинаково: agentflow-gate <операция>.
+# Значения ниже — для демо-проекта kit (eslint + node --test через run.sh). Другой репозиторий
+# переопределяет их в своём .agentflow/policy.yaml, например:
+#   ops: { lint: "npm run lint", unit: "npm test", e2e: "npx playwright test" }
 gates:
+  ops:
+    lint: bash "$AGENTFLOW_KIT/tools/agentflow/run.sh" lint
+    unit: bash "$AGENTFLOW_KIT/tools/agentflow/run.sh" unit
+    e2e: bash "$AGENTFLOW_KIT/tools/agentflow/run.sh" e2e
   batch: [lint, unit]
   full: [lint, unit, e2e]
 
+# Acceptance-тесты: каталог (в нём же evidence/) и чем их писать — уходит в промпт acceptance-tester.
+acceptance:
+  dir: e2e
+  framework: "node:test и node:assert/strict, файлы e2e/<capability>.test.js; импорт из ../src/index.js"
+
 # Чтение разрешено всем в пределах worktree. Запись и shell — только перечисленное.
-# write/denyWrite — glob относительно корня worktree; {change} — id текущего change.
-# shell — операции run.sh, которые роль может вызвать сама.
+# write/denyWrite — glob относительно корня worktree; {change} — id текущего change,
+# {acceptance} — acceptance.dir. shell — операции gates.ops, которые роль может вызвать сама.
 roles:
   spec-author:
     write: ["openspec/changes/{change}/**"]
@@ -54,7 +67,7 @@ roles:
     write: ["**"]
     denyWrite:
       - "openspec/**"
-      - "e2e/**"
+      - "{acceptance}/**"
       - ".qwen/**"
       - ".agentflow/**"
       - "tools/**"
@@ -69,7 +82,7 @@ roles:
     write: []
     shell: []
   acceptance-tester:
-    write: ["e2e/**"]
+    write: ["{acceptance}/**"]
     shell: [e2e]
 
 # Запрещено всем ролям в любой фазе. Уходит в excludeTools каждой сессии

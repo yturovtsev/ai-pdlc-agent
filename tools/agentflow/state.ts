@@ -70,7 +70,8 @@ export interface ArtifactState {
 export interface BatchState {
   id: string;
   title: string;
-  tasks: { id: string; text: string; done: boolean }[];
+  /** file/line — место задачи в файле задач схемы (из openspec instructions apply). */
+  tasks: { id: string; text: string; done: boolean; file?: string; line?: number }[];
   status: 'pending' | 'done';
   rounds: number;
   base?: string;
@@ -121,6 +122,8 @@ export interface RunState {
   intent: { source: string; text: string; clarifications: { question: string; answer: string }[] };
   spec: {
     order: string[];
+    /** Схема OpenSpec change (из .openspec.yaml change или config.yaml репозитория). */
+    schema?: string;
     artifacts: Record<string, ArtifactState>;
     holisticPassed: boolean;
     /** Digest пакета, на котором сквозное ревью дало PASS. */

@@ -1,8 +1,9 @@
 // Пакеты контекста для ролей: каждая получает только то, что ей положено по контракту,
 // и читает исходные файлы сама. Промпт сохраняется в contexts/ прогона для аудита.
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Instructions } from './openspec.ts';
+import { KIT, layered } from './config.ts';
+import type { ApplyTask, Instructions } from './openspec.ts';
 import { contractExample } from './review-validator.ts';
 import type { Finding, Question } from './state.ts';
 import { listFiles } from './util.ts';
@@ -14,9 +15,15 @@ export interface Rubric {
   mandatory: string[];
 }
 
-export function loadRubric(root: string, name: string): Rubric {
-  const path = `.agentflow/rubrics/${name}.md`;
-  const text = readFileSync(join(root, path), 'utf8');
+/**
+ * Рубрика целевого репозитория (.agentflow/rubrics/<name>.md) или kit. Для артефакта схемы,
+ * у которого своей рубрики нет (корпоративная схема), — общая рубрика artifact.md.
+ */
+export function loadRubric(repo: string, name: string): Rubric {
+  let abs = layered(repo, `rubrics/${name}.md`, `.agentflow/rubrics/${name}.md`);
+  if (!existsSync(abs)) abs = layered(repo, 'rubrics/artifact.md', '.agentflow/rubrics/artifact.md');
+  const path = abs.startsWith(KIT + '/') ? `kit:${abs.slice(KIT.length + 1)}` : abs.slice(repo.length + 1);
+  const text = readFileSync(abs, 'utf8');
   const section = text.split(/^## /m).find((s) => s.startsWith('Обязательные проверки')) ?? '';
   const mandatory = [...section.matchAll(/^- `([A-Z0-9-]+)`/gm)].map((m) => m[1]!);
   return { name, path, text, mandatory };
@@ -62,7 +69,38 @@ export function requirementsTable(reqs: Requirement[]): string {
 export interface TaskBatch {
   id: string;
   title: string;
-  tasks: { id: string; text: string }[];
+  tasks: { id: string; text: string; done?: boolean; file?: string; line?: number }[];
+}
+
+/**
+ * Батчи из задач, которые разобрал сам OpenSpec (формат файла задач — по схеме репозитория):
+ * задачи под одним заголовком — один task batch; задачи без заголовка — батч «Задачи».
+ */
+export function batchesFromTasks(tasks: ApplyTask[]): TaskBatch[] {
+  const batches: TaskBatch[] = [];
+  const lines = new Map<string, string[]>();
+  for (const t of tasks) {
+    if (!lines.has(t.sourcePath)) lines.set(t.sourcePath, readFileSync(t.sourcePath, 'utf8').split('\n'));
+    const src = lines.get(t.sourcePath)!;
+    let title = 'Задачи';
+    for (let i = t.line - 2; i >= 0; i--) {
+      const h = src[i]!.match(/^#{2,6}\s+(.+)$/);
+      if (h) {
+        title = h[1]!.trim();
+        break;
+      }
+    }
+    const key = `${t.sourcePath}#${title}`;
+    let b = batches.find((x) => (x as TaskBatch & { key?: string }).key === key);
+    if (!b) {
+      const num = title.match(/^(\d+)[.)]/)?.[1];
+      b = Object.assign({ id: num ?? String(batches.length + 1), title: title.replace(/^\d+[.)]\s*/, ''), tasks: [] }, { key });
+      batches.push(b);
+    }
+    const tid = t.description.match(/^(\d+(?:\.\d+)+)\s+/)?.[1] ?? `${b.id}.${b.tasks.length + 1}`;
+    b.tasks.push({ id: tid, text: t.description.replace(/^\d+(?:\.\d+)+\s+/, ''), done: t.done, file: t.sourcePath, line: t.line });
+  }
+  return batches.map(({ id, title, tasks: ts }) => ({ id, title, tasks: ts }));
 }
 
 /** Группа "## N. Название" = один task batch; задачи "- [ ] N.M описание". */
@@ -143,7 +181,7 @@ export function clarifyPrompt(ctx: BaseCtx): string {
     header('уточнение intent', ctx),
     '',
     'Ты spec-author на шаге уточнений. Этот шаг только на чтение: файлов не создавай.',
-    'Прочитай intent и релевантный код (src/, test/, openspec/specs/). Сформулируй вопросы, без ответа на которые',
+    'Прочитай intent, релевантный код репозитория и openspec/specs/. Сформулируй вопросы, без ответа на которые',
     'спеку пришлось бы писать на догадках. Не больше 5. Если всё однозначно — верни пустой список.',
     '',
     intentBlock(ctx),
@@ -170,6 +208,8 @@ export function authorPrompt(
     rubric: Rubric;
     findings: Finding[];
     exists: boolean;
+    /** Артефакт — файл задач apply (apply.requires схемы). */
+    tracked?: boolean;
   },
 ): string {
   const ins = a.instructions;
@@ -181,6 +221,9 @@ export function authorPrompt(
     '',
     `Пиши только артефакт «${a.id}»: ${ctx.changeDir}/${a.generates}. Остальные файлы не трогай — запись будет отклонена.`,
     a.exists ? 'Артефакт уже существует: исправь его по находкам ниже, не переписывая то, что к ним не относится.' : '',
+    a.tracked
+      ? 'Это файл задач фазы apply. Каждый раздел с заголовком `##` станет одним task batch (1-4 задачи) — один вызов implementer и одно ревью кода. Acceptance-тесты не планируй: их пишет отдельная роль. Галочки не ставь: прогресс отмечает контроллер.'
+      : '',
     '',
     intentBlock(ctx),
     '',
@@ -243,7 +286,7 @@ export function specReviewPrompt(
     `- артефакт: ${a.files.map((f) => `${ctx.changeDir}/${f}`).join(', ') || '(файлов нет)'}`,
     `- upstream: ${a.upstream.flatMap((u) => u.files.map((f) => `${ctx.changeDir}/${f}`)).join(', ') || '(нет)'}`,
     `- инструкция OpenSpec для этого артефакта: ${a.instructionsPath}`,
-    '- код репозитория: src/, test/ — для проверки реализуемости',
+    '- код репозитория — для проверки реализуемости',
     a.fixDiffPath ? `- diff исправлений с прошлого раунда: ${a.fixDiffPath}` : '',
     '',
     intentBlock(ctx),
@@ -337,13 +380,13 @@ export function implementerPrompt(
     '## Разрешено',
     `- писать: ${a.write.join(', ')}`,
     `- нельзя писать: ${a.denyWrite.join(', ') || '(нет)'}`,
-    `- shell: только ${a.shell.map((s) => `./tools/agentflow/run.sh ${s}`).join(', ') || '(нет)'}`,
+    `- shell: только ${a.shell.map((s) => `agentflow-gate ${s}`).join(', ') || '(нет)'}`,
     '- git, установка пакетов и прочие команды недоступны; коммиты делает контроллер.',
     '',
     '## Definition of Done',
     '- каждая задача батча реализована, проверка из её описания выполнима;',
-    '- unit-тест из сценария написан и проходит; run.sh lint и run.sh unit зелёные;',
-    '- нет работы вне батча; спека, e2e/ и конфиги не тронуты.',
+    `- unit-тест из сценария написан и проходит; ${a.shell.map((s) => `agentflow-gate ${s}`).join(' и ') || 'гейты'} зелёные;`,
+    '- нет работы вне батча; спека, acceptance-тесты и конфиги не тронуты.',
     '',
     a.gateOutput ? '## Красные гейты — исправь\n' + a.gateOutput : '',
     a.findings.length ? '## Находки ревью к исправлению\n' + formatFindings(a.findings) + '\nПо каждой ответь fixed или disputed с доказательством.' : '',
@@ -412,7 +455,7 @@ export function codeReviewPrompt(
 
 export function acceptancePrompt(
   ctx: BaseCtx,
-  a: { reqs: Requirement[]; specFiles: string[]; testPlan: string; snapshotId: string; rubric: Rubric },
+  a: { reqs: Requirement[]; specFiles: string[]; testPlan?: string; snapshotId: string; rubric: Rubric; dir: string; framework: string; shell: string[] },
 ): string {
   return [
     header('acceptance по замороженной спеке', ctx),
@@ -421,16 +464,16 @@ export function acceptancePrompt(
     '',
     '## Манифест контекста',
     `- спека: ${a.specFiles.join(', ')}`,
-    `- test-plan: ${a.testPlan}`,
+    a.testPlan ? `- test-plan: ${a.testPlan}` : '- отдельного test-plan в схеме нет: проверки строй из сценариев спеки',
     '- код читай только для диагностики (путь импорта, причина падения); проверки строй из спеки',
     '',
     '## Индекс сценариев — по одному check на каждый, id ровно такие',
     requirementsTable(a.reqs),
     '',
     '## Что сделать',
-    '1. Напиши тесты в e2e/<capability>.test.js (node:test, node:assert/strict). В имени теста — id сценария.',
-    '2. Запусти ./tools/agentflow/run.sh e2e (вывод сохранится в e2e/evidence/e2e-run.txt).',
-    '3. Дополнительные доказательства сохрани в e2e/evidence/.',
+    `1. Напиши тесты в ${a.dir}/: ${a.framework}. В имени теста — id сценария.`,
+    `2. Запусти ${a.shell.map((s) => `agentflow-gate ${s}`).join(', ') || 'тесты'} — других shell-команд нет.`,
+    `3. Вывод прогона и прочие доказательства сохрани в ${a.dir}/evidence/.`,
     '',
     `## Рубрика (${a.rubric.path})`,
     a.rubric.text,
@@ -454,6 +497,7 @@ export function finalReviewPrompt(
     head: string;
     gates: string;
     acceptancePath: string;
+    acceptanceDir: string;
     rubric: Rubric;
     snapshotId: string;
     prior: Finding[];
@@ -468,7 +512,7 @@ export function finalReviewPrompt(
     `- полный diff фазы apply: ${a.diffPath}`,
     `- спека: ${a.specFiles.join(', ')}`,
     `- отчёт acceptance-tester: ${a.acceptancePath}`,
-    '- e2e/ и e2e/evidence/ — acceptance-тесты и доказательства',
+    `- ${a.acceptanceDir}/ и ${a.acceptanceDir}/evidence/ — acceptance-тесты и доказательства`,
     '',
     '## Индекс требований — каждое requirementId обязано быть в traceability[]',
     requirementsTable(a.reqs),

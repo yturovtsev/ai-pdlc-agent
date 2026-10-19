@@ -6,6 +6,8 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { c, log } from './log.ts';
 import { decideAcl, toolsFor, type RoleCall, type RoleResult, type RoleRuntime } from './roles.ts';
+import { KIT_BIN } from './config.ts';
+import { gateEnv } from './policy.ts';
 import { exec } from './util.ts';
 
 const ARTIFACTS: Record<string, Record<string, string>> = {
@@ -248,8 +250,8 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
             "test('slugify реэкспортируется из index', () => {\n  assert.equal(typeof slugify, 'function');\n});\n",
         );
       }
-      log.role(role.name, '→ run_shell_command ./tools/agentflow/run.sh lint');
-      const d = decideAcl(rt, role.name, false, 'run_shell_command', { command: './tools/agentflow/run.sh lint' });
+      log.role(role.name, '→ run_shell_command agentflow-gate lint');
+      const d = decideAcl(rt, role.name, false, 'run_shell_command', { command: 'agentflow-gate lint' });
       log.acl(role.name, 'run_shell_command', d.target, d.ok, d.reason);
       text = json({ status: 'DONE', tasks: [], responses: [], specIssue: null });
       break;
@@ -267,8 +269,8 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
         })
         .join('\n');
       write('e2e/text-slug.test.js', "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { slugify } from '../src/index.js';\n\n" + body);
-      log.role(role.name, '→ run_shell_command ./tools/agentflow/run.sh e2e');
-      const r = await exec('bash', ['tools/agentflow/run.sh', 'e2e'], { cwd: rt.worktree });
+      log.role(role.name, '→ run_shell_command agentflow-gate e2e');
+      const r = await exec('bash', [`${KIT_BIN}/agentflow-gate`, 'e2e'], { cwd: rt.worktree, env: { ...process.env, ...gateEnv(rt.policy) } });
       const scenarios = reqs.flatMap((rq) => rq.scenarios.map((s) => ({ rq, s })));
       const result = r.code === 0 ? 'PASS' : 'FAIL';
       text = json({

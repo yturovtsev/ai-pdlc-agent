@@ -4,6 +4,9 @@
   "private": true,
   "description": "Конвейер spec-driven разработки на Qwen Code: контроллер agentflow и пять ролей-субагентов",
   "type": "module",
+  "bin": {
+    "agentflow": "tools/agentflow/bin/agentflow.mjs"
+  },
   "engines": {
     "node": ">=22.0.0"
   },
