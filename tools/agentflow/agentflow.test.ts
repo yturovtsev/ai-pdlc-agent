@@ -1,12 +1,13 @@
-// Офлайн-тесты детерминированных узлов: контракт ревью, правила принятия, ACL, tasks, glob.
+// Офлайн-тесты детерминированных узлов: контракт ревью, правила принятия, ACL, tasks, glob, выбор схемы OpenSpec.
 //   npm run test:agentflow
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { batchesFromTasks, parseTasks } from './context-builder.ts';
-import { deepMerge } from './config.ts';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { deepMerge, KIT } from './config.ts';
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
+import { OpenSpec } from './openspec.ts';
 import { decide, validateReview, type Expectation } from './review-validator.ts';
 import { decideAcl, type RoleRuntime } from './roles.ts';
 import { normalize } from './snapshot.ts';
@@ -150,4 +151,50 @@ test('батчи из задач OpenSpec: по заголовкам, выпол
 test('policy репозитория сливается с policy kit: объекты — по ключам, списки — заменой', () => {
   const merged = deepMerge({ gates: { ops: { lint: 'a', unit: 'b' }, batch: ['lint', 'unit'] }, x: 1 }, { gates: { ops: { lint: 'npm run lint' }, batch: ['lint'] } });
   assert.deepEqual(merged, { gates: { ops: { lint: 'npm run lint', unit: 'b' }, batch: ['lint'] }, x: 1 });
+});
+
+/** Репозиторий без своего openspec: config.yaml со схемой schema и, если project, сама схема в openspec/schemas/. */
+function schemaRepo(schema: string, project: boolean): string {
+  const dir = mkdtempSync(join(tmpdir(), 'agentflow-schema-'));
+  mkdirSync(join(dir, 'openspec/changes'), { recursive: true });
+  writeFileSync(join(dir, 'openspec/config.yaml'), `schema: ${schema}\n`);
+  if (project) {
+    const to = join(dir, 'openspec/schemas', schema);
+    cpSync(join(KIT, 'node_modules/@fission-ai/openspec/schemas/spec-driven'), to, { recursive: true });
+    writeFileSync(join(to, 'schema.yaml'), readFileSync(join(to, 'schema.yaml'), 'utf8').replace(/^name: .*/m, `name: ${schema}`));
+  }
+  return dir;
+}
+
+test('схема проекта из config.yaml: её видит OpenSpec kit', async () => {
+  const dir = schemaRepo('corp-edition', true);
+  const os = new OpenSpec(dir, dir);
+  assert.equal(await os.ensureSchema('x', undefined), 'corp-edition');
+  assert.equal(os.bin, join(KIT, 'node_modules/.bin/openspec'));
+});
+
+test('схему видит только openspec из PATH — берётся он', { skip: process.platform === 'win32' }, async () => {
+  const dir = schemaRepo('corp-builtin', false);
+  const bin = mkdtempSync(join(tmpdir(), 'agentflow-bin-'));
+  writeFileSync(join(bin, 'openspec'), '#!/bin/sh\necho \'[{"name":"corp-builtin","source":"package"}]\'\n');
+  chmodSync(join(bin, 'openspec'), 0o755);
+  const path = process.env['PATH'];
+  process.env['PATH'] = `${bin}${delimiter}${path ?? ''}`;
+  try {
+    const os = new OpenSpec(dir, dir);
+    assert.equal(await os.ensureSchema('x', undefined), 'corp-builtin');
+    assert.equal(os.bin, join(bin, 'openspec'));
+  } finally {
+    process.env['PATH'] = path;
+  }
+});
+
+test('схему не видит никто — ошибка до создания change со списком схем каждого CLI', async () => {
+  const dir = schemaRepo('nope', false);
+  await assert.rejects(new OpenSpec(dir, dir).ensureSchema('x', undefined), /не видит схему «nope»[\s\S]*spec-driven \(package\)/);
+});
+
+test('явная схема policy перебивает config.yaml', async () => {
+  const dir = schemaRepo('corp-edition', true);
+  assert.equal(await new OpenSpec(dir, dir).ensureSchema('x', 'spec-driven'), 'spec-driven');
 });

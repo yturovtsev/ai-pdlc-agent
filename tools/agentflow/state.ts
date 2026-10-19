@@ -117,7 +117,7 @@ export interface RunState {
   branch: string;
   baseCommit: string;
   options: { autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[] };
-  versions: { prompts: string; policy: string; sdk: string; openspec: string };
+  versions: { prompts: string; policy: string; sdk: string; openspec: string; openspecBin?: string };
   stagesDone: Stage[];
   intent: { source: string; text: string; clarifications: { question: string; answer: string }[] };
   spec: {

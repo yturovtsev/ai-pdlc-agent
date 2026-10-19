@@ -20,7 +20,9 @@ qwen:
   debug: false
 
 openspec:
-  schema: agentflow
+  # Пусто — схема из openspec/config.yaml репозитория (у kit там agentflow). Непустое значение уходит
+  # в `openspec new change --schema` и перебивает схему любого репозитория.
+  schema: ""
 
 limits:
   artifactRounds: 3     # раунды исправления одного артефакта

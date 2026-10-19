@@ -62,6 +62,9 @@ Mock-прогон создаёт ветку и worktree и коммитит в �
 - OpenSpec 1.14: `status --json` (артефакты, `applyRequires`), `instructions <id> --json`,
   `instructions apply --json` (задачи с `sourcePath`/`line`), `new change` без `--schema` берёт
   схему из `config.yaml`; `validate --strict` падает, пока в change нет дельт specs.
+- OpenSpec ищет схемы в `openspec/schemas/<имя>/schema.yaml` проекта, в `$XDG_DATA_HOME/openspec/schemas`
+  и в своей сборке; `Creating change … with schema 'spec-driven'` в спиннере `new change` — всегда дефолт,
+  реальная схема из config.yaml. OpenSpec 1.13 не отдаёт `sourcePath` задач. CLI выбирает `ensureSchema`.
 - Node 22.12: `node --test test/` каталог не принимает — нужен glob; `@inquirer/*` просит ≥22.13.
 - `--auto-approve` + вечно красный гейт раньше зацикливался; теперь с 3-го исчерпания рекомендуется стоп.
 

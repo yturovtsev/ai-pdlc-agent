@@ -1454,7 +1454,7 @@ function makeCtx(root: string, runDir: string, store: RunStore, policy: Policy, 
     store,
     policy,
     roles,
-    os: new OpenSpec(root, s.worktree),
+    os: new OpenSpec(root, s.worktree, s.versions.openspecBin),
     rt,
     human: new Human(s.options.autoApprove),
     inject: new Injector(store),
@@ -1560,11 +1560,16 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
     mkdirSync(dirname(join(wt, p)), { recursive: true });
     cpSync(from, join(wt, p));
   }
+  // Схемы и config в .gitignore не попадают ни в HEAD, ни в git status — без них OpenSpec в worktree схему не найдёт.
+  for (const p of ['openspec/config.yaml', 'openspec/schemas']) {
+    if (existsSync(join(ROOT, p))) cpSync(join(ROOT, p), join(wt, p), { recursive: true, force: false });
+  }
   const otherDirty = dirty.filter((p) => !carry.includes(p));
   if (otherDirty.length) log.warn(`незакоммиченные изменения вне openspec/ не попадут в worktree: ${otherDirty.slice(0, 5).join(', ')}${otherDirty.length > 5 ? '…' : ''}`);
 
   const store = new RunStore(runDir);
   const os = new OpenSpec(ROOT, wt);
+  await os.ensureSchema(change, existing ? undefined : policy.openspec.schema || undefined);
   store.state = {
     runId,
     change,
@@ -1578,7 +1583,7 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
     branch,
     baseCommit,
     options: { autoApprove: args.autoApprove, mock: args.mock, clarify: args.clarify, inject: args.inject },
-    versions: { prompts: promptsRevision(ROOT), policy: policy.sha, sdk: sdkVersion(), openspec: await os.version() },
+    versions: { prompts: promptsRevision(ROOT), policy: policy.sha, sdk: sdkVersion(), openspec: await os.version(), openspecBin: os.bin },
     stagesDone: [],
     intent: { source: intent?.source ?? `openspec/changes/${change}`, text: intentText, clarifications: [] },
     spec: { order: [], artifacts: {}, holisticPassed: false, questions: [] },
