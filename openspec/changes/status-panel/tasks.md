@@ -1,0 +1,24 @@
+# Tasks
+
+## 1. Отрисовка панели
+
+- [x] 1.1 Создать `tools/agentflow/status-panel.ts` с типом `PanelState` и чистой функцией `renderPanel(state, width, now)`, которая возвращает две строки: строку субагента (роль, модель, effort, новая сессия или продолжение, время мм:сс, число инструментов, `запуск N`, `ролей M`) или строку контроллера `⚙ …`, и строку контекста (run id, change, этап, петля «имя» раунд/макс, `⏱` время команды). Строки обрезаются по видимой ширине без ANSI с `…`. Проверка: unit-тесты в `agentflow.test.ts` на оба вида первой строки, на resume, на петлю и на обрезку до 40 и 120 колонок с цветом; `npm run test:agentflow`.
+- [x] 1.2 Добавить `panelEnabled({isTTY, rows, cols, noPanel, env})`: панель выключена без TTY, при высоте меньше 10 строк, при ширине меньше 40 колонок, при `--no-panel` и при `AGENTFLOW_NO_PANEL=1`. Проверка: табличный unit-тест на каждое условие и на включённый случай 30×120.
+
+## 2. Терминальный слой панели
+
+- [x] 2.1 Реализовать синглтон `panel` с методами `start(init, out)`, `update`, `pause`, `resume`, `stop`. `start` резервирует две строки и ставит область прокрутки `ESC[1;{rows-2}r` внутри `ESC7`/`ESC8`. Кадр рисуется одной записью в две нижние строки. Таймер `setInterval(1000).unref()` работает только между `start`/`resume` и `pause`/`stop`. При `resize` область пересчитывается, а если размер меньше порога, панель выключается. До `start` и при `enabled: false` методы ничего не пишут. Проверка: unit-тест с фейковым потоком (`isTTY`, `rows`, `columns`, `write`, `EventEmitter`) — после `start` в записи есть `ESC[1;28r`, после `resize` до 24×60 есть `ESC[1;22r`, а кадр не длиннее 60 видимых символов; при `enabled: false` ничего не записано.
+- [x] 2.2 Восстанавливать терминал: идемпотентный `stop()` (`ESC[r`, стирание нижних строк, курсор под логом, `ESC[?25h`). `start` регистрирует обработчик `process.on('exit')` и `process.once` на `SIGINT`/`SIGTERM` с выходом 130/143, а `stop` снимает их. Проверка: unit-тест — второй `stop()` ничего не пишет, после `stop()` число слушателей `SIGINT` вернулось к исходному.
+
+## 3. Подключение к логу и ролям
+
+- [x] 3.1 В `log.ts` обновлять панель из `phase` (этап, сброс петли), `loopOpen`/`loopClose`, `spawn` (субагент, `launches++`), `roleDone` (субагент снят, activity «<роль> завершил»), `step`/`gate`/`verdict` (activity), `human` (activity «решение человека»). Текст в консоли и события `events.jsonl` не меняются. Проверка: unit-тест — после `panel.start` с фейковым потоком последовательность `log.phase` → `log.loopOpen('x', 2, 3)` → `log.spawn('implementer', …)` даёт кадр с `implementer`, `2/3`, `запуск 1`, а после `log.roleDone` кадр со строкой `⚙`.
+- [x] 3.2 Добавить `log.toolUse(role, name, arg)`: печатает ту же строку `→ name arg`, что сейчас `log.role`, и увеличивает счётчик инструментов субагента в панели. В `roles.ts` (блок `tool_use`) и в `mock.ts` (`write`, `read`, вызовы `agentflow-gate`) вызывать его вместо `log.role` со стрелкой. Проверка: unit-тест на рост счётчика в кадре; `npm run typecheck && npm run lint`.
+
+- [x] 3.3 Добавить в `roles.ts` функцию `describeTask(meta)`, которая по `TaskMeta` описывает, над чем работает вызов (артефакт и файл, батч, вид ревью). Передавать её результат полем `target` в `log.spawn` из `runRole` и `runMock`, а в `renderPanel` показывать сразу после времени субагента. Проверка: unit-тест `describeTask` на каждый `kind` и тест хуков: после `log.spawn` с `target` кадр содержит цель; mock-прогон в pty показывает `пишет proposal.md`, `ревью proposal`, `батч 1`.
+
+## 4. Диалоги, CLI и документация
+
+- [x] 4.1 В `human.ts` вызывать `panel.pause()` перед `select`/`input` из `@inquirer/prompts` и `panel.resume()` в `finally`. Ветку `--auto-approve` не трогать. Проверка: unit-тест с фейковым потоком — `pause` пишет `ESC[r` и останавливает кадры, `resume` снова ставит область. Вручную: mock-прогон в TTY без `--auto-approve`, меню работает стрелками, после ответа панель на месте.
+- [x] 4.2 В `controller.ts` добавить флаг `--no-panel` в `parseArgs` и `USAGE`. В `startRun` и `resumeRun` после `makeCtx` вызывать `panel.start({runId, change, roles: roles.size, launches: Σ state.usage[*].calls, enabled: panelEnabled(…)})`, а `panel.stop()` — в `finally` вокруг `pipeline`. Проверка: в копии kit `npm run agentflow -- run tasks/01-slugify.md --mock --auto-approve --inject all > out.log` завершается кодом 0, `grep -c $'\e\\[[0-9;]*r' out.log` даёт 0; тот же прогон в терминале показывает панель, а после выхода терминал прокручивается во всю высоту.
+- [x] 4.3 Описать панель в README, раздел «Что видно в консоли»: содержимое строк, когда панель скрыта, `--no-panel`, `AGENTFLOW_NO_PANEL`, восстановление после `SIGKILL` (`reset` или `printf '\e[r'`). В карту `AGENTS.md` добавить `status-panel.ts`, а в «Неочевидные факты» — что DECSTBM переводит курсор в начало экрана. Проверка: команды из README выполняются как написано.

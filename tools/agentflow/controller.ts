@@ -41,11 +41,14 @@ import { printLoopSummary, writeAcceptanceReport } from './report.ts';
 import { decide, countBySeverity, validateReview, type Decision, type Expectation, type Review, type ReviewFinding } from './review-validator.ts';
 import { expandGlob, loadRoles, mcpViolations, mcpWarnings, roleFiles, runRole, type RoleDef, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
 import { artifactFiles, artifactSnapshot, artifactText, codeSnapshot, specDigest } from './snapshot.ts';
+import { panelEnabled, panel } from './status-panel.ts';
 import { RunStore, STAGES, type BatchState, type Finding, type RunState, type Stage } from './state.ts';
 import { Blocked, exec, extractJson, matchesAny, now, oneLine, sha256, short, stamp } from './util.ts';
 
 /** Целевой репозиторий: git-корень, из которого запущен agentflow (или --repo). Задаётся в main. */
 let ROOT = KIT;
+/** --no-panel: без панели статуса внизу терминала. */
+let NO_PANEL = false;
 const ROLE_NAMES = ['spec-author', 'spec-reviewer', 'implementer', 'code-reviewer', 'acceptance-tester'];
 
 interface Ctx {
@@ -1478,6 +1481,15 @@ async function pipeline(ctx: Ctx): Promise<void> {
   ctx.tracked = new Set(status.applyRequires);
   s.spec.order = ctx.graph.map((n) => n.id);
   s.spec.schema = status.schemaName;
+  const out = process.stdout;
+  panel.start({
+    runId: s.runId,
+    change: s.change,
+    roles: ctx.roles.size,
+    launches: Object.values(s.usage).reduce((n, u) => n + u.calls, 0),
+    phase: `этап ${s.stage}`,
+    enabled: panelEnabled({ isTTY: out.isTTY, rows: out.rows, cols: out.columns, noPanel: NO_PANEL, env: process.env }),
+  });
   log.info(`схема OpenSpec: ${status.schemaName} · артефакты: ${ctx.graph.map((n) => n.id).join(' → ')} · apply требует: ${status.applyRequires.join(', ') || '—'}`);
   ctx.store.save();
   try {
@@ -1511,6 +1523,8 @@ async function pipeline(ctx: Ctx): Promise<void> {
     printLoopSummary(s);
     console.log(`\nпричина записана в ${ctx.store.statePath}; продолжить после исправления: agentflow resume ${s.runId}`);
     process.exitCode = 2;
+  } finally {
+    panel.stop();
   }
 }
 
@@ -1781,7 +1795,8 @@ const USAGE = `agentflow — конвейер spec-driven разработки �
                            ${INJECT_HELP.join('\n                           ')}
       --mock             роли без моделей (только демо-проект kit)
       --no-clarify       пропустить шаг уточнения intent
-  agentflow resume <run-id>
+      --no-panel         без панели статуса внизу терминала (или AGENTFLOW_NO_PANEL=1)
+  agentflow resume <run-id> [--no-panel]
   agentflow status [<run-id>]
   agentflow agents [<run-id>]              список субагентов: роль, сессия, модель из ответа API
   agentflow smoke                          smoke-тесты корпоративного CLI в этом репозитории
@@ -1796,6 +1811,7 @@ async function main(): Promise<void> {
       inject: { type: 'string' },
       mock: { type: 'boolean', default: false },
       'no-clarify': { type: 'boolean', default: false },
+      'no-panel': { type: 'boolean', default: false },
       'agentflow-schema': { type: 'boolean', default: false },
       repo: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
@@ -1807,6 +1823,7 @@ async function main(): Promise<void> {
     return;
   }
   ROOT = await resolveRepo(values.repo);
+  NO_PANEL = values['no-panel'];
   if (cmd === 'init') {
     await initRepo(values['agentflow-schema']);
   } else if (cmd === 'changes') {

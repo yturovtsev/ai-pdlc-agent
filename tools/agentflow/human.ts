@@ -2,6 +2,7 @@
 // обоснован. Без TTY и без --auto-approve решение человека невозможно → BLOCKED.
 import { input, select } from '@inquirer/prompts';
 import { c, log } from './log.ts';
+import { panel } from './status-panel.ts';
 import { Blocked } from './util.ts';
 
 export interface Option<K extends string = string> {
@@ -19,6 +20,16 @@ export interface Choice<K extends string = string> {
   recommended: K;
   /** Почему рекомендован именно этот вариант. */
   rationale: string;
+}
+
+/** Меню inquirer рисуется без панели: она убрана на время диалога и возвращается после ответа. */
+async function paused<T>(fn: () => Promise<T>): Promise<T> {
+  panel.pause();
+  try {
+    return await fn();
+  } finally {
+    panel.resume();
+  }
 }
 
 export class Human {
@@ -41,18 +52,20 @@ export class Human {
     this.ensureTty(ch.title);
     // Рекомендуемый вариант первым, под курсором и с пометкой; остальные в исходном порядке.
     const ordered = [rec, ...ch.options.filter((o) => o !== rec)];
-    const answer = await select<K>({
-      message: ch.title,
-      default: rec.key,
-      loop: false,
-      pageSize: Math.max(ordered.length, 7),
-      choices: ordered.map((o) => ({
-        value: o.key,
-        name: o === rec ? c.green(`★ ${o.label} (рекомендуется)`) : `  ${o.label}`,
-        short: o.label,
-        description: o === rec ? `${o.description ?? ''}${o.description ? '\n' : ''}Почему: ${ch.rationale}` : o.description,
-      })),
-    });
+    const answer = await paused(() =>
+      select<K>({
+        message: ch.title,
+        default: rec.key,
+        loop: false,
+        pageSize: Math.max(ordered.length, 7),
+        choices: ordered.map((o) => ({
+          value: o.key,
+          name: o === rec ? c.green(`★ ${o.label} (рекомендуется)`) : `  ${o.label}`,
+          short: o.label,
+          description: o === rec ? `${o.description ?? ''}${o.description ? '\n' : ''}Почему: ${ch.rationale}` : o.description,
+        })),
+      }),
+    );
     log.info(c.gray(`  выбрано: ${ch.options.find((o) => o.key === answer)?.label}`));
     return answer;
   }
@@ -63,7 +76,7 @@ export class Human {
       return autoAnswer;
     }
     this.ensureTty(question);
-    return (await input({ message: question })).trim() || autoAnswer;
+    return (await paused(() => input({ message: question }))).trim() || autoAnswer;
   }
 
   /**

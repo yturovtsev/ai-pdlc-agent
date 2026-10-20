@@ -90,6 +90,29 @@ export interface TaskMeta {
   requirements?: { id: string; name: string; scenarios: { id: string; name: string }[] }[];
 }
 
+/** Над чем работает вызов — для панели статуса и события spawn. */
+export function describeTask(meta: TaskMeta): string {
+  switch (meta.kind) {
+    case 'clarify':
+      return 'уточнение intent';
+    case 'author':
+      return `пишет ${meta.generates ?? meta.artifact ?? 'артефакт'}`;
+    case 'spec-review':
+      return `ревью ${meta.artifact ?? meta.target ?? 'артефакта'}`;
+    case 'holistic':
+      return 'сквозное ревью change';
+    case 'implement':
+      // Находки финального ревью implementer закрывает в синтетическом батче final-<раунд>.
+      return meta.batchId?.startsWith('final-') ? `исправления финального ревью, раунд ${meta.batchId.slice(6)}` : `батч ${meta.batchId ?? '?'}`;
+    case 'code-review':
+      return `ревью батча ${meta.batchId ?? '?'}`;
+    case 'acceptance':
+      return 'acceptance-тесты';
+    case 'final-review':
+      return 'финальное ревью';
+  }
+}
+
 export interface RoleCall {
   role: RoleDef;
   prompt: string;
@@ -263,7 +286,7 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   const st = sessionTools(rt.policy, role, call.readOnly);
   const tools = spawnTools(rt.policy, role, call.readOnly);
   const effort = rt.policy.qwen.effortViaSdk ? role.effort : undefined;
-  log.spawn(role.name, { model: role.model, effort, session: sessionId, resume: !!call.resume, tools });
+  log.spawn(role.name, { model: role.model, effort, session: sessionId, resume: !!call.resume, tools, target: describeTask(call.meta) });
 
   const abortController = new AbortController();
   const minutes = rt.policy.limits.roleTimeoutMinutes;
@@ -332,7 +355,7 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
           else if (b.type === 'thinking') log.role(role.name, c.gray(`… размышляет (${b.thinking.length} симв.)`));
           else if (b.type === 'tool_use') {
             if (b.name.startsWith(MCP_PREFIX)) mcpUses.set(b.id, b.name);
-            log.role(role.name, `→ ${b.name} ${toolArg(b.input)}`);
+            log.toolUse(role.name, b.name, toolArg(b.input));
           }
         }
       } else if (isSDKUserMessage(m) && Array.isArray(m.message.content)) {

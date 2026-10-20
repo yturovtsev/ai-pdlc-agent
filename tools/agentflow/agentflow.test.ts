@@ -1,5 +1,6 @@
-// Офлайн-тесты детерминированных узлов: контракт ревью, правила принятия, ACL, tasks, glob, выбор схемы OpenSpec.
+// Офлайн-тесты детерминированных узлов: контракт ревью, правила принятия, ACL, tasks, glob, выбор схемы OpenSpec, панель статуса.
 //   npm run test:agentflow
+import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { batchesFromTasks, parseTasks } from './context-builder.ts';
@@ -9,10 +10,12 @@ import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { OpenSpec } from './openspec.ts';
 import { decide, validateReview, type Expectation } from './review-validator.ts';
-import { apiErrorIn, decideAcl, mcpViolations, mcpWarnings, sessionTools, type RoleDef, type RoleRuntime } from './roles.ts';
+import { apiErrorIn, decideAcl, describeTask, mcpViolations, mcpWarnings, sessionTools, type RoleDef, type RoleRuntime } from './roles.ts';
 import type { Policy } from './policy.ts';
 import { normalize } from './snapshot.ts';
 import { globToRegExp } from './util.ts';
+import { log } from './log.ts';
+import { fit, panel, panelEnabled, renderPanel, stripAnsi, type PanelState } from './status-panel.ts';
 
 const exp: Expectation = { role: 'spec-reviewer', target: 'design', snapshotId: 'sha256:abc', round: 2, mandatoryChecks: ['DESIGN-ERRORS'] };
 const review = (over: Record<string, unknown> = {}) =>
@@ -254,4 +257,159 @@ test('схему не видит никто — ошибка до создани
 test('явная схема policy перебивает config.yaml', async () => {
   const dir = schemaRepo('corp-edition', true);
   assert.equal(await new OpenSpec(dir, dir).ensureSchema('x', 'spec-driven'), 'spec-driven');
+});
+
+const panelState = (over: Partial<PanelState> = {}): PanelState => ({
+  runId: '20261020-1200-demo',
+  change: 'demo',
+  roles: 5,
+  launches: 7,
+  phase: 'ФАЗА APPLY',
+  activity: 'гейт lint: зелёный',
+  startedAt: 0,
+  ...over,
+});
+
+test('панель: строка субагента, строка контроллера и контекст прогона', () => {
+  const agent = { role: 'implementer', target: 'батч 2', model: 'qwen3-coder', effort: 'high', resume: false, startedAt: 1_000, tools: 3 };
+  const [top, bottom] = renderPanel(panelState({ agent, loop: { name: 'batch-1', round: 2, max: 3 } }), 200, 126_000);
+  for (const part of ['▶ implementer 02:05 · батч 2', 'qwen3-coder', 'effort high', 'новая сессия', 'инстр. 3', 'запуск 7', 'ролей 5']) assert.ok(top.includes(part), part);
+  for (const part of ['⏱ 02:06', 'петля «batch-1» 2/3', 'ФАЗА APPLY', 'change demo', 'run 20261020-1200-demo']) assert.ok(bottom.includes(part), part);
+  assert.ok(renderPanel(panelState({ agent: { ...agent, resume: true } }), 200, 2_000)[0].includes('продолжение сессии'));
+  const [idle] = renderPanel(panelState(), 200, 3_723_000);
+  assert.ok(idle.startsWith('⚙ контроллер') && idle.includes('гейт lint: зелёный'));
+  assert.ok(renderPanel(panelState(), 200, 3_723_000)[1].includes('⏱ 1:02:03'));
+});
+
+test('панель: обрезка по видимой ширине без разрыва ANSI', () => {
+  const long = 'а'.repeat(150);
+  assert.equal(fit('коротко', 40), 'коротко');
+  for (const w of [40, 120]) {
+    assert.equal([...fit(long, w)].length, w);
+    assert.ok(fit(long, w).endsWith('…'));
+    const colored = fit(`\x1b[35m${long}\x1b[0m`, w);
+    assert.equal([...stripAnsi(colored)].length, w);
+    assert.ok(colored.startsWith('\x1b[35m') && colored.endsWith('…\x1b[0m'));
+  }
+  const [top, bottom] = renderPanel(panelState({ phase: long }), 40, 0);
+  assert.ok([...stripAnsi(top)].length <= 40 && [...stripAnsi(bottom)].length === 40);
+});
+
+test('панель включается только в TTY нормального размера без --no-panel', () => {
+  const on = { isTTY: true, rows: 30, cols: 120, env: {} };
+  assert.equal(panelEnabled(on), true);
+  assert.equal(panelEnabled({ ...on, isTTY: false }), false);
+  assert.equal(panelEnabled({ ...on, rows: 9 }), false);
+  assert.equal(panelEnabled({ ...on, cols: 39 }), false);
+  assert.equal(panelEnabled({ ...on, noPanel: true }), false);
+  assert.equal(panelEnabled({ ...on, env: { AGENTFLOW_NO_PANEL: '1' } }), false);
+  assert.equal(panelEnabled({ ...on, rows: undefined }), false);
+});
+
+class FakeTty extends EventEmitter {
+  isTTY = true;
+  writes: string[] = [];
+  constructor(
+    public rows: number,
+    public columns: number,
+  ) {
+    super();
+  }
+  write(s: string): boolean {
+    this.writes.push(s);
+    return true;
+  }
+  get all(): string {
+    return this.writes.join('');
+  }
+  /** Последний кадр панели: текст двух нижних строк без ANSI. */
+  frame(): string[] {
+    const at = `\x1b[${this.rows - 1};1H`;
+    const w = [...this.writes].reverse().find((x) => x.includes(at));
+    if (!w) return [];
+    return w
+      .slice(w.indexOf(at))
+      .split(/\x1b\[\d+;1H\x1b\[2K/)
+      .slice(1)
+      .map((l) => stripAnsi(l.replace(/\x1b8$/, '')));
+  }
+}
+
+const startPanel = (out: FakeTty, enabled = true) => panel.start({ runId: 'r1', change: 'demo', roles: 5, launches: 0, enabled }, out);
+
+test('панель: область прокрутки, resize и идемпотентный stop', () => {
+  const sigint = process.listenerCount('SIGINT');
+  const off = new FakeTty(30, 120);
+  startPanel(off, false);
+  panel.update({ activity: 'x' });
+  assert.equal(off.writes.length, 0);
+
+  const out = new FakeTty(30, 120);
+  startPanel(out);
+  assert.ok(out.all.includes('\x1b[1;28r'));
+  assert.equal(process.listenerCount('SIGINT'), sigint + 1);
+  out.rows = 24;
+  out.columns = 60;
+  out.emit('resize');
+  assert.ok(out.all.includes('\x1b[1;22r'));
+  const f = out.frame();
+  assert.equal(f.length, 2);
+  for (const l of f) assert.ok([...l].length <= 60, l);
+  panel.stop();
+  assert.ok(out.writes.at(-1)!.includes('\x1b[?25h'));
+  assert.ok(out.all.lastIndexOf('\x1b[r') > out.all.lastIndexOf('\x1b[1;22r'));
+  const n = out.writes.length;
+  panel.stop();
+  assert.equal(out.writes.length, n);
+  assert.equal(process.listenerCount('SIGINT'), sigint);
+});
+
+test('панель: маленький терминал после resize выключает панель', () => {
+  const out = new FakeTty(30, 120);
+  startPanel(out);
+  out.rows = 8;
+  out.emit('resize');
+  const n = out.writes.length;
+  panel.update({ activity: 'y' });
+  assert.equal(out.writes.length, n);
+  assert.ok(out.all.endsWith('\x1b[?25h'));
+});
+
+test('панель: хуки лога и пауза на время диалога', () => {
+  const out = new FakeTty(30, 120);
+  startPanel(out);
+  log.phase('ФАЗА APPLY');
+  log.loopOpen('batch-1', 2, 3);
+  log.spawn('implementer', { model: 'qwen3-coder', effort: 'high', session: 'abcdef0123', resume: false, tools: ['read_file'], target: 'батч 1' });
+  log.toolUse('implementer', 'read_file', 'src/index.js');
+  let [top, bottom] = out.frame();
+  assert.ok(top!.includes('▶ implementer') && top!.includes('батч 1') && top!.includes('запуск 1') && top!.includes('инстр. 1'), top);
+  assert.ok(bottom!.includes('петля «batch-1» 2/3'), bottom);
+  log.roleDone('implementer', { turns: 1, seconds: 0, models: [], denials: 0 });
+  log.gate('lint', true, '');
+  [top] = out.frame();
+  assert.ok(top!.startsWith('⚙ контроллер') && top!.includes('гейт lint'), top);
+
+  panel.pause();
+  assert.ok(out.writes.at(-1)!.includes('\x1b[r'));
+  const n = out.writes.length;
+  log.step('во время диалога');
+  assert.equal(out.writes.length, n);
+  panel.resume();
+  assert.ok(out.writes.slice(n).join('').includes('\x1b[1;28r'));
+  log.loopClose('PASS');
+  panel.stop();
+});
+
+test('цель вызова роли для панели: по виду шага', () => {
+  assert.equal(describeTask({ kind: 'clarify' }), 'уточнение intent');
+  assert.equal(describeTask({ kind: 'author', artifact: 'design', generates: 'design.md' }), 'пишет design.md');
+  assert.equal(describeTask({ kind: 'author', artifact: 'specs', generates: 'specs/**/*.md' }), 'пишет specs/**/*.md');
+  assert.equal(describeTask({ kind: 'spec-review', artifact: 'design', target: 'design' }), 'ревью design');
+  assert.equal(describeTask({ kind: 'holistic', target: 'change' }), 'сквозное ревью change');
+  assert.equal(describeTask({ kind: 'implement', batchId: '2' }), 'батч 2');
+  assert.equal(describeTask({ kind: 'implement', batchId: 'final-1' }), 'исправления финального ревью, раунд 1');
+  assert.equal(describeTask({ kind: 'code-review', batchId: '2', target: 'batch-2' }), 'ревью батча 2');
+  assert.equal(describeTask({ kind: 'acceptance', target: 'acceptance' }), 'acceptance-тесты');
+  assert.equal(describeTask({ kind: 'final-review', target: 'final' }), 'финальное ревью');
 });

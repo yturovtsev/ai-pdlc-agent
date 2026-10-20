@@ -1,5 +1,6 @@
 // Консольный рендер конвейера: фазы, петли с номером раунда, запуск субагентов,
 // их вызовы инструментов, решения ACL, гейты и вердикты. Всё дублируется в events.jsonl.
+import { panel } from './status-panel.ts';
 import { oneLine } from './util.ts';
 
 const useColor = process.stdout.isTTY && !process.env['NO_COLOR'];
@@ -53,20 +54,23 @@ export const log = {
     const bar = '═'.repeat(72);
     console.log('\n' + c.bold(bar) + '\n' + c.bold(' ' + title) + '\n' + c.bold(bar));
     emit('phase', { title });
+    panel.update({ phase: title, loop: undefined });
   },
 
   loopOpen(name: string, round: number, max: number): void {
     line(c.bold(`┌─ петля «${name}» · раунд ${round}/${max}`));
     depth++;
     emit('loop', { name, round, max });
+    panel.update({ loop: { name, round, max } });
   },
 
   loopClose(text: string): void {
     depth = Math.max(0, depth - 1);
     line(c.bold(`└─ ${text}`));
+    panel.update({ loop: undefined });
   },
 
-  spawn(role: string, info: { model: string; effort?: string; session: string; resume: boolean; tools: string[] }): void {
+  spawn(role: string, info: { model: string; effort?: string; session: string; resume: boolean; tools: string[]; target?: string }): void {
     const how = info.resume ? `продолжение сессии ${info.session.slice(0, 8)}` : `новая сессия ${info.session.slice(0, 8)}`;
     line(
       paintRole(role, `▶ субагент ${role}`) +
@@ -74,10 +78,22 @@ export const log = {
     );
     line(c.gray(`  инструменты: ${info.tools.join(', ')}`));
     emit('spawn', { role, ...info });
+    panel.update((s) => {
+      s.launches++;
+      s.agent = { role, target: info.target, model: info.model, effort: info.effort, resume: info.resume, startedAt: Date.now(), tools: 0 };
+    });
   },
 
   role(role: string, text: string): void {
     line(paintRole(role, `  ${role} │ `) + text);
+  },
+
+  /** Вызов инструмента роли: строка лога и счётчик инструментов в панели. */
+  toolUse(role: string, name: string, arg: string): void {
+    log.role(role, `→ ${name} ${arg}`);
+    panel.update((s) => {
+      if (s.agent) s.agent.tools++;
+    });
   },
 
   roleDone(role: string, info: { turns: number; seconds: number; models: string[]; denials: number }): void {
@@ -88,6 +104,7 @@ export const log = {
         (info.denials ? c.yellow(` · отказов ACL: ${info.denials}`) : ''),
     );
     emit('role-done', { role, ...info });
+    panel.update({ agent: undefined, activity: `${role} завершил` });
   },
 
   acl(role: string, tool: string, target: string, allowed: boolean, reason: string): void {
@@ -99,16 +116,19 @@ export const log = {
   step(text: string): void {
     line(c.gray('⚙ ') + text);
     emit('step', { text });
+    panel.update({ activity: oneLine(text, 160) });
   },
 
   gate(op: string, ok: boolean, detail: string): void {
     line((ok ? c.green('● гейт ') : c.red('● гейт ')) + `${op}: ` + (ok ? c.green('зелёный') : c.red('красный')) + c.gray(detail ? ` · ${detail}` : ''));
     emit('gate', { op, ok, detail });
+    panel.update({ activity: `гейт ${op}: ${ok ? 'зелёный' : 'красный'}` });
   },
 
   verdict(status: string, summary: string, next: string): void {
     line(verdictColor(status)(`◆ вердикт ${status}`) + c.gray(` · ${summary}`) + ` → ${next}`);
     emit('verdict', { status, summary, next });
+    panel.update({ activity: `вердикт ${status} → ${oneLine(next, 80)}` });
   },
 
   inject(text: string): void {
@@ -134,5 +154,6 @@ export const log = {
   human(text: string): void {
     line(c.bold(c.yellow('☺ ты: ')) + text);
     emit('human', { text });
+    panel.update({ activity: 'решение человека' });
   },
 };

@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { c, log } from './log.ts';
-import { decideAcl, spawnTools, type RoleCall, type RoleResult, type RoleRuntime } from './roles.ts';
+import { decideAcl, describeTask, spawnTools, type RoleCall, type RoleResult, type RoleRuntime } from './roles.ts';
 import { KIT_BIN } from './config.ts';
 import { gateEnv } from './policy.ts';
 import { exec } from './util.ts';
@@ -153,13 +153,13 @@ function json(v: unknown): string {
 export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResult> {
   const { role, meta } = call;
   const session = call.resume ?? randomUUID();
-  log.spawn(role.name, { model: `${role.model} (mock)`, effort: role.effort, session, resume: !!call.resume, tools: spawnTools(rt.policy, role, call.readOnly) });
+  log.spawn(role.name, { model: `${role.model} (mock)`, effort: role.effort, session, resume: !!call.resume, tools: spawnTools(rt.policy, role, call.readOnly), target: describeTask(meta) });
   log.role(role.name, c.gray('сессия открыта · mock'));
   // Те же сообщения потока, что у настоящей сессии, чтобы `agentflow agents` работал и в mock.
   rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'system', subtype: 'init', session_id: session, model: `${role.model} (mock)`, tools: spawnTools(rt.policy, role, call.readOnly), permission_mode: 'default' } });
 
   const write = (rel: string, content: string) => {
-    log.role(role.name, `→ write_file ${rel}`);
+    log.toolUse(role.name, 'write_file', rel);
     const d = decideAcl(rt, role.name, !!call.readOnly, 'write_file', { file_path: rel });
     log.acl(role.name, 'write_file', d.target, d.ok, d.reason);
     if (!d.ok) return;
@@ -168,7 +168,7 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
     writeFileSync(abs, content);
   };
   const read = (rel: string) => {
-    log.role(role.name, `→ read_file ${rel}`);
+    log.toolUse(role.name, 'read_file', rel);
     return readFileSync(join(rt.worktree, rel), 'utf8');
   };
   const pass = (target: string, extra: Record<string, unknown> = {}) => ({
@@ -250,7 +250,7 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
             "test('slugify реэкспортируется из index', () => {\n  assert.equal(typeof slugify, 'function');\n});\n",
         );
       }
-      log.role(role.name, '→ run_shell_command agentflow-gate lint');
+      log.toolUse(role.name, 'run_shell_command', 'agentflow-gate lint');
       const d = decideAcl(rt, role.name, false, 'run_shell_command', { command: 'agentflow-gate lint' });
       log.acl(role.name, 'run_shell_command', d.target, d.ok, d.reason);
       text = json({ status: 'DONE', tasks: [], responses: [], specIssue: null });
@@ -269,7 +269,7 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
         })
         .join('\n');
       write('e2e/text-slug.test.js', "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { slugify } from '../src/index.js';\n\n" + body);
-      log.role(role.name, '→ run_shell_command agentflow-gate e2e');
+      log.toolUse(role.name, 'run_shell_command', 'agentflow-gate e2e');
       const r = await exec('bash', [`${KIT_BIN}/agentflow-gate`, 'e2e'], { cwd: rt.worktree, env: { ...process.env, ...gateEnv(rt.policy) } });
       const scenarios = reqs.flatMap((rq) => rq.scenarios.map((s) => ({ rq, s })));
       const result = r.code === 0 ? 'PASS' : 'FAIL';

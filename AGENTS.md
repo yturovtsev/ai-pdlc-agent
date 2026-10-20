@@ -17,6 +17,7 @@ Kit конвейера spec-driven разработки на Qwen Code (корп
 | `context-builder.ts` | промпты ролей, индекс требований `REQ-*/SCN-*`, батчи из задач OpenSpec |
 | `review-validator.ts` | контракт ответа ревьюера и правила принятия (`decide`) |
 | `human.ts` | меню стрелками: рекомендация `★` + обоснование; `--auto-approve` выбирает рекомендацию |
+| `status-panel.ts` | панель статуса внизу терминала (субагент, модель, effort, время); пополняется хуками `log.ts` |
 | `config.ts`, `policy.ts` | kit vs целевой репозиторий, слои настроек, `gateEnv` |
 | `openspec.ts`, `git.ts`, `gates.ts`, `snapshot.ts`, `state.ts` | детерминированные узлы |
 | `mock.ts`, `inject.ts`, `smoke.ts`, `agents.ts`, `report.ts` | mock-роли, fault injection, smoke CLI, список сессий, ACCEPTANCE.md |
@@ -70,6 +71,10 @@ Mock-прогон создаёт ветку и worktree и коммитит в �
   если у модели в провайдере нет своего `generationConfig.timeout`; `env` SDK сливается с `process.env`.
 - Node 22.12: `node --test test/` каталог не принимает — нужен glob; `@inquirer/*` просит ≥22.13.
 - `--auto-approve` + вечно красный гейт раньше зацикливался; теперь с 3-го исчерпания рекомендуется стоп.
+- Панель держится областью прокрутки DECSTBM (`ESC[1;Nr`): установка и сброс области переводят курсор
+  в начало экрана, поэтому вокруг них `ESC7`/`ESC8`. Ctrl+C получает вся группа процессов: обёртка
+  `bin/agentflow.mjs` перехватывает SIGINT и ждёт контроллер, иначе shell получает терминал раньше, чем
+  контроллер снимет область.
 - MCP в CLI 0.1.8 (проверено пробником: CLI из SDK + фейковый OpenAI-эндпоинт): `coreTools` MCP не
   фильтрует; `readOnlyHint` и `trust: true` выполняются без `canUseTool`; `excludeTools: ['mcp__*']`
   отклоняет вызов до исполнения, но из init-списка не убирает; `allowedMcpServerNames` (непустой)
