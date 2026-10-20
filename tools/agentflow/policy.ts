@@ -11,6 +11,8 @@ export interface RolePolicy {
   write: string[];
   denyWrite?: string[];
   shell: GateOp[];
+  /** Шаблоны имён MCP-инструментов (`mcp__<server>__<tool>`, `*`); нет ключа — MCP запрещён. */
+  mcp?: string[];
 }
 
 export interface Policy {

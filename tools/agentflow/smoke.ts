@@ -1,19 +1,20 @@
 // Smoke-тесты корпоративного CLI и SDK (шаг 1 порядка внедрения): каждая роль уходит на свою
 // модель, ревьюер не пишет и не запускает shell, ACL implementer режет защищённые пути,
 // несколько tool calls подряд в thinking mode не ломают историю, unattended-сессия ничего не
-// спрашивает, resume продолжает сессию, битый JSON не становится PASS.
+// спрашивает, resume продолжает сессию, битый JSON не становится PASS, MCP-инструменты доступны
+// только по roles.<роль>.mcp.
 //
-//   npm run smoke [-- --only spec-reviewer,implementer]
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+//   npm run smoke [-- --only spec-reviewer,implementer,mcp]
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
-import { query } from '@qwen-code/sdk';
-import { resolveRepo } from './config.ts';
+import { query, type McpServerConfig } from '@qwen-code/sdk';
+import { KIT, resolveRepo } from './config.ts';
 import { addWorktree } from './git.ts';
 import { c, setLogSink } from './log.ts';
-import { loadPolicy, qwenAuthType, qwenExecutable } from './policy.ts';
+import { loadPolicy, qwenAuthType, qwenExecutable, type Policy } from './policy.ts';
 import { validateReview } from './review-validator.ts';
-import { loadRoles, runRole, type RoleRuntime } from './roles.ts';
+import { loadRoles, mcpViolations, runRole, type RoleDef, type RoleRuntime } from './roles.ts';
 import { RunStore } from './state.ts';
 import { exec, stamp } from './util.ts';
 
@@ -38,7 +39,14 @@ async function main(): Promise<void> {
   await addWorktree(ROOT, wt, `agentflow/smoke-${runStamp}`);
   const store = new RunStore(dir);
   setLogSink((e) => store.append(e));
-  const rt: RoleRuntime = { policy, change: 'smoke', worktree: wt, contextsDir, ledger: (e) => store.append(e) };
+  // Init-сообщения сессий по шагу: какие инструменты и MCP-серверы CLI реально зарегистрировал.
+  const inits = new Map<string, { tools: string[]; servers: { name: string; status: string }[] }>();
+  const ledger = (e: Record<string, unknown>) => {
+    const m = e['msg'] as { type?: string; subtype?: string; tools?: string[]; mcp_servers?: { name: string; status: string }[] } | undefined;
+    if (e['ev'] === 'sdk' && m?.type === 'system' && m.subtype === 'init') inits.set(String(e['step']), { tools: m.tools ?? [], servers: m.mcp_servers ?? [] });
+    store.append(e);
+  };
+  const rt: RoleRuntime = { policy, change: 'smoke', worktree: wt, contextsDir, ledger };
   const checks: Check[] = [];
   const check = (name: string, ok: boolean, detail: string) => {
     checks.push({ name, ok, detail });
@@ -132,11 +140,60 @@ async function main(): Promise<void> {
     check(`${r.name}: ask_user_question и agent не регистрируются`, !r.tools.includes('ask_user_question') && !r.tools.includes('agent'), `инструменты: ${r.tools.join(', ')}`);
   }
 
-  // 6. Битый JSON и таймаут не превращаются в PASS.
+  // 6. MCP только по policy: stdio-серверы smoke-mcp-server.mjs, у jira search и у confluence
+  // get_page — readOnlyHint (CLI выполняет их без canUseTool), остальные спрашивают разрешение.
+  if (!only || only.includes('mcp')) await smokeMcp(rt, roles.get('spec-author'), roles.get('spec-reviewer'), inits, check);
+
+  // 7. Битый JSON и таймаут не превращаются в PASS.
   const broken = validateReview('{"status":"PASS", обрыв', { role: 'spec-reviewer', target: 'proposal', snapshotId: 'sha256:x', round: 1, mandatoryChecks: [] });
   check('битый JSON ревьюера — ошибка шага, не вердикт', !broken.ok, broken.ok ? '' : broken.error);
 
   finish(dir, checks);
+}
+
+type Inits = Map<string, { tools: string[]; servers: { name: string; status: string }[] }>;
+
+/** stdio-серверы как в настройках CLI; выполненные инструменты пишутся в log. */
+function mcpServers(log: string): Record<string, McpServerConfig> {
+  const server = (name: string): McpServerConfig => ({ command: process.execPath, args: [join(KIT, 'tools/agentflow/smoke-mcp-server.mjs'), name], env: { SMOKE_MCP_LOG: log } });
+  return { jira: server('jira'), confluence: server('confluence') };
+}
+
+async function smokeMcp(
+  base: RoleRuntime,
+  author: RoleDef | undefined,
+  reviewer: RoleDef | undefined,
+  inits: Inits,
+  check: (name: string, ok: boolean, detail: string) => void,
+): Promise<void> {
+  if (!author || !reviewer) return;
+  const log = join(base.contextsDir, 'smoke-mcp-calls.txt');
+  const called = { has: (t: string) => existsSync(log) && readFileSync(log, 'utf8').split('\n').includes(t), list: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().replaceAll('\n', ', ') : ''), clear: () => rmSync(log, { force: true }) };
+  const withMcp = (role: string, mcp: string[]): RoleRuntime => ({
+    ...base,
+    mcpServers: mcpServers(log),
+    policy: { ...base.policy, roles: { ...base.policy.roles, [role]: { ...base.policy.roles[role]!, mcp } } } as Policy,
+  });
+  const ask = 'Smoke-тест MCP. Вызови по очереди MCP-инструменты mcp__jira__get_issue, mcp__jira__create_issue, mcp__jira__search и mcp__confluence__get_page — те, что у тебя есть. Ответь списком: инструмент — результат или ошибка.';
+
+  const rv = withMcp('spec-reviewer', []);
+  await runRole(rv, { role: reviewer, label: 'smoke-mcp-none', cwd: base.worktree, meta: { kind: 'spec-review' }, prompt: ask });
+  check('MCP: роль без mcp не выполнила ни одного MCP-инструмента', !!inits.get('smoke-mcp-none') && !called.list(), `выполнено: ${called.list() || 'ничего'}`);
+
+  called.clear();
+  const au = withMcp('spec-author', ['mcp__jira__get_issue']);
+  const res = await runRole(au, { role: author, label: 'smoke-mcp-jira', cwd: base.worktree, meta: { kind: 'author' }, prompt: ask });
+  const servers = (inits.get('smoke-mcp-jira')?.servers ?? []).map((x) => x.name);
+  check('MCP: подключён только названный сервер', servers.includes('jira') && !servers.includes('confluence') && !called.has('mcp__confluence__get_page'), `серверы: ${servers.join(', ') || 'нет'}`);
+  check('MCP: инструмент из allowlist выполняется', called.has('mcp__jira__get_issue'), res.ok ? res.text.slice(0, 80) : res.error ?? '');
+  check('MCP: ask-инструмент вне allowlist отклонён ACL', !called.has('mcp__jira__create_issue'), '');
+  const bad = mcpViolations(au.policy, 'spec-author', false, res.mcpCalls ?? []);
+  check('MCP: вызов в обход ACL виден сверке', !called.has('mcp__jira__search') || bad.includes('mcp__jira__search'), `вне allowlist: ${bad.join(', ') || 'нет'}`);
+
+  const wiki = withMcp('spec-author', ['mcp__wiki__*']);
+  await runRole(wiki, { role: author, label: 'smoke-mcp-wiki', cwd: base.worktree, meta: { kind: 'author' }, prompt: 'Smoke-тест. Ответь одним словом: OK.' });
+  const wikiServers = inits.get('smoke-mcp-wiki')?.servers ?? [];
+  check('MCP: ненастроенный сервер виден в init', !wikiServers.some((x) => x.name === 'wiki' && x.status === 'connected'), wikiServers.map((x) => `${x.name} ${x.status}`).join(', ') || 'серверов нет');
 }
 
 function finish(dir: string, checks: Check[]): void {

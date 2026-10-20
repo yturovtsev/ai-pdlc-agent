@@ -10,6 +10,7 @@ import {
   isSDKUserMessage,
   query,
   type CanUseTool,
+  type McpServerConfig,
   type QueryOptions,
   type SDKResultMessage,
 } from '@qwen-code/sdk';
@@ -36,6 +37,7 @@ export interface RoleDef {
 export const READ_TOOLS = ['read_file', 'grep_search', 'glob', 'list_directory'];
 const WRITE_TOOLS = new Set(['write_file', 'edit', 'notebook_edit']);
 const SHELL_TOOLS = new Set(['run_shell_command']);
+const MCP_PREFIX = 'mcp__';
 
 /** Роли kit (.qwen/agents/), поверх них одноимённые файлы целевого репозитория (.agentflow/agents/). */
 export function roleFiles(repo: string): { file: string; path: string }[] {
@@ -111,6 +113,8 @@ export interface RoleResult {
   models: string[];
   denials: number;
   usage?: { input_tokens: number; output_tokens: number };
+  /** MCP-инструменты, которые выполнились (успешный tool_result), — для сверки с policy после роли. */
+  mcpCalls?: string[];
 }
 
 export interface RoleRuntime {
@@ -121,6 +125,8 @@ export interface RoleRuntime {
   contextsDir: string;
   ledger: (event: Record<string, unknown>) => void;
   mock?: (rt: RoleRuntime, call: RoleCall) => Promise<RoleResult>;
+  /** MCP-серверы, переданные сессии через SDK (smoke); обычно серверы берутся из настроек CLI. */
+  mcpServers?: Record<string, McpServerConfig>;
 }
 
 export interface AclDecision {
@@ -156,6 +162,13 @@ export function decideAcl(rt: RoleRuntime, roleName: string, readOnly: boolean, 
     if (readOnly || !rp.shell.includes(m[1]!)) return { ok: false, target: cmd, reason: `операция ${m[1]} роли не разрешена` };
     return { ok: true, target: cmd, reason: 'операция gates.ops из policy' };
   }
+  if (toolName.startsWith(MCP_PREFIX)) {
+    if (readOnly) return { ok: false, target: toolName, reason: 'шаг только на чтение' };
+    const hit = (rp.mcp ?? []).find((g) => matchesAny(toolName, [g]));
+    return hit
+      ? { ok: true, target: toolName, reason: `шаблон ${hit} из roles.${roleName}.mcp` }
+      : { ok: false, target: toolName, reason: `нет в roles.${roleName}.mcp` };
+  }
   return { ok: false, target: toolName, reason: 'инструмент не в политике роли' };
 }
 
@@ -170,6 +183,55 @@ export function aclFor(rt: RoleRuntime, roleName: string, readOnly: boolean): Ca
 
 export function toolsFor(role: RoleDef, readOnly?: boolean): string[] {
   return readOnly ? role.tools.filter((t) => READ_TOOLS.includes(t)) : role.tools;
+}
+
+/** MCP-шаблоны роли в этом шаге: в шаге только на чтение MCP нет ни у кого. */
+export function mcpPatterns(policy: Policy, roleName: string, readOnly?: boolean): string[] {
+  return readOnly ? [] : (policy.roles[roleName]?.mcp ?? []);
+}
+
+export interface SessionTools {
+  coreTools: string[];
+  excludeTools: string[];
+  allowedMcpServerNames?: string[];
+}
+
+/**
+ * Инструменты сессии. coreTools CLI фильтрует только встроенные инструменты, а MCP-вызов с
+ * readOnlyHint или с сервера trust: true выполняется без canUseTool. Поэтому роль без MCP
+ * получает deny-правило mcp__*: CLI проверяет его раньше разрешения по умолчанию.
+ */
+export function sessionTools(policy: Policy, role: RoleDef, readOnly?: boolean): SessionTools {
+  const mcp = mcpPatterns(policy, role.name, readOnly);
+  const coreTools = toolsFor(role, readOnly).filter((t) => !t.startsWith(MCP_PREFIX));
+  if (!mcp.length) return { coreTools, excludeTools: [...policy.denyAll, `${MCP_PREFIX}*`] };
+  const servers = mcp.map((g) => {
+    const parts = g.split('__');
+    return parts.length >= 3 && parts[0] === 'mcp' && parts[1] && !/[*?]/.test(parts[1]) ? parts[1] : undefined;
+  });
+  const named = servers.every((x): x is string => !!x);
+  return { coreTools, excludeTools: policy.denyAll, ...(named ? { allowedMcpServerNames: [...new Set(servers)] } : {}) };
+}
+
+/** Инструменты для лога запуска: встроенные из coreTools и MCP-шаблоны роли в этом шаге. */
+export function spawnTools(policy: Policy, role: RoleDef, readOnly?: boolean): string[] {
+  return [...sessionTools(policy, role, readOnly).coreTools, ...mcpPatterns(policy, role.name, readOnly)];
+}
+
+/** MCP-вызовы роли вне её шаблонов: CLI мог выполнить их без ACL (trust, readOnlyHint). */
+export function mcpViolations(policy: Policy, roleName: string, readOnly: boolean | undefined, calls: string[]): string[] {
+  const mcp = mcpPatterns(policy, roleName, readOnly);
+  return [...new Set(calls.filter((t) => t.startsWith(MCP_PREFIX) && !matchesAny(t, mcp)))];
+}
+
+/** MCP-инструменты из tools: роли, которые policy не разрешает: CLI на tools: для MCP не смотрит. */
+export function mcpWarnings(policy: Policy, roles: Map<string, RoleDef>): string[] {
+  const out: string[] = [];
+  for (const r of roles.values()) {
+    const missing = r.tools.filter((t) => t.startsWith(MCP_PREFIX) && !matchesAny(t, policy.roles[r.name]?.mcp ?? []));
+    if (missing.length) out.push(`${r.name}: ${missing.join(', ')} в tools: (${r.file}) не разрешены policy — добавь шаблон в roles.${r.name}.mcp`);
+  }
+  return out;
 }
 
 function toolArg(input: unknown): string {
@@ -189,7 +251,8 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   if (rt.mock) return rt.mock(rt, call);
   const { role } = call;
   const sessionId = call.resume ?? randomUUID();
-  const tools = toolsFor(role, call.readOnly);
+  const st = sessionTools(rt.policy, role, call.readOnly);
+  const tools = spawnTools(rt.policy, role, call.readOnly);
   const effort = rt.policy.qwen.effortViaSdk ? role.effort : undefined;
   log.spawn(role.name, { model: role.model, effort, session: sessionId, resume: !!call.resume, tools });
 
@@ -215,8 +278,10 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
     model: role.model,
     systemPrompt: { type: 'preset', preset: 'qwen_code', append: role.prompt },
     permissionMode: 'default',
-    coreTools: tools,
-    excludeTools: rt.policy.denyAll,
+    coreTools: st.coreTools,
+    excludeTools: st.excludeTools,
+    ...(st.allowedMcpServerNames ? { allowedMcpServerNames: st.allowedMcpServerNames } : {}),
+    ...(rt.mcpServers ? { mcpServers: rt.mcpServers } : {}),
     canUseTool: aclFor(rt, role.name, !!call.readOnly),
     maxSessionTurns: role.maxTurns,
     includeDirectories: [rt.contextsDir],
@@ -233,6 +298,9 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
 
   const started = Date.now();
   const models = new Set<string>();
+  // Отклонённый CLI или ACL вызов приходит с is_error: в сверку идут только выполненные.
+  const mcpUses = new Map<string, string>();
+  const mcpCalls: string[] = [];
   let result: SDKResultMessage | undefined;
   let error: string | undefined;
   try {
@@ -240,17 +308,28 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
     for await (const m of q) {
       rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: m });
       if (isSDKSystemMessage(m) && m.subtype === 'init') {
-        log.role(role.name, c.gray(`сессия открыта · модель ${m.model ?? '?'} · режим ${m.permission_mode ?? '?'} · инструментов ${m.tools?.length ?? 0}`));
+        const mcpTools = (m.tools ?? []).filter((t) => t.startsWith(MCP_PREFIX)).length;
+        const servers = (m.mcp_servers ?? []).map((x) => `${x.name} ${x.status}`).join(', ');
+        log.role(
+          role.name,
+          c.gray(`сессия открыта · модель ${m.model ?? '?'} · режим ${m.permission_mode ?? '?'} · инструментов ${m.tools?.length ?? 0}`) +
+            (servers || mcpTools ? c.gray(` · MCP: ${servers || 'серверов нет'}, инструментов ${mcpTools}`) : ''),
+        );
       } else if (isSDKAssistantMessage(m)) {
         if (m.message.model) models.add(m.message.model);
         for (const b of m.message.content) {
           if (b.type === 'text' && b.text.trim()) log.role(role.name, '«' + oneLine(b.text, 220) + '»');
           else if (b.type === 'thinking') log.role(role.name, c.gray(`… размышляет (${b.thinking.length} симв.)`));
-          else if (b.type === 'tool_use') log.role(role.name, `→ ${b.name} ${toolArg(b.input)}`);
+          else if (b.type === 'tool_use') {
+            if (b.name.startsWith(MCP_PREFIX)) mcpUses.set(b.id, b.name);
+            log.role(role.name, `→ ${b.name} ${toolArg(b.input)}`);
+          }
         }
       } else if (isSDKUserMessage(m) && Array.isArray(m.message.content)) {
         for (const b of m.message.content) {
-          if (b.type === 'tool_result' && b.is_error) log.role(role.name, c.red('✗ ' + oneLine(blockText(b.content), 160)));
+          if (b.type !== 'tool_result') continue;
+          if (b.is_error) log.role(role.name, c.red('✗ ' + oneLine(blockText(b.content), 160)));
+          else if (mcpUses.has(b.tool_use_id)) mcpCalls.push(mcpUses.get(b.tool_use_id)!);
         }
       } else if (isSDKResultMessage(m)) {
         result = m;
@@ -263,7 +342,7 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   }
 
   const seconds = Math.round((Date.now() - started) / 1000);
-  const base = { sessionId, seconds, models: [...models] };
+  const base = { sessionId, seconds, models: [...models], mcpCalls };
   if (!result) {
     // CLI упал до ответа: показываем его stderr и команду запуска, чтобы причину было видно сразу.
     log.error(`${role.name}: CLI завершился без ответа: ${error ?? 'нет result'}`);

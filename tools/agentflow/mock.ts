@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { c, log } from './log.ts';
-import { decideAcl, toolsFor, type RoleCall, type RoleResult, type RoleRuntime } from './roles.ts';
+import { decideAcl, spawnTools, type RoleCall, type RoleResult, type RoleRuntime } from './roles.ts';
 import { KIT_BIN } from './config.ts';
 import { gateEnv } from './policy.ts';
 import { exec } from './util.ts';
@@ -153,10 +153,10 @@ function json(v: unknown): string {
 export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResult> {
   const { role, meta } = call;
   const session = call.resume ?? randomUUID();
-  log.spawn(role.name, { model: `${role.model} (mock)`, effort: role.effort, session, resume: !!call.resume, tools: toolsFor(role, call.readOnly) });
+  log.spawn(role.name, { model: `${role.model} (mock)`, effort: role.effort, session, resume: !!call.resume, tools: spawnTools(rt.policy, role, call.readOnly) });
   log.role(role.name, c.gray('сессия открыта · mock'));
   // Те же сообщения потока, что у настоящей сессии, чтобы `agentflow agents` работал и в mock.
-  rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'system', subtype: 'init', session_id: session, model: `${role.model} (mock)`, tools: toolsFor(role, call.readOnly), permission_mode: 'default' } });
+  rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'system', subtype: 'init', session_id: session, model: `${role.model} (mock)`, tools: spawnTools(rt.policy, role, call.readOnly), permission_mode: 'default' } });
 
   const write = (rel: string, content: string) => {
     log.role(role.name, `→ write_file ${rel}`);

@@ -67,6 +67,14 @@ Mock-прогон создаёт ветку и worktree и коммитит в �
   реальная схема из config.yaml. OpenSpec 1.13 не отдаёт `sourcePath` задач. CLI выбирает `ensureSchema`.
 - Node 22.12: `node --test test/` каталог не принимает — нужен glob; `@inquirer/*` просит ≥22.13.
 - `--auto-approve` + вечно красный гейт раньше зацикливался; теперь с 3-го исчерпания рекомендуется стоп.
+- MCP в CLI 0.1.8 (проверено пробником: CLI из SDK + фейковый OpenAI-эндпоинт): `coreTools` MCP не
+  фильтрует; `readOnlyHint` и `trust: true` выполняются без `canUseTool`; `excludeTools: ['mcp__*']`
+  отклоняет вызов до исполнения, но из init-списка не убирает; `allowedMcpServerNames` (непустой)
+  отключает остальные серверы. Модели MCP приходят через `tool_search`. SDK-серверы
+  (`createSdkMcpServer`) CLI считает доверенными — для проверки ACL нужен stdio-сервер.
+- Init-список `tools` ≠ инструменты модели: при `coreTools: ['read_file']` модели уходят ещё `agent`,
+  `ask_user_question`, `skill`, `tool_search`; `ask_user_question` проходит `canUseTool`, `agent` и
+  `skill` — нет.
 
 ## Решения (почему так)
 
@@ -81,6 +89,6 @@ Mock-прогон создаёт ветку и worktree и коммитит в �
 ## Не сделано
 
 Команды `/opsx:*` и `/spec-*` для gigacode; `.gigacode/settings.json`; контейнер, sandbox, сетевой
-allowlist; хуки и MCP-источники требований; Claude Doc не обновлён под возврат spec-author.
+allowlist; хуки и MCP-источники требований (MCP-инструменты ролям даёт `roles.<роль>.mcp`); Claude Doc не обновлён под возврат spec-author.
 На gigacode конвейер запущен у пользователя после правки id моделей; все петли целиком проверены
 на mock-ролях (демо kit и чужой репозиторий со схемой spec-driven).

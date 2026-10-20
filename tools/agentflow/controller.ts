@@ -39,7 +39,7 @@ import { OpenSpec, topoOrder, type ArtifactNode } from './openspec.ts';
 import { loadPolicy, qwenExecutable, type Policy } from './policy.ts';
 import { printLoopSummary, writeAcceptanceReport } from './report.ts';
 import { decide, countBySeverity, validateReview, type Decision, type Expectation, type Review, type ReviewFinding } from './review-validator.ts';
-import { expandGlob, loadRoles, roleFiles, runRole, type RoleDef, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
+import { expandGlob, loadRoles, mcpViolations, mcpWarnings, roleFiles, runRole, type RoleDef, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
 import { artifactFiles, artifactSnapshot, artifactText, codeSnapshot, specDigest } from './snapshot.ts';
 import { RunStore, STAGES, type BatchState, type Finding, type RunState, type Stage } from './state.ts';
 import { Blocked, exec, extractJson, matchesAny, now, oneLine, sha256, short, stamp } from './util.ts';
@@ -79,6 +79,12 @@ function role(ctx: Ctx, name: string): RoleDef {
   const r = ctx.roles.get(name);
   if (!r) throw new Error(`нет роли ${name} в .qwen/agents/`);
   return r;
+}
+
+/** MCP-вызовы против policy: защита второй линии для инструментов, которые CLI выполнил без ACL. */
+function checkMcp(ctx: Ctx, roleName: string, readOnly: boolean | undefined, res: RoleResult): void {
+  const bad = mcpViolations(ctx.policy, roleName, readOnly, res.mcpCalls ?? []);
+  if (bad.length) throw new Blocked(`${roleName} вызвал MCP-инструменты вне roles.${roleName}.mcp: ${bad.join(', ')}`);
 }
 
 function account(ctx: Ctx, r: RoleDef, res: RoleResult): void {
@@ -125,6 +131,7 @@ async function callRole(
     for (let attempt = 1; attempt <= tries; attempt++) {
       const res = await runRole(ctx.rt, { role: r, prompt, label: opts.label, cwd: ctx.wt, readOnly: opts.readOnly, resume: attempt === 1 && series === 1 ? opts.resume : undefined, meta });
       account(ctx, r, res);
+      checkMcp(ctx, name, opts.readOnly, res);
       if (res.ok) return res;
       lastError = res.error ?? 'неизвестная ошибка';
       log.warn(`${name}: ошибка шага (${lastError}) — попытка ${attempt}/${tries}`);
@@ -154,6 +161,7 @@ async function callReviewer(
       writeContext(ctx.contextsDir, tag, p);
       const res = await runRole(ctx.rt, { role: r, prompt: p, label, cwd: ctx.wt, meta });
       account(ctx, r, res);
+      checkMcp(ctx, name, false, res);
       if (!res.ok) {
         lastError = res.error ?? 'неизвестная ошибка';
         log.warn(`${name}: ошибка шага (${lastError}) — попытка ${attempt}/${tries}`);
@@ -1530,6 +1538,7 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
   if (!existsSync(join(ROOT, 'openspec'))) throw new Error(`в ${ROOT} нет openspec/: выполни agentflow init (или openspec init)`);
   const policy = loadPolicy(ROOT);
   const roles = loadRoles(ROOT);
+  for (const w of mcpWarnings(policy, roles)) log.warn(w);
   for (const n of ROLE_NAMES) if (!roles.has(n)) throw new Error(`нет файла роли ${n}.md ни в kit, ни в .agentflow/agents/`);
   const dirty = (await changedPaths(ROOT)).filter((p) => !p.startsWith('.agentflow-runs/'));
 
@@ -1626,6 +1635,7 @@ async function resumeRun(runId: string): Promise<void> {
   }
   const policy = loadPolicy(ROOT);
   const roles = loadRoles(ROOT);
+  for (const w of mcpWarnings(policy, roles)) log.warn(w);
   if (policy.sha !== store.state.versions.policy) log.warn('policy.yaml изменился с начала run — используется новая версия');
   store.state.status = 'running';
   store.state.stopReason = undefined;

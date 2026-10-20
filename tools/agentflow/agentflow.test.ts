@@ -9,7 +9,8 @@ import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { OpenSpec } from './openspec.ts';
 import { decide, validateReview, type Expectation } from './review-validator.ts';
-import { decideAcl, type RoleRuntime } from './roles.ts';
+import { decideAcl, mcpViolations, mcpWarnings, sessionTools, type RoleDef, type RoleRuntime } from './roles.ts';
+import type { Policy } from './policy.ts';
 import { normalize } from './snapshot.ts';
 import { globToRegExp } from './util.ts';
 
@@ -116,6 +117,56 @@ test('ACL: implementer не пишет в спеку и e2e, вне worktree и 
 test('ACL: ревьюер не пишет, шаг readOnly не пишет никому', () => {
   assert.equal(decideAcl(rt, 'code-reviewer', false, 'write_file', { file_path: 'src/a.js' }).ok, false);
   assert.equal(decideAcl(rt, 'implementer', true, 'write_file', { file_path: 'src/a.js' }).ok, false);
+});
+
+const mcpPolicy = (mcp?: string[]) =>
+  ({ ...rt.policy, denyAll: ['Bash(git *)'], roles: { ...rt.policy.roles, 'spec-author': { write: [], shell: [], ...(mcp ? { mcp } : {}) } } }) as unknown as Policy;
+const mcpRt = (mcp?: string[]) => ({ ...rt, policy: mcpPolicy(mcp) }) as RoleRuntime;
+const roleDef = (name: string, tools: string[]) => ({ name, tools, file: `kit:.qwen/agents/${name}.md` }) as unknown as RoleDef;
+
+test('ACL MCP: разрешено только по шаблону roles.<роль>.mcp и не в шаге readOnly', () => {
+  const ok = decideAcl(mcpRt(['mcp__jira__*']), 'spec-author', false, 'mcp__jira__get_issue', {});
+  assert.ok(ok.ok);
+  assert.match(ok.reason, /mcp__jira__\*/);
+  const out = decideAcl(mcpRt(['mcp__jira__get_issue']), 'spec-author', false, 'mcp__jira__create_issue', {});
+  assert.equal(out.ok, false);
+  assert.match(out.reason, /roles\.spec-author\.mcp/);
+  assert.equal(decideAcl(mcpRt(['mcp__jira__*']), 'spec-author', true, 'mcp__jira__get_issue', {}).ok, false);
+  assert.equal(decideAcl(mcpRt(['mcp__jira__*']), 'code-reviewer', false, 'mcp__jira__get_issue', {}).ok, false);
+});
+
+test('сессия: без mcp и в шаге readOnly MCP-инструменты не регистрируются', () => {
+  const r = roleDef('spec-author', ['read_file', 'mcp__jira__get_issue']);
+  const none = sessionTools(mcpPolicy(), r);
+  assert.deepEqual(none.coreTools, ['read_file']);
+  assert.deepEqual(none.excludeTools, ['Bash(git *)', 'mcp__*']);
+  assert.equal(none.allowedMcpServerNames, undefined);
+  assert.ok(sessionTools(mcpPolicy(['mcp__jira__*']), r, true).excludeTools.includes('mcp__*'));
+});
+
+test('сессия: подключаются только серверы из шаблонов, шаблон без сервера — все', () => {
+  const r = roleDef('spec-author', ['read_file']);
+  const named = sessionTools(mcpPolicy(['mcp__jira__*', 'mcp__jira__get_issue']), r);
+  assert.deepEqual(named.allowedMcpServerNames, ['jira']);
+  assert.equal(named.excludeTools.includes('mcp__*'), false);
+  assert.equal(sessionTools(mcpPolicy(['mcp__*']), r).allowedMcpServerNames, undefined);
+  assert.equal(sessionTools(mcpPolicy(['mcp__ji*__x', 'mcp__jira__*']), r).allowedMcpServerNames, undefined);
+});
+
+test('сверка MCP-вызовов после роли', () => {
+  const p = mcpPolicy(['mcp__jira__get_issue']);
+  assert.deepEqual(mcpViolations(p, 'spec-author', false, ['mcp__jira__get_issue', 'mcp__jira__search', 'mcp__jira__search']), ['mcp__jira__search']);
+  assert.deepEqual(mcpViolations(p, 'spec-author', false, ['mcp__jira__get_issue']), []);
+  assert.deepEqual(mcpViolations(p, 'spec-author', true, ['mcp__jira__get_issue']), ['mcp__jira__get_issue']);
+  assert.deepEqual(mcpViolations(p, 'code-reviewer', false, ['mcp__jira__get_issue']), ['mcp__jira__get_issue']);
+});
+
+test('предупреждение: MCP в tools: роли без разрешения в policy', () => {
+  const roles = new Map([['spec-author', roleDef('spec-author', ['read_file', 'mcp__jira__get_issue'])]]);
+  const [w, ...rest] = mcpWarnings(mcpPolicy(), roles);
+  assert.equal(rest.length, 0);
+  assert.match(w!, /mcp__jira__get_issue.*roles\.spec-author\.mcp/);
+  assert.deepEqual(mcpWarnings(mcpPolicy(['mcp__jira__*']), roles), []);
 });
 
 test('tasks.md: группа ## N. — task batch', () => {

@@ -58,13 +58,18 @@ acceptance:
 # Чтение разрешено всем в пределах worktree. Запись и shell — только перечисленное.
 # write/denyWrite — glob относительно корня worktree; {change} — id текущего change,
 # {acceptance} — acceptance.dir. shell — операции gates.ops, которые роль может вызвать сама.
+# mcp — шаблоны имён MCP-инструментов mcp__<server>__<tool> (* допустим, например "mcp__jira__*").
+# Пусто — у роли нет MCP-инструментов вовсе; в шаге только на чтение их нет ни у кого.
+# Серверы настраиваются в CLI (.gigacode/settings.json), имя инструмента видно в init-сессии.
 roles:
   spec-author:
     write: ["openspec/changes/{change}/**"]
     shell: []
+    mcp: []
   spec-reviewer:
     write: []
     shell: []
+    mcp: []
   implementer:
     write: ["**"]
     denyWrite:
@@ -80,12 +85,15 @@ roles:
       - "eslint.config.js"
       - ".gitignore"
     shell: [lint, unit]
+    mcp: []
   code-reviewer:
     write: []
     shell: []
+    mcp: []
   acceptance-tester:
     write: ["{acceptance}/**"]
     shell: [e2e]
+    mcp: []
 
 # Запрещено всем ролям в любой фазе. Уходит в excludeTools каждой сессии
 # поверх deny из .qwen/settings.json.
