@@ -241,6 +241,15 @@ function toolArg(input: unknown): string {
   return v === undefined ? '' : oneLine(String(v), 100);
 }
 
+/**
+ * В stream-json CLI не завершает сессию ошибкой при сбое API (таймаут, обрыв, 4xx/5xx): он дописывает
+ * «[API Error: …]» текстом ассистента и отдаёт успешный result. Это сбой шага, а не ответ роли.
+ */
+export function apiErrorIn(text: string): string | undefined {
+  const i = text.lastIndexOf('[API Error:');
+  return i < 0 ? undefined : text.slice(i);
+}
+
 function blockText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) return content.map((b) => (b && typeof b === 'object' && 'text' in b ? String(b.text) : '')).join(' ');
@@ -261,6 +270,7 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   const timer = minutes > 0 ? setTimeout(() => abortController.abort(), minutes * 60_000) : undefined;
   const exe = qwenExecutable(rt.policy);
   const authType = qwenAuthType(rt.policy);
+  const apiTimeout = rt.policy.qwen.apiTimeoutSeconds ?? 0;
   // SDK 0.1.8 пересылает stderr CLI в callback только на уровне debug: без этого причина
   // падения CLI ("exited with code 1") теряется. Хвост держим для сообщения об ошибке.
   const stderrTail: string[] = [];
@@ -289,7 +299,7 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
     debug: rt.policy.qwen.debug,
     logLevel: 'debug',
     stderr: onStderr,
-    env: gateEnv(rt.policy),
+    env: { ...gateEnv(rt.policy), ...(apiTimeout ? { QWEN_CODE_API_TIMEOUT_MS: String(apiTimeout * 1000) } : {}) },
     ...(call.resume ? { resume: call.resume } : { sessionId }),
     ...(effort ? { effort } : {}),
     ...(exe ? { pathToQwenExecutable: exe } : {}),
@@ -361,6 +371,8 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
     return { ...base, ...info, ok: false, text: '', error: `${result.subtype}${result.error?.message ? ': ' + result.error.message : ''}` };
   }
   const text = result.result;
+  const apiError = apiErrorIn(text);
+  if (apiError) return { ...base, ...info, ok: false, text: '', error: `ошибка API: ${oneLine(apiError, 300)}` };
   if (!text.trim()) return { ...base, ...info, ok: false, text, error: 'пустой ответ' };
   return { ...base, ...info, ok: true, text };
 }

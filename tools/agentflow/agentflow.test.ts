@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { OpenSpec } from './openspec.ts';
 import { decide, validateReview, type Expectation } from './review-validator.ts';
-import { decideAcl, mcpViolations, mcpWarnings, sessionTools, type RoleDef, type RoleRuntime } from './roles.ts';
+import { apiErrorIn, decideAcl, mcpViolations, mcpWarnings, sessionTools, type RoleDef, type RoleRuntime } from './roles.ts';
 import type { Policy } from './policy.ts';
 import { normalize } from './snapshot.ts';
 import { globToRegExp } from './util.ts';
@@ -167,6 +167,12 @@ test('предупреждение: MCP в tools: роли без разреше
   assert.equal(rest.length, 0);
   assert.match(w!, /mcp__jira__get_issue.*roles\.spec-author\.mcp/);
   assert.deepEqual(mcpWarnings(mcpPolicy(['mcp__jira__*']), roles), []);
+});
+
+test('ошибка API в тексте ответа — сбой шага, а не ответ роли', () => {
+  assert.equal(apiErrorIn('{"status": "PASS"}'), undefined);
+  assert.equal(apiErrorIn('[API Error: terminated (Status: 400)]'), '[API Error: terminated (Status: 400)]');
+  assert.match(apiErrorIn('Читаю спеку.[API Error: Request timeout after 120s.\n\nTroubleshooting tips:]') ?? '', /^\[API Error: Request timeout/);
 });
 
 test('tasks.md: группа ## N. — task batch', () => {

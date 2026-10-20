@@ -65,6 +65,9 @@ Mock-прогон создаёт ветку и worktree и коммитит в �
 - OpenSpec ищет схемы в `openspec/schemas/<имя>/schema.yaml` проекта, в `$XDG_DATA_HOME/openspec/schemas`
   и в своей сборке; `Creating change … with schema 'spec-driven'` в спиннере `new change` — всегда дефолт,
   реальная схема из config.yaml. OpenSpec 1.13 не отдаёт `sourcePath` задач. CLI выбирает `ensureSchema`.
+- Сбой API в stream-json (таймаут, `terminated`, 4xx/5xx) CLI дописывает текстом `[API Error: …]` и отдаёт
+  успешный `result` — ловит `apiErrorIn`. Таймаут запроса — 120 с, `QWEN_CODE_API_TIMEOUT_MS` его меняет,
+  если у модели в провайдере нет своего `generationConfig.timeout`; `env` SDK сливается с `process.env`.
 - Node 22.12: `node --test test/` каталог не принимает — нужен glob; `@inquirer/*` просит ≥22.13.
 - `--auto-approve` + вечно красный гейт раньше зацикливался; теперь с 3-го исчерпания рекомендуется стоп.
 - MCP в CLI 0.1.8 (проверено пробником: CLI из SDK + фейковый OpenAI-эндпоинт): `coreTools` MCP не

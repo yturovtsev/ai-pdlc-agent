@@ -16,6 +16,10 @@ qwen:
   # Если модель или шлюз отвечают ошибкой на поле reasoning — поставь false,
   # модели пойдут на своём уровне по умолчанию.
   effortViaSdk: true
+  # Таймаут одного запроса к модели, секунды (QWEN_CODE_API_TIMEOUT_MS сессии). 0 — дефолт CLI (120 с).
+  # На effort max ответ модели бывает дольше дефолта: CLI отдаёт «[API Error: Request timeout…]».
+  # Не действует, если у модели в провайдере CLI задан свой generationConfig.timeout.
+  apiTimeoutSeconds: 600
   # Подробный лог CLI (пишется в events.jsonl через stderr).
   debug: false
 

@@ -17,7 +17,7 @@ export interface RolePolicy {
 
 export interface Policy {
   version: number;
-  qwen: { executable: string; authType?: string; effortViaSdk: boolean; debug: boolean };
+  qwen: { executable: string; authType?: string; effortViaSdk: boolean; apiTimeoutSeconds?: number; debug: boolean };
   openspec: { schema: string };
   limits: {
     artifactRounds: number;
