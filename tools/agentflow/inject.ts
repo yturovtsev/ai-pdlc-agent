@@ -12,9 +12,14 @@ export const INJECT_ALL = [
   'final-revise', // REVISE финального ревью → исправление через implementer, гейты и ревью заново
   'artifact-stuck:specs', // одна и та же находка все автоматические раунды → диалог «лимит исчерпан»
   'batch-stuck:2', // то же для task batch 2 в apply
+  'stall:implementer', // первая сессия implementer молчит → сторож простоя, диалог вмешательства, повтор шага
 ];
 
-export const INJECT_HELP = [...INJECT_ALL, 'kill-after:<stage> — убить контроллер после этапа (проверка resume)'];
+export const INJECT_HELP = [
+  ...INJECT_ALL.filter((p) => !p.startsWith('stall:')),
+  'stall:<роль> — первая сессия роли молчит, пока сторож её не прервёт (в mock порог 2 с)',
+  'kill-after:<stage> — убить контроллер после этапа (проверка resume)',
+];
 
 export function parseInject(arg: string | undefined): string[] {
   if (!arg) return [];

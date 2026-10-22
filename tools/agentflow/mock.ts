@@ -5,7 +5,8 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { c, log } from './log.ts';
-import { decideAcl, describeTask, spawnTools, type RoleCall, type RoleResult, type RoleRuntime } from './roles.ts';
+import { decideAcl, describeTask, newTracker, spawnTools, syncPanel, Watchdog, type RoleCall, type RoleResult, type RoleRuntime } from './roles.ts';
+import type { SessionTracker } from './session-tracker.ts';
 import { KIT_BIN } from './config.ts';
 import { gateEnv } from './policy.ts';
 import { exec } from './util.ts';
@@ -155,20 +156,54 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   const session = call.resume ?? randomUUID();
   log.spawn(role.name, { model: `${role.model} (mock)`, effort: role.effort, session, resume: !!call.resume, tools: spawnTools(rt.policy, role, call.readOnly), target: describeTask(meta) });
   log.role(role.name, c.gray('сессия открыта · mock'));
+  const tracker = newTracker(rt, role.name);
+  const abort = new AbortController();
+  const watch = new Watchdog(rt, call, tracker, abort);
+  let res: RoleResult | undefined;
+  try {
+    // Точка stall:<роль>: сессия молчит, пока сторож её не прервёт. Процесс держит таймер —
+    // у настоящей сессии его держит дочерний CLI, а сторож свой таймер не держит.
+    if (meta.silent) {
+      const keep = setInterval(() => {}, 1000);
+      await new Promise((done) => abort.signal.addEventListener('abort', done, { once: true }));
+      clearInterval(keep);
+    } else res = await mockSession(rt, call, session, tracker);
+  } finally {
+    await watch.stop();
+    log.roleEnd(role.name, !!res && !watch.outcome);
+  }
+  if (watch.outcome || !res) {
+    const denials = tracker.summary();
+    log.denials(role.name, denials.groups);
+    const error = watch.outcome?.message ?? 'сессия прервана';
+    return { ok: false, sessionId: session, text: '', error, turns: 0, seconds: 0, models: [], denials: denials.total, ...(watch.outcome ? { intervention: watch.outcome } : {}) };
+  }
+  return res;
+}
+
+async function mockSession(rt: RoleRuntime, call: RoleCall, session: string, tracker: SessionTracker): Promise<RoleResult> {
+  const { role, meta } = call;
+  const acl = (tool: string, input: Record<string, unknown>) => {
+    const d = decideAcl(rt, role.name, !!call.readOnly, tool, input);
+    log.acl(role.name, tool, d);
+    tracker.event();
+    tracker.acl(tool, input, d);
+    syncPanel(tracker);
+    return d;
+  };
   // Те же сообщения потока, что у настоящей сессии, чтобы `agentflow agents` работал и в mock.
   rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'system', subtype: 'init', session_id: session, model: `${role.model} (mock)`, tools: spawnTools(rt.policy, role, call.readOnly), permission_mode: 'default' } });
 
   const write = (rel: string, content: string) => {
     log.toolUse(role.name, 'write_file', rel);
-    const d = decideAcl(rt, role.name, !!call.readOnly, 'write_file', { file_path: rel });
-    log.acl(role.name, 'write_file', d.target, d.ok, d.reason);
-    if (!d.ok) return;
+    if (!acl('write_file', { file_path: rel }).ok) return;
     const abs = join(rt.worktree, rel);
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, content);
   };
   const read = (rel: string) => {
     log.toolUse(role.name, 'read_file', rel);
+    tracker.event();
     return readFileSync(join(rt.worktree, rel), 'utf8');
   };
   const pass = (target: string, extra: Record<string, unknown> = {}) => ({
@@ -251,8 +286,7 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
         );
       }
       log.toolUse(role.name, 'run_shell_command', 'agentflow-gate lint');
-      const d = decideAcl(rt, role.name, false, 'run_shell_command', { command: 'agentflow-gate lint' });
-      log.acl(role.name, 'run_shell_command', d.target, d.ok, d.reason);
+      acl('run_shell_command', { command: 'agentflow-gate lint' });
       text = json({ status: 'DONE', tasks: [], responses: [], specIssue: null });
       break;
     }
@@ -271,6 +305,7 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
       write('e2e/text-slug.test.js', "import { test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { slugify } from '../src/index.js';\n\n" + body);
       log.toolUse(role.name, 'run_shell_command', 'agentflow-gate e2e');
       const r = await exec('bash', [`${KIT_BIN}/agentflow-gate`, 'e2e'], { cwd: rt.worktree, env: { ...process.env, ...gateEnv(rt.policy) } });
+      tracker.event();
       const scenarios = reqs.flatMap((rq) => rq.scenarios.map((s) => ({ rq, s })));
       const result = r.code === 0 ? 'PASS' : 'FAIL';
       text = json({
@@ -296,6 +331,7 @@ export async function runMock(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   log.role(role.name, '«' + text.split('\n')[0] + ' …»');
   rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'assistant', session_id: session, message: { model: `${role.model} (mock)` } } });
   rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'result', session_id: session, num_turns: 1 } });
-  log.roleDone(role.name, { turns: 1, seconds: 0, models: [`${role.model} (mock)`], denials: 0 });
-  return { ok: true, sessionId: session, text, turns: 1, seconds: 0, models: [`${role.model} (mock)`], denials: 0 };
+  const denials = tracker.summary();
+  log.roleDone(role.name, { turns: 1, seconds: 0, models: [`${role.model} (mock)`], denials: denials.total, groups: denials.groups });
+  return { ok: true, sessionId: session, text, turns: 1, seconds: 0, models: [`${role.model} (mock)`], denials: denials.total };
 }

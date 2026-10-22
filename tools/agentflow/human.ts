@@ -22,12 +22,17 @@ export interface Choice<K extends string = string> {
   rationale: string;
 }
 
-/** Меню inquirer рисуется без панели: она убрана на время диалога и возвращается после ответа. */
+/**
+ * Меню inquirer рисуется без панели: она убрана на время диалога и возвращается после ответа.
+ * Лог удержан: работающая сессия (диалог вмешательства) не рвёт меню, её строки выйдут после.
+ */
 async function paused<T>(fn: () => Promise<T>): Promise<T> {
   panel.pause();
+  log.hold();
   try {
     return await fn();
   } finally {
+    log.release();
     panel.resume();
   }
 }
@@ -40,6 +45,15 @@ export class Human {
   }
 
   async select<K extends string>(ch: Choice<K>): Promise<K> {
+    return (await this.choose(ch))!;
+  }
+
+  /** Диалог, который можно закрыть извне: при отмене через signal возвращает undefined. */
+  async selectOrCancel<K extends string>(ch: Choice<K>, signal: AbortSignal): Promise<K | undefined> {
+    return this.choose(ch, signal);
+  }
+
+  private async choose<K extends string>(ch: Choice<K>, signal?: AbortSignal): Promise<K | undefined> {
     const rec = ch.options.find((o) => o.key === ch.recommended) ?? ch.options[0]!;
     console.log('');
     log.human(c.bold(ch.title));
@@ -49,23 +63,36 @@ export class Human {
       log.info(c.gray(`  (--auto-approve) → ${rec.label}`));
       return rec.key;
     }
+    if (signal?.aborted) return undefined;
     this.ensureTty(ch.title);
     // Рекомендуемый вариант первым, под курсором и с пометкой; остальные в исходном порядке.
     const ordered = [rec, ...ch.options.filter((o) => o !== rec)];
-    const answer = await paused(() =>
-      select<K>({
-        message: ch.title,
-        default: rec.key,
-        loop: false,
-        pageSize: Math.max(ordered.length, 7),
-        choices: ordered.map((o) => ({
-          value: o.key,
-          name: o === rec ? c.green(`★ ${o.label} (рекомендуется)`) : `  ${o.label}`,
-          short: o.label,
-          description: o === rec ? `${o.description ?? ''}${o.description ? '\n' : ''}Почему: ${ch.rationale}` : o.description,
-        })),
-      }),
-    );
+    const answer = await paused(async () => {
+      try {
+        return await select<K>(
+          {
+            message: ch.title,
+            default: rec.key,
+            loop: false,
+            pageSize: Math.max(ordered.length, 7),
+            choices: ordered.map((o) => ({
+              value: o.key,
+              name: o === rec ? c.green(`★ ${o.label} (рекомендуется)`) : `  ${o.label}`,
+              short: o.label,
+              description: o === rec ? `${o.description ?? ''}${o.description ? '\n' : ''}Почему: ${ch.rationale}` : o.description,
+            })),
+          },
+          { signal },
+        );
+      } catch (e) {
+        if (signal?.aborted && e instanceof Error && e.name === 'AbortPromptError') return undefined;
+        throw e;
+      }
+    });
+    if (answer === undefined) {
+      log.info(c.gray('  диалог закрыт без выбора'));
+      return undefined;
+    }
     log.info(c.gray(`  выбрано: ${ch.options.find((o) => o.key === answer)?.label}`));
     return answer;
   }

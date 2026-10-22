@@ -19,6 +19,7 @@ export async function runGates(
   mkdirSync(opts.logDir, { recursive: true });
   const results: GateResult[] = [];
   for (const op of ops) {
+    log.gateStart(op);
     let r = await exec('bash', [join(KIT_BIN, 'agentflow-gate'), op], { cwd: opts.cwd, env: { ...process.env, ...gateEnv(opts.policy) } });
     let output = (r.stdout + (r.stderr ? '\n' + r.stderr : '')).trim();
     if (opts.injectRed && results.length === 0) {

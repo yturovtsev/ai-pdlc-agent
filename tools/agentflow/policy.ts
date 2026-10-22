@@ -27,6 +27,10 @@ export interface Policy {
     gateAttempts: number;
     infraRetries: number;
     roleTimeoutMinutes: number;
+    /** Минут без сообщений от сессии до диалога вмешательства; 0 — сторож выключен. */
+    stallMinutes: number;
+    /** Отказов ACL подряд до диалога вмешательства; 0 — проверка выключена. */
+    aclDenialStreak: number;
   };
   git: { branchPrefix: string };
   gates: {
@@ -57,6 +61,9 @@ export function loadPolicy(repo: string): Policy {
   for (const op of [...p.gates.batch, ...p.gates.full]) {
     if (!p.gates.ops?.[op]) throw new Error(`policy: гейт ${op} не описан в gates.ops`);
   }
+  // Policy, собранная до появления ключей (старая копия kit), получает значения по умолчанию.
+  p.limits.stallMinutes ??= 15;
+  p.limits.aclDenialStreak ??= 5;
   return { ...p, denyAll: p.denyAll ?? [], sources: files, sha: sha256(texts.join('\n---\n')) };
 }
 

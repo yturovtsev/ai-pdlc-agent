@@ -33,15 +33,16 @@ import { runGates, gatesSummary, type GateResult } from './gates.ts';
 import { addWorktree, changedPaths, commitAll, diff, diffNoIndex, ensureRepo, head } from './git.ts';
 import { Human } from './human.ts';
 import { INJECT_HELP, Injector, parseInject } from './inject.ts';
+import { aclRetryAddendum, diagnose, INTERVENTION_OPTIONS, recommendIntervention } from './intervention.ts';
 import { c, log, setLogSink } from './log.ts';
 import { runMock } from './mock.ts';
 import { OpenSpec, topoOrder, type ArtifactNode } from './openspec.ts';
 import { loadPolicy, qwenExecutable, type Policy } from './policy.ts';
 import { printLoopSummary, writeAcceptanceReport } from './report.ts';
 import { decide, countBySeverity, validateReview, type Decision, type Expectation, type Review, type ReviewFinding } from './review-validator.ts';
-import { expandGlob, loadRoles, mcpViolations, mcpWarnings, roleFiles, runRole, type RoleDef, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
+import { expandGlob, loadRoles, mcpViolations, mcpWarnings, roleFiles, runRole, stallMs, type RoleCall, type RoleDef, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
 import { artifactFiles, artifactSnapshot, artifactText, codeSnapshot, specDigest } from './snapshot.ts';
-import { panelEnabled, panel } from './status-panel.ts';
+import { clock, panelEnabled, panel } from './status-panel.ts';
 import { RunStore, STAGES, type BatchState, type Finding, type RunState, type Stage } from './state.ts';
 import { Blocked, exec, extractJson, matchesAny, now, oneLine, sha256, short, stamp } from './util.ts';
 
@@ -118,6 +119,43 @@ async function infraExhausted(ctx: Ctx, what: string, error: string, series: num
   if (k === 'stop') throw new Blocked(`${what}: ${error}`);
 }
 
+/**
+ * Решение о вмешательстве в работающую сессию шага. Счётчик простоев один на все попытки и серии
+ * шага: так --auto-approve идёт по цепочке «ждать → повторить → стоп», а не ждёт вечно.
+ */
+function interventionHandler(ctx: Ctx, label: string): NonNullable<RoleCall['intervene']> {
+  let stalls = 0;
+  return async (ev, signal) => {
+    if (ev.kind === 'stall') stalls++;
+    const opened = Date.now();
+    const rec = recommendIntervention(ev, stalls);
+    const hints = [...new Set(ev.denials.map((d) => d.hint).filter(Boolean))].map((h) => `что делать: ${h}`);
+    const k = await ctx.human.selectOrCancel(
+      {
+        title: ev.kind === 'stall' ? `${label}: роль ${ev.role} молчит ${clock(ev.idleMs)}` : `${label}: роль ${ev.role} упирается в ACL`,
+        context: [diagnose(ev), ...hints, `подробности: ${ctx.store.ledgerPath}`],
+        options: INTERVENTION_OPTIONS,
+        recommended: rec.choice,
+        rationale: rec.rationale,
+      },
+      signal,
+    );
+    if (k !== undefined) return k;
+    log.info(
+      ev.kind === 'stall'
+        ? `${ev.role}: сессия ожила после ${clock(ev.idleMs + Date.now() - opened)} простоя — ждём дальше`
+        : `${ev.role}: сессия завершилась, пока был открыт диалог`,
+    );
+    return 'woke';
+  };
+}
+
+/** Сессию прервали по решению о вмешательстве: стоп — BLOCKED, после серии ACL — подсказка в промпт повтора. */
+function afterIntervention(label: string, name: string, res: RoleResult): string {
+  if (res.intervention?.decision === 'stop') throw new Blocked(`${label}: роль ${name}: ${res.error}`);
+  return res.intervention?.kind === 'acl-streak' ? '\n\n' + aclRetryAddendum(res.intervention.denials) : '';
+}
+
 /** Вызов роли с повторами на инфраструктурных ошибках (таймаут, пустой ответ, сбой CLI). */
 async function callRole(
   ctx: Ctx,
@@ -129,13 +167,28 @@ async function callRole(
   const r = role(ctx, name);
   writeContext(ctx.contextsDir, opts.label, prompt);
   const tries = ctx.policy.limits.infraRetries + 1;
+  const intervene = interventionHandler(ctx, opts.label);
+  let silent = ctx.inject.take(`stall:${name}`);
+  let addendum = '';
   for (let series = 1; ; series++) {
     let lastError = '';
     for (let attempt = 1; attempt <= tries; attempt++) {
-      const res = await runRole(ctx.rt, { role: r, prompt, label: opts.label, cwd: ctx.wt, readOnly: opts.readOnly, resume: attempt === 1 && series === 1 ? opts.resume : undefined, meta });
+      if (addendum) writeContext(ctx.contextsDir, `${opts.label}-acl-retry`, prompt + addendum);
+      const res = await runRole(ctx.rt, {
+        role: r,
+        prompt: prompt + addendum,
+        label: opts.label,
+        cwd: ctx.wt,
+        readOnly: opts.readOnly,
+        resume: attempt === 1 && series === 1 ? opts.resume : undefined,
+        meta: silent ? { ...meta, silent } : meta,
+        intervene,
+      });
+      silent = false;
       account(ctx, r, res);
       checkMcp(ctx, name, opts.readOnly, res);
       if (res.ok) return res;
+      addendum = afterIntervention(opts.label, name, res) || addendum;
       lastError = res.error ?? 'неизвестная ошибка';
       log.warn(`${name}: ошибка шага (${lastError}) — попытка ${attempt}/${tries}`);
     }
@@ -154,18 +207,23 @@ async function callReviewer(
 ): Promise<Review> {
   const r = role(ctx, name);
   const tries = ctx.policy.limits.infraRetries + 1;
+  const intervene = interventionHandler(ctx, label);
+  let silent = ctx.inject.take(`stall:${name}`);
+  let addendum = '';
   for (let series = 1; ; series++) {
     let lastError = '';
     for (let attempt = 1; attempt <= tries; attempt++) {
-      const p = lastError
-        ? `${prompt}\n\n## Предыдущий ответ отклонён валидатором контракта\n${lastError}\nВерни ответ строго по контракту.`
-        : prompt;
+      const p =
+        (lastError ? `${prompt}\n\n## Предыдущий ответ отклонён валидатором контракта\n${lastError}\nВерни ответ строго по контракту.` : prompt) +
+        addendum;
       const tag = series === 1 && attempt === 1 ? label : `${label}-retry${series}.${attempt}`;
       writeContext(ctx.contextsDir, tag, p);
-      const res = await runRole(ctx.rt, { role: r, prompt: p, label, cwd: ctx.wt, meta });
+      const res = await runRole(ctx.rt, { role: r, prompt: p, label, cwd: ctx.wt, meta: silent ? { ...meta, silent } : meta, intervene });
+      silent = false;
       account(ctx, r, res);
       checkMcp(ctx, name, false, res);
       if (!res.ok) {
+        addendum = afterIntervention(label, name, res) || addendum;
         lastError = res.error ?? 'неизвестная ошибка';
         log.warn(`${name}: ошибка шага (${lastError}) — попытка ${attempt}/${tries}`);
         continue;
@@ -1482,12 +1540,21 @@ async function pipeline(ctx: Ctx): Promise<void> {
   s.spec.order = ctx.graph.map((n) => n.id);
   s.spec.schema = status.schemaName;
   const out = process.stdout;
+  const stall = ctx.policy.limits.stallMinutes;
+  const apiSeconds = ctx.policy.qwen.apiTimeoutSeconds || 120;
+  if (stall > 0 && stall * 60 <= apiSeconds) {
+    log.warn(
+      `limits.stallMinutes (${stall} мин) не больше таймаута запроса к модели (${apiSeconds} с, qwen.apiTimeoutSeconds): ` +
+        'сторож простоя может сработать раньше, чем CLI дождётся ответа модели',
+    );
+  }
   panel.start({
     runId: s.runId,
     change: s.change,
     roles: ctx.roles.size,
     launches: Object.values(s.usage).reduce((n, u) => n + u.calls, 0),
     phase: `этап ${s.stage}`,
+    stallMs: stallMs(ctx.rt),
     enabled: panelEnabled({ isTTY: out.isTTY, rows: out.rows, cols: out.columns, noPanel: NO_PANEL, env: process.env }),
   });
   log.info(`схема OpenSpec: ${status.schemaName} · артефакты: ${ctx.graph.map((n) => n.id).join(' → ')} · apply требует: ${status.applyRequires.join(', ') || '—'}`);

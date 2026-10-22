@@ -18,6 +18,8 @@ import { parse } from 'yaml';
 import { c, log } from './log.ts';
 import { KIT } from './config.ts';
 import { gateEnv, qwenAuthType, qwenExecutable, type Policy } from './policy.ts';
+import { interventionError, type Intervention, type InterventionDecision, type InterventionKind, type InterventionOutcome } from './intervention.ts';
+import { SessionTracker, toolArg } from './session-tracker.ts';
 import { matchesAny, oneLine, sha256 } from './util.ts';
 
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -88,6 +90,8 @@ export interface TaskMeta {
   target?: string;
   batchId?: string;
   requirements?: { id: string; name: string; scenarios: { id: string; name: string }[] }[];
+  /** Fault injection stall:<роль>: mock-сессия молчит до прерывания. */
+  silent?: boolean;
 }
 
 /** Над чем работает вызов — для панели статуса и события spawn. */
@@ -124,6 +128,11 @@ export interface RoleCall {
   /** Продолжить сессию (раунд исправлений implementer). */
   resume?: string;
   meta: TaskMeta;
+  /**
+   * Решение о вмешательстве при простое или серии отказов ACL; диагноз в лог пишет оно же (строкой
+   * контекста диалога). signal прерывается, если сессия ожила.
+   */
+  intervene?: (ev: Intervention, signal: AbortSignal) => Promise<InterventionDecision>;
 }
 
 export interface RoleResult {
@@ -138,6 +147,8 @@ export interface RoleResult {
   usage?: { input_tokens: number; output_tokens: number };
   /** MCP-инструменты, которые выполнились (успешный tool_result), — для сверки с policy после роли. */
   mcpCalls?: string[];
+  /** Сессия прервана по решению о вмешательстве (повтор или стоп). */
+  intervention?: InterventionOutcome;
 }
 
 export interface RoleRuntime {
@@ -152,10 +163,19 @@ export interface RoleRuntime {
   mcpServers?: Record<string, McpServerConfig>;
 }
 
+/** Отказ ACL: ожидаемый (роль обойдётся сама) или признак, что роли не хватает разрешения в policy. */
+export type AclCategory = 'expected' | 'permission';
+
 export interface AclDecision {
   ok: boolean;
   target: string;
   reason: string;
+  /** Только у отказа. */
+  category?: AclCategory;
+  /** Что делать человеку: действий не нужно или какой ключ policy поправить. */
+  hint?: string;
+  /** Что роли разрешено в этой категории — уходит модели, чтобы она не повторяла вызов. */
+  allowed?: string;
 }
 
 /** Подстановки в glob policy: {change} — id change, {acceptance} — каталог acceptance-тестов. */
@@ -163,44 +183,72 @@ export function expandGlob(glob: string, change: string, policy: Policy): string
   return glob.replaceAll('{change}', change).replaceAll('{acceptance}', policy.acceptance.dir.replace(/\/$/, ''));
 }
 
+const NO_ACTION = 'действий не нужно';
+
 /** Решение ACL роли по вызову инструмента. Всё, что не разрешено явно, отклоняется. */
 export function decideAcl(rt: RoleRuntime, roleName: string, readOnly: boolean, toolName: string, input: Record<string, unknown>): AclDecision {
   const rp = rt.policy.roles[roleName] ?? { write: [], shell: [] };
   const sub = (g: string) => expandGlob(g, rt.change, rt.policy);
+  const key = `roles.${roleName}`;
+  const deny = (target: string, reason: string, category: AclCategory, hint: string, allowed: string): AclDecision => ({ ok: false, target, reason, category, hint, allowed });
+  const readOnlyAllowed = `шаг только на чтение: ${READ_TOOLS.join(', ')}`;
+  const writeAllowed = rp.write.length
+    ? `запись по glob ${rp.write.map(sub).join(', ')}${rp.denyWrite?.length ? ` кроме ${rp.denyWrite.map(sub).join(', ')}` : ''}`
+    : 'запись роли не разрешена';
+  const gates = rp.shell.map((op) => `agentflow-gate ${op}`);
+  const shellAllowed = gates.length ? `shell — только ${gates.join(', ')}` : 'shell-команды роли не разрешены';
   if (WRITE_TOOLS.has(toolName)) {
     const raw = String(input['file_path'] ?? input['path'] ?? input['absolute_path'] ?? '');
     const abs = isAbsolute(raw) ? raw : resolve(rt.worktree, raw);
     const rel = relative(rt.worktree, abs).split(sep).join('/');
-    if (!raw) return { ok: false, target: '(нет пути)', reason: 'не указан путь' };
-    if (rel.startsWith('..') || isAbsolute(rel)) return { ok: false, target: raw, reason: 'вне worktree' };
-    if (readOnly) return { ok: false, target: rel, reason: 'шаг только на чтение' };
-    if (!matchesAny(rel, rp.write.map(sub))) return { ok: false, target: rel, reason: `роли ${roleName} запись сюда не разрешена` };
-    if (matchesAny(rel, (rp.denyWrite ?? []).map(sub))) return { ok: false, target: rel, reason: 'защищённый путь' };
+    if (!raw) return deny('(нет пути)', 'не указан путь', 'expected', `роль не указала путь — ${NO_ACTION}`, writeAllowed);
+    if (rel.startsWith('..') || isAbsolute(rel)) return deny(raw, 'вне worktree', 'expected', `роль ошиблась путём — ${NO_ACTION}`, `${writeAllowed} внутри worktree`);
+    if (readOnly) return deny(rel, 'шаг только на чтение', 'expected', `шаг уточнений только читает — ${NO_ACTION}`, readOnlyAllowed);
+    if (!matchesAny(rel, rp.write.map(sub))) {
+      return deny(rel, `роли ${roleName} запись сюда не разрешена`, 'permission', `если роли нужен этот путь — добавь glob для ${rel} в ${key}.write (.agentflow/policy.yaml)`, writeAllowed);
+    }
+    const guard = (rp.denyWrite ?? []).find((g) => matchesAny(rel, [sub(g)]));
+    if (guard) {
+      return deny(rel, 'защищённый путь', 'expected', `путь защищён шаблоном ${guard} из ${key}.denyWrite — роль должна обойтись; если путь ей правда нужен, убери шаблон из denyWrite`, writeAllowed);
+    }
     return { ok: true, target: rel, reason: 'разрешено policy' };
   }
   if (SHELL_TOOLS.has(toolName)) {
     const cmd = String(input['command'] ?? '').trim();
     const m = cmd.match(/^agentflow-gate\s+([a-z0-9-]+)$/);
-    if (!m) return { ok: false, target: cmd, reason: 'разрешена только команда agentflow-gate <операция>' };
-    if (readOnly || !rp.shell.includes(m[1]!)) return { ok: false, target: cmd, reason: `операция ${m[1]} роли не разрешена` };
+    if (!m) {
+      return deny(cmd, 'разрешена только команда agentflow-gate <операция>', 'expected', `роль должна вызывать agentflow-gate; если нужна другая команда — оформи её операцией в gates.ops и добавь в ${key}.shell`, shellAllowed);
+    }
+    const op = m[1]!;
+    if (readOnly) return deny(cmd, 'шаг только на чтение', 'expected', `шаг уточнений только читает — ${NO_ACTION}`, readOnlyAllowed);
+    if (!rt.policy.gates.ops[op]) return deny(cmd, `операции ${op} нет в gates.ops`, 'expected', `такой операции нет — ${NO_ACTION}; роли доступны: ${gates.join(', ') || 'ничего'}`, shellAllowed);
+    if (!rp.shell.includes(op)) return deny(cmd, `операция ${op} роли не разрешена`, 'permission', `если роли нужна операция ${op} — добавь её в ${key}.shell`, shellAllowed);
     return { ok: true, target: cmd, reason: 'операция gates.ops из policy' };
   }
   if (toolName.startsWith(MCP_PREFIX)) {
-    if (readOnly) return { ok: false, target: toolName, reason: 'шаг только на чтение' };
+    const mcpAllowed = rp.mcp?.length ? `MCP по шаблонам ${rp.mcp.join(', ')}` : 'MCP-инструменты роли не разрешены';
+    if (readOnly) return deny(toolName, 'шаг только на чтение', 'expected', `шаг уточнений только читает — ${NO_ACTION}`, readOnlyAllowed);
     const hit = (rp.mcp ?? []).find((g) => matchesAny(toolName, [g]));
     return hit
-      ? { ok: true, target: toolName, reason: `шаблон ${hit} из roles.${roleName}.mcp` }
-      : { ok: false, target: toolName, reason: `нет в roles.${roleName}.mcp` };
+      ? { ok: true, target: toolName, reason: `шаблон ${hit} из ${key}.mcp` }
+      : deny(toolName, `нет в ${key}.mcp`, 'permission', `если роли нужен этот инструмент — добавь шаблон ${toolName} в ${key}.mcp`, mcpAllowed);
   }
-  return { ok: false, target: toolName, reason: 'инструмент не в политике роли' };
+  // ask_user_question и прочее, что CLI отправляет на разрешение: ролям не выдаётся намеренно.
+  const why = toolName === 'ask_user_question' ? ' (вопросы человеку идут через шаг уточнений)' : '';
+  return deny(toolName, 'инструмент не в политике роли', 'expected', `инструмент ${toolName} ролям не выдаётся${why} — ${NO_ACTION}`, readOnly ? readOnlyAllowed : `чтение, ${writeAllowed}, ${shellAllowed}`);
 }
 
-export function aclFor(rt: RoleRuntime, roleName: string, readOnly: boolean): CanUseTool {
+/** Ответ модели на отказ: причина, что разрешено и просьба не повторять — иначе модель пробует обойти запрет. */
+export function aclDenyMessage(d: AclDecision): string {
+  return `agentflow ACL: ${d.reason}. Разрешено: ${d.allowed ?? 'см. политику роли'}. Не повторяй этот вызов — обойдись разрешённым.`;
+}
+
+export function aclFor(rt: RoleRuntime, roleName: string, readOnly: boolean, onDecision?: (tool: string, input: Record<string, unknown>, d: AclDecision) => void): CanUseTool {
   return async (toolName, input) => {
     const d = decideAcl(rt, roleName, readOnly, toolName, input);
-    log.acl(roleName, toolName, d.target, d.ok, d.reason);
-    rt.ledger({ ev: 'acl', role: roleName, tool: toolName, target: d.target, allowed: d.ok, reason: d.reason });
-    return d.ok ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: `agentflow ACL: ${d.reason}` };
+    log.acl(roleName, toolName, d);
+    onDecision?.(toolName, input, d);
+    return d.ok ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: aclDenyMessage(d) };
   };
 }
 
@@ -257,11 +305,93 @@ export function mcpWarnings(policy: Policy, roles: Map<string, RoleDef>): string
   return out;
 }
 
-function toolArg(input: unknown): string {
-  if (!input || typeof input !== 'object') return '';
-  const o = input as Record<string, unknown>;
-  const v = o['file_path'] ?? o['path'] ?? o['command'] ?? o['pattern'] ?? o['absolute_path'] ?? o['dir_path'];
-  return v === undefined ? '' : oneLine(String(v), 100);
+/** Порог простоя сессии: под --mock — 2 с, чтобы точка stall:<роль> проходилась за секунды. */
+export function stallMs(rt: RoleRuntime): number {
+  return rt.mock ? 2000 : rt.policy.limits.stallMinutes * 60_000;
+}
+
+export function newTracker(rt: RoleRuntime, role: string): SessionTracker {
+  return new SessionTracker({ role, stallMs: stallMs(rt), denialStreak: rt.policy.limits.aclDenialStreak });
+}
+
+/** Шаг, вложенные и отказы сессии — в панель статуса. */
+export function syncPanel(t: SessionTracker): void {
+  const last = t.denials.at(-1);
+  log.session({ step: t.step(), nested: t.nested, denials: t.denials.length, lastDenial: last && `${last.tool} ${oneLine(last.target, 40)} — ${last.reason}` });
+}
+
+/**
+ * Сторож сессии: раз в секунду смотрит на простой и серию отказов и, если порог пройден,
+ * спрашивает call.intervene. Повтор и стоп прерывают сессию через её abortController;
+ * решение исполняет вызывающий по outcome.
+ */
+export class Watchdog {
+  outcome: InterventionOutcome | undefined;
+  private dialog: { kind: InterventionKind; ctl: AbortController } | undefined;
+  private pending: Promise<void> | undefined;
+  private closed = false;
+  private readonly timer: ReturnType<typeof setInterval>;
+
+  constructor(
+    private readonly rt: RoleRuntime,
+    private readonly call: RoleCall,
+    private readonly tracker: SessionTracker,
+    private readonly abort: AbortController,
+  ) {
+    this.timer = setInterval(() => this.check(), 1000);
+    this.timer.unref();
+  }
+
+  /**
+   * Новое сообщение сессии. Диалог простоя закрывается: сессия ожила. Диалог серии ACL — нет:
+   * роль, упёршаяся в ACL, продолжает присылать отказы, и диалог закрывался бы сразу.
+   */
+  activity(): void {
+    if (this.dialog?.kind === 'stall') this.dialog.ctl.abort();
+  }
+
+  /** Сессия закончилась: открытый диалог закрывается, поздние решения уже не действуют. */
+  async stop(): Promise<void> {
+    this.closed = true;
+    clearInterval(this.timer);
+    this.dialog?.ctl.abort();
+    await this.pending;
+  }
+
+  check(): void {
+    if (this.closed || this.pending || this.outcome || !this.call.intervene) return;
+    const kind = this.tracker.stalled() ? 'stall' : this.tracker.streakHit() ? 'acl-streak' : undefined;
+    if (!kind) return;
+    this.pending = this.intervene(kind).finally(() => (this.pending = undefined));
+  }
+
+  private async intervene(kind: InterventionKind): Promise<void> {
+    const t = this.tracker;
+    const ev: Intervention = { kind, role: t.role, step: t.step(), idleMs: t.idleMs(), denials: kind === 'acl-streak' ? t.streakDenials() : [] };
+    this.rt.ledger({
+      ev: kind,
+      role: ev.role,
+      step: ev.step.label,
+      since: new Date(ev.step.since).toISOString(),
+      idleMs: ev.idleMs,
+      ...(ev.denials.length ? { denials: ev.denials.map((d) => ({ tool: d.tool, target: d.target, reason: d.reason, category: d.category })) } : {}),
+    });
+    const ctl = new AbortController();
+    this.dialog = { kind, ctl };
+    let decision: InterventionDecision;
+    try {
+      decision = await this.call.intervene!(ev, ctl.signal);
+    } finally {
+      this.dialog = undefined;
+    }
+    this.rt.ledger({ ev: 'intervention', role: ev.role, kind, decision });
+    if (this.closed) return;
+    if (decision === 'retry' || decision === 'stop') {
+      this.outcome = { kind, decision, denials: ev.denials, message: interventionError(ev) };
+      this.abort.abort();
+    } else if (kind === 'stall') t.resetIdle();
+    else t.resetStreak();
+  }
 }
 
 /**
@@ -283,11 +413,23 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   if (rt.mock) return rt.mock(rt, call);
   const { role } = call;
   const sessionId = call.resume ?? randomUUID();
-  const st = sessionTools(rt.policy, role, call.readOnly);
   const tools = spawnTools(rt.policy, role, call.readOnly);
   const effort = rt.policy.qwen.effortViaSdk ? role.effort : undefined;
   log.spawn(role.name, { model: role.model, effort, session: sessionId, resume: !!call.resume, tools, target: describeTask(call.meta) });
+  let answered = false;
+  try {
+    const res = await runSession(rt, call, sessionId, effort);
+    answered = !res.intervention && (res.ok || res.turns > 0);
+    return res;
+  } finally {
+    log.roleEnd(role.name, answered);
+  }
+}
 
+async function runSession(rt: RoleRuntime, call: RoleCall, sessionId: string, effort: Effort | undefined): Promise<RoleResult> {
+  const { role } = call;
+  const st = sessionTools(rt.policy, role, call.readOnly);
+  const tracker = newTracker(rt, role.name);
   const abortController = new AbortController();
   const minutes = rt.policy.limits.roleTimeoutMinutes;
   const timer = minutes > 0 ? setTimeout(() => abortController.abort(), minutes * 60_000) : undefined;
@@ -315,7 +457,10 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
     excludeTools: st.excludeTools,
     ...(st.allowedMcpServerNames ? { allowedMcpServerNames: st.allowedMcpServerNames } : {}),
     ...(rt.mcpServers ? { mcpServers: rt.mcpServers } : {}),
-    canUseTool: aclFor(rt, role.name, !!call.readOnly),
+    canUseTool: aclFor(rt, role.name, !!call.readOnly, (tool, input, d) => {
+      tracker.acl(tool, input, d);
+      syncPanel(tracker);
+    }),
     maxSessionTurns: role.maxTurns,
     includeDirectories: [rt.contextsDir],
     abortController,
@@ -336,10 +481,15 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
   const mcpCalls: string[] = [];
   let result: SDKResultMessage | undefined;
   let error: string | undefined;
+  const watch = new Watchdog(rt, call, tracker, abortController);
   try {
     const q = query({ prompt: call.prompt, options });
     for await (const m of q) {
       rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: m });
+      tracker.event();
+      watch.activity();
+      // Сообщения вложенного субагента CLI приходят в том же потоке с id его вызова task/agent.
+      const parent = (m as { parent_tool_use_id?: string | null }).parent_tool_use_id ?? undefined;
       if (isSDKSystemMessage(m) && m.subtype === 'init') {
         const mcpTools = (m.tools ?? []).filter((t) => t.startsWith(MCP_PREFIX)).length;
         const servers = (m.mcp_servers ?? []).map((x) => `${x.name} ${x.status}`).join(', ');
@@ -355,41 +505,52 @@ export async function runRole(rt: RoleRuntime, call: RoleCall): Promise<RoleResu
           else if (b.type === 'thinking') log.role(role.name, c.gray(`… размышляет (${b.thinking.length} симв.)`));
           else if (b.type === 'tool_use') {
             if (b.name.startsWith(MCP_PREFIX)) mcpUses.set(b.id, b.name);
+            tracker.toolUse(b.id, b.name, toolArg(b.input), parent);
             log.toolUse(role.name, b.name, toolArg(b.input));
           }
         }
       } else if (isSDKUserMessage(m) && Array.isArray(m.message.content)) {
         for (const b of m.message.content) {
           if (b.type !== 'tool_result') continue;
+          tracker.toolResult(b.tool_use_id, !!b.is_error, parent);
           if (b.is_error) log.role(role.name, c.red('✗ ' + oneLine(blockText(b.content), 160)));
           else if (mcpUses.has(b.tool_use_id)) mcpCalls.push(mcpUses.get(b.tool_use_id)!);
         }
       } else if (isSDKResultMessage(m)) {
         result = m;
       }
+      syncPanel(tracker);
     }
   } catch (e) {
-    error = abortController.signal.aborted ? `таймаут роли ${minutes} мин` : e instanceof Error ? e.message : String(e);
+    error = watch.outcome?.message ?? (abortController.signal.aborted ? `таймаут роли ${minutes} мин` : e instanceof Error ? e.message : String(e));
   } finally {
     if (timer) clearTimeout(timer);
+    await watch.stop();
   }
 
   const seconds = Math.round((Date.now() - started) / 1000);
   const base = { sessionId, seconds, models: [...models], mcpCalls };
+  const denials = tracker.summary(result?.permission_denials ?? []);
+  if (watch.outcome) {
+    // Сессию прервал человек (или автопилот): stderr CLI тут не причина, только шум.
+    log.denials(role.name, denials.groups);
+    return { ...base, ok: false, text: '', error: watch.outcome.message, turns: result?.num_turns ?? 0, denials: denials.total, intervention: watch.outcome };
+  }
   if (!result) {
+    log.denials(role.name, denials.groups);
     // CLI упал до ответа: показываем его stderr и команду запуска, чтобы причину было видно сразу.
     log.error(`${role.name}: CLI завершился без ответа: ${error ?? 'нет result'}`);
     if (spawnLine) log.info(c.gray(`  команда: ${oneLine(spawnLine, 600)}`));
     for (const l of stderrTail) log.info(c.gray(`  stderr: ${l}`));
     const tail = stderrTail.slice(-3).join(' | ');
-    return { ...base, ok: false, text: '', error: `${error ?? 'сессия завершилась без result'}${tail ? ` — stderr: ${tail}` : ''}`, turns: 0, denials: 0 };
+    return { ...base, ok: false, text: '', error: `${error ?? 'сессия завершилась без result'}${tail ? ` — stderr: ${tail}` : ''}`, turns: 0, denials: denials.total };
   }
   const info = {
     turns: result.num_turns,
-    denials: result.permission_denials.length,
+    denials: denials.total,
     usage: { input_tokens: result.usage.input_tokens, output_tokens: result.usage.output_tokens },
   };
-  log.roleDone(role.name, { turns: info.turns, seconds, models: base.models, denials: info.denials });
+  log.roleDone(role.name, { turns: info.turns, seconds, models: base.models, denials: info.denials, groups: denials.groups });
   if (result.is_error) {
     return { ...base, ...info, ok: false, text: '', error: `${result.subtype}${result.error?.message ? ': ' + result.error.message : ''}` };
   }

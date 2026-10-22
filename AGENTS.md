@@ -13,11 +13,13 @@ Kit конвейера spec-driven разработки на Qwen Code (корп
 | Путь | Что |
 | --- | --- |
 | `tools/agentflow/controller.ts` | этапы `STAGES`, петли (`artifactLoop`, `holisticLoop`, `batchLoop`, `stageFinal`), диалоги исчерпания, CLI (`run/resume/status/agents/changes/init`) |
-| `roles.ts` | роли из файлов, сессия SDK на вызов (`runRole`), ACL `decideAcl` |
+| `roles.ts` | роли из файлов, сессия SDK на вызов (`runRole`), ACL `decideAcl` (категория, подсказка, разрешённое), сторож `Watchdog` |
+| `session-tracker.ts` | состояние сессии: текущий шаг, простой, вложенные субагенты, отказы ACL, серия, сводка |
+| `intervention.ts` | вмешательство при простое/серии ACL: диагноз, рекомендация, промпт повтора (чистые функции) |
 | `context-builder.ts` | промпты ролей, индекс требований `REQ-*/SCN-*`, батчи из задач OpenSpec |
 | `review-validator.ts` | контракт ответа ревьюера и правила принятия (`decide`) |
 | `human.ts` | меню стрелками: рекомендация `★` + обоснование; `--auto-approve` выбирает рекомендацию |
-| `status-panel.ts` | панель статуса внизу терминала (субагент, модель, effort, время); пополняется хуками `log.ts` |
+| `status-panel.ts` | панель статуса внизу терминала в три строки (субагент и активные, текущий шаг и с какого времени, контекст); пополняется хуками `log.ts` |
 | `config.ts`, `policy.ts` | kit vs целевой репозиторий, слои настроек, `gateEnv` |
 | `openspec.ts`, `git.ts`, `gates.ts`, `snapshot.ts`, `state.ts` | детерминированные узлы |
 | `mock.ts`, `inject.ts`, `smoke.ts`, `agents.ts`, `report.ts` | mock-роли, fault injection, smoke CLI, список сессий, ACCEPTANCE.md |
@@ -83,6 +85,14 @@ Mock-прогон создаёт ветку и worktree и коммитит в �
 - Init-список `tools` ≠ инструменты модели: при `coreTools: ['read_file']` модели уходят ещё `agent`,
   `ask_user_question`, `skill`, `tool_search`; `ask_user_question` проходит `canUseTool`, `agent` и
   `skill` — нет.
+- `canUseTool` в SDK 0.1.8 получает имя и вход инструмента, `tool_use_id` в нём нет. `result.permission_denials`
+  (`{tool_name, tool_use_id, tool_input}`) включает и отказы ACL контроллера, и отказы самого CLI
+  (`excludeTools`/`denyAll`): их разделяют сопоставлением по (инструмент, аргумент).
+- Сообщения вложенного субагента CLI идут в том же потоке с `parent_tool_use_id` его вызова `task`/`agent`.
+- `@inquirer/prompts` 8: промпт отменяется через второй аргумент `{ signal }`, отмена — `AbortPromptError`.
+- `controller.ts` при импорте запускает `main()`: всё, что нужно unit-тестам, держи в других модулях.
+- Таймер сторожа `unref`: настоящую сессию держит дочерний CLI, а молчащей mock-сессии (`stall:<роль>`)
+  нужен свой таймер, иначе процесс завершается с незавершённым промисом.
 
 ## Решения (почему так)
 

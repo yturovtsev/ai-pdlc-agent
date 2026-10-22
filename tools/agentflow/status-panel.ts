@@ -1,7 +1,8 @@
-// Панель статуса внизу терминала: текущий субагент, его модель, effort и время, этап и петля.
-// Закрепляется областью прокрутки (DECSTBM): лог, включая console.log мимо log.ts, прокручивается
-// над двумя нижними строками. Состояние пополняют хуки log.ts; без start() всё — no-op.
-import { c, paintRole } from './log.ts';
+// Панель статуса внизу терминала: текущий субагент, его модель, effort и время, текущий шаг
+// сессии и с какого времени он идёт, этап и петля. Закрепляется областью прокрутки (DECSTBM):
+// лог, включая console.log мимо log.ts, прокручивается над тремя нижними строками.
+// Состояние пополняют хуки log.ts; без start() всё — no-op.
+import { c, clockTime, paintRole } from './log.ts';
 
 export interface PanelAgent {
   role: string;
@@ -12,6 +13,11 @@ export interface PanelAgent {
   resume: boolean;
   startedAt: number;
   tools: number;
+  /** Что сессия делает сейчас и с какого времени. */
+  step?: { label: string; since: number };
+  /** Вложенные субагенты CLI внутри сессии. */
+  nested?: number;
+  denials?: { count: number; last?: string };
 }
 
 export interface PanelState {
@@ -24,8 +30,13 @@ export interface PanelState {
   phase: string;
   loop?: { name: string; round: number; max: number };
   agent?: PanelAgent;
-  /** Что делает контроллер, когда субагента нет. */
+  /** Что делает контроллер, когда субагента нет, и с какого времени. */
   activity: string;
+  activitySince?: number;
+  /** Открытых сессий конвейера. */
+  sessions?: number;
+  /** Порог простоя: с половины шаг жёлтый, от порога — красный. 0 — без подсветки. */
+  stallMs?: number;
   /** Начало текущей команды run/resume. */
   startedAt: number;
 }
@@ -39,7 +50,7 @@ export interface PanelOut {
   off(event: 'resize', listener: () => void): unknown;
 }
 
-const HEIGHT = 2;
+const HEIGHT = 3;
 export const MIN_ROWS = 10;
 export const MIN_COLS = 40;
 const ESC = '\x1b';
@@ -78,7 +89,7 @@ export function fit(s: string, width: number): string {
   return out + '…' + (colored ? `${ESC}[0m` : '');
 }
 
-function clock(ms: number): string {
+export function clock(ms: number): string {
   const t = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(t / 3600);
   const mm = String(Math.floor((t % 3600) / 60)).padStart(2, '0');
@@ -86,11 +97,32 @@ function clock(ms: number): string {
   return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
-/** Две строки панели: субагент (или контроллер) и контекст прогона. Время и цель — первыми, чтобы не обрезались. */
-export function renderPanel(s: PanelState, width: number, now: number): [string, string] {
+function plural(n: number, one: string, many: string): string {
+  return n === 1 ? one : many;
+}
+
+/** Насколько затянулся шаг: предупреждение с половины порога простоя, простой — от порога. */
+export function stepLevel(ms: number, stallMs: number): 'ok' | 'warn' | 'stall' {
+  if (stallMs > 0 && ms >= stallMs) return 'stall';
+  return stallMs > 0 && ms >= stallMs / 2 ? 'warn' : 'ok';
+}
+
+function stepDuration(ms: number, stallMs: number): string {
+  const t = clock(ms);
+  const level = stepLevel(ms, stallMs);
+  return level === 'stall' ? c.red(`простой ${t}`) : level === 'warn' ? c.yellow(t) : t;
+}
+
+/**
+ * Три строки панели: субагент (или контроллер), текущий шаг и контекст прогона.
+ * Время и цель — первыми, чтобы их не съела обрезка.
+ */
+export function renderPanel(s: PanelState, width: number, now: number): [string, string, string] {
   const sep = c.gray(' · ');
-  const counts = `запуск ${s.launches}${sep}ролей ${s.roles}`;
   const a = s.agent;
+  const nested = a?.nested ?? 0;
+  const active = `активных ${s.sessions ?? (a ? 1 : 0)}` + (nested ? ` (+${nested} ${plural(nested, 'вложенный', 'вложенных')})` : '');
+  const counts = `${active}${sep}запуск ${s.launches}${sep}ролей ${s.roles}`;
   const top = a
     ? [
         paintRole(a.role, `▶ ${a.role}`) + ' ' + c.bold(clock(now - a.startedAt)),
@@ -101,7 +133,17 @@ export function renderPanel(s: PanelState, width: number, now: number): [string,
         `инстр. ${a.tools}`,
         counts,
       ].join(sep)
-    : [c.gray('⚙ контроллер'), s.activity || 'работает', counts].join(sep);
+    : [c.gray('⚙ контроллер'), counts].join(sep);
+  let middle: string;
+  if (a) {
+    const step = a.step ?? { label: 'ждёт ответа модели', since: a.startedAt };
+    const parts = [`  ↳ ${step.label}`, `с ${clockTime(step.since)}`, stepDuration(now - step.since, s.stallMs ?? 0)];
+    if (a.denials?.count) parts.push(c.yellow(`✗ ACL ${a.denials.count}${a.denials.last ? `: ${a.denials.last}` : ''}`));
+    middle = parts.join(sep);
+  } else {
+    const since = s.activitySince;
+    middle = [`  ↳ ${s.activity || 'работает'}`, ...(since !== undefined ? [`с ${clockTime(since)}`, clock(now - since)] : [])].join(sep);
+  }
   const bottom = c.gray(
     [
       `⏱ ${clock(now - s.startedAt)}`,
@@ -111,7 +153,7 @@ export function renderPanel(s: PanelState, width: number, now: number): [string,
       `run ${s.runId}`,
     ].join(' · '),
   );
-  return [fit(top, width), fit(bottom, width)];
+  return [fit(top, width), fit(middle, width), fit(bottom, width)];
 }
 
 class Panel {
@@ -125,10 +167,11 @@ class Panel {
   private readonly onSigint = () => this.exitBySignal(130);
   private readonly onSigterm = () => this.exitBySignal(143);
 
-  start(init: { runId: string; change: string; roles: number; launches: number; phase?: string; enabled: boolean }, out: PanelOut = process.stdout): void {
+  start(init: { runId: string; change: string; roles: number; launches: number; phase?: string; stallMs?: number; enabled: boolean }, out: PanelOut = process.stdout): void {
     if (!init.enabled || this.active) return;
     this.out = out;
-    this.state = { runId: init.runId, change: init.change, roles: init.roles, launches: init.launches, phase: init.phase ?? '', activity: 'старт', startedAt: Date.now() };
+    const at = Date.now();
+    this.state = { runId: init.runId, change: init.change, roles: init.roles, launches: init.launches, phase: init.phase ?? '', activity: 'старт', activitySince: at, sessions: 0, stallMs: init.stallMs ?? 0, startedAt: at };
     this.active = true;
     this.paused = false;
     out.on('resize', this.onResize);
@@ -198,7 +241,7 @@ class Panel {
   }
 
   /**
-   * Освободить две нижние строки под курсором и закрепить область над ними. Курсор стоит в
+   * Освободить нижние строки под курсором и закрепить область над ними. Курсор стоит в
    * начале пустой строки после лога; ESC[J стирает остатки прежней панели ниже него.
    * DECSTBM переводит курсор в начало экрана — отсюда SAVE/RESTORE вокруг.
    */
