@@ -114,6 +114,13 @@ export function oneLine(text: string, max: number): string {
   return s.length > max ? s.slice(0, max - 1) + '…' : s;
 }
 
+/** Число со словом в нужной форме: «1 строка», «2 строки», «5 строк». */
+export function pluralRu(n: number, one: string, few: string, many: string): string {
+  const d = n % 10;
+  const dd = n % 100;
+  return `${n} ${d === 1 && dd !== 11 ? one : d >= 2 && d <= 4 && (dd < 12 || dd > 14) ? few : many}`;
+}
+
 export function now(): string {
   return new Date().toISOString();
 }

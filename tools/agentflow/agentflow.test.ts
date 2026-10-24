@@ -1,4 +1,5 @@
-// Офлайн-тесты детерминированных узлов: контракт ревью, правила принятия, ACL, tasks, glob, выбор схемы OpenSpec, панель статуса.
+// Офлайн-тесты детерминированных узлов: контракт ревью, правила принятия, ACL, tasks, glob, выбор схемы OpenSpec, панель статуса,
+// экран лога и режим мыши.
 //   npm run test:agentflow
 import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
@@ -19,7 +20,9 @@ import type { DiscussReply } from './context-builder.ts';
 import type { DiscussTurn } from './state.ts';
 import { normalize } from './snapshot.ts';
 import { globToRegExp } from './util.ts';
-import { log } from './log.ts';
+import { c, log, moreLines, thinkingLines } from './log.ts';
+import { InputParser, mouse, mouseEnabled } from './mouse.ts';
+import { charWidth, CursorModel, screen, textWidth, wrapText } from './screen.ts';
 import { SessionTracker, WAITING_MODEL } from './session-tracker.ts';
 import { fit, panel, panelEnabled, renderPanel, stepLevel, stripAnsi, type PanelState } from './status-panel.ts';
 
@@ -913,4 +916,696 @@ test('обсуждение при автопилоте: только репли�
 
 test('склонение реплик', () => {
   assert.deepEqual([1, 2, 5, 11, 12, 21, 22, 25].map(replies), ['1 реплика', '2 реплики', '5 реплик', '11 реплик', '12 реплик', '21 реплика', '22 реплики', '25 реплик']);
+});
+
+// ─── Экран лога и режим мыши ───
+
+/**
+ * Эмулятор терминала для тестов экрана: сетка, история строк, ушедших за верх области с верхней
+ * строкой 1, область прокрутки, сохранённый курсор, отложенный перенос и ответ на запрос позиции.
+ */
+class Vt {
+  grid: string[][];
+  history: string[] = [];
+  replies: [number, number][] = [];
+  r = 0;
+  c = 0;
+  wraps = 0;
+  private top = 0;
+  private bottom: number;
+  private saved = { r: 0, c: 0 };
+  private mode: 'text' | 'esc' | 'csi' | 'osc' = 'text';
+  private params = '';
+  constructor(
+    public rows: number,
+    public cols: number,
+  ) {
+    this.grid = Array.from({ length: rows }, () => this.blank());
+    this.bottom = rows - 1;
+  }
+  private blank(): string[] {
+    return Array<string>(this.cols).fill(' ');
+  }
+  lines(): string[] {
+    return this.grid.map((l) => l.join('').trimEnd());
+  }
+  /** Строка экрана (с 1), где есть text, или 0. */
+  row(text: string): number {
+    return this.lines().findIndex((l) => l.includes(text)) + 1;
+  }
+  feed(s: string): void {
+    for (const ch of s) {
+      if (this.mode === 'esc') this.escape(ch);
+      else if (this.mode === 'csi') this.csi(ch);
+      else if (this.mode === 'osc') this.mode = ch === '\x07' ? 'text' : 'osc';
+      else this.text(ch);
+    }
+  }
+  private text(ch: string): void {
+    const cp = ch.codePointAt(0)!;
+    if (ch === '\x1b') this.mode = 'esc';
+    else if (ch === '\n') {
+      this.c = 0;
+      this.lf();
+    } else if (ch === '\r') this.c = 0;
+    else if (cp >= 0x20) {
+      const w = charWidth(cp);
+      if (!w) return;
+      if (this.c + w > this.cols) {
+        this.c = 0;
+        this.lf();
+        this.wraps++;
+      }
+      this.grid[this.r]![this.c] = ch;
+      if (w === 2) this.grid[this.r]![this.c + 1] = '';
+      this.c += w;
+    }
+  }
+  private escape(ch: string): void {
+    this.mode = ch === '[' ? 'csi' : ch === ']' ? 'osc' : 'text';
+    this.params = '';
+    if (ch === '7') this.saved = { r: this.r, c: this.c };
+    if (ch === '8') ({ r: this.r, c: this.c } = this.saved);
+  }
+  private csi(ch: string): void {
+    if (/[0-9;?]/.test(ch)) {
+      this.params += ch;
+      return;
+    }
+    this.mode = 'text';
+    if (this.params.startsWith('?')) return;
+    const [a, b] = this.params.split(';').map((x) => (x === '' ? undefined : Number(x)));
+    const n = Math.max(1, a ?? 1);
+    const clear = (r: number, from: number) => {
+      for (let i = Math.min(from, this.cols - 1); i < this.cols; i++) this.grid[r]![i] = ' ';
+    };
+    switch (ch) {
+      case 'H':
+        this.r = Math.max(0, Math.min(this.rows - 1, (a ?? 1) - 1));
+        this.c = Math.max(0, (b ?? 1) - 1);
+        break;
+      case 'A':
+        this.r = Math.max(this.r >= this.top ? this.top : 0, this.r - n);
+        break;
+      case 'B':
+        this.r = Math.min(this.r <= this.bottom ? this.bottom : this.rows - 1, this.r + n);
+        break;
+      case 'G':
+        this.c = n - 1;
+        break;
+      case 'K':
+        clear(this.r, a === 2 ? 0 : this.c);
+        break;
+      case 'J':
+        if (a === 2) this.grid = this.grid.map(() => this.blank());
+        else {
+          clear(this.r, this.c);
+          for (let r = this.r + 1; r < this.rows; r++) this.grid[r] = this.blank();
+        }
+        break;
+      case 'M':
+        if (this.r >= this.top && this.r <= this.bottom) {
+          for (let i = 0; i < n; i++) {
+            this.grid.splice(this.r, 1);
+            this.grid.splice(this.bottom, 0, this.blank());
+          }
+        }
+        this.c = 0;
+        break;
+      case 'r':
+        this.top = (a ?? 1) - 1;
+        this.bottom = (b ?? this.rows) - 1;
+        this.r = 0;
+        this.c = 0;
+        break;
+      case 'n':
+        if (a === 6) this.replies.push([this.r + 1, Math.min(this.c, this.cols - 1) + 1]);
+        break;
+    }
+  }
+  private lf(): void {
+    if (this.r === this.bottom) {
+      const [gone] = this.grid.splice(this.top, 1);
+      if (this.top === 0) this.history.push(gone!.join('').trimEnd());
+      this.grid.splice(this.bottom, 0, this.blank());
+    } else if (this.r < this.rows - 1) this.r++;
+  }
+}
+
+/** Терминал теста: всё, что пишется, рисует эмулятор; ответ на запрос позиции уходит в onReply. */
+class VtTty extends FakeTty {
+  vt: Vt;
+  onReply: (row: number, col: number) => void = () => {};
+  /** Ответы копятся до deliver(): между запросом и ответом можно что-то вывести. */
+  defer = false;
+  constructor(rows: number, columns: number) {
+    super(rows, columns);
+    this.vt = new Vt(rows, columns);
+  }
+  override write(s: string): boolean {
+    super.write(s);
+    this.vt.feed(s);
+    if (!this.defer) this.deliver();
+    return true;
+  }
+  deliver(): void {
+    for (let r = this.vt.replies.shift(); r; r = this.vt.replies.shift()) this.onReply(r[0], r[1]);
+  }
+}
+
+const consoleLog = console.log;
+
+/** Экран лога на эмуляторе: console.log пишет в него же, как в настоящем терминале. */
+function term(o: { rows?: number; columns?: number; panel?: boolean } = {}) {
+  const out = new VtTty(o.rows ?? 30, o.columns ?? 120);
+  if (o.panel !== false) startPanel(out);
+  screen.start({ enabled: true, out, logBottom: () => panel.logBottom() });
+  out.onReply = (row) => screen.cursor(row);
+  console.log = (...a: unknown[]) => void out.write(a.map(String).join(' ') + '\n');
+  return {
+    out,
+    vt: out.vt,
+    row: (text: string) => out.vt.row(text),
+    lines: () => out.vt.lines(),
+    click(text: string): void {
+      const y = out.vt.row(text);
+      assert.ok(y > 0, `на экране нет «${text}»`);
+      screen.click(y);
+    },
+    done(): void {
+      console.log = consoleLog;
+      screen.stop();
+      panel.stop();
+    },
+  };
+}
+
+const fill = (p: string, n: number) => {
+  for (let i = 1; i <= n; i++) log.info(`${p}${String(i).padStart(2, '0')}`);
+};
+/** Абзацы из пронумерованных слов: по словам видно порядок и полноту раскрытого текста. */
+const numbered = (p: string, n: number) => {
+  const ws = Array.from({ length: n }, (_, i) => `${p}${String(i + 1).padStart(3, '0')}`);
+  const paras: string[] = [];
+  for (let i = 0; i < ws.length; i += 60) paras.push(ws.slice(i, i + 60).join(' '));
+  return paras.join('\n\n');
+};
+const lined = (p: string, n: number) => Array.from({ length: n }, (_, i) => `${p}${String(i + 1).padStart(2, '0')}`).join('\n');
+const tokens = (s: string, p: string) => s.match(new RegExp(`\\b${p}\\d{3}\\b`, 'g')) ?? [];
+const T1240 = numbered('w', 260).slice(0, 1240);
+
+test('экран: модель движения курсора — переводы и переносы строк, сдвиги, ESC7…ESC8, сброс', () => {
+  const m = new CursorModel();
+  m.feed('abc\n', 120);
+  assert.equal(m.moved, 1);
+  m.feed('a'.repeat(120) + '\n', 120);
+  assert.equal(m.moved, 2, 'ровно в ширину окна — одна строка');
+  m.feed('a'.repeat(130) + '\n', 120);
+  assert.equal(m.moved, 4);
+  const w = new CursorModel();
+  w.feed('你'.repeat(30) + '\n', 50);
+  assert.equal(w.moved, 2, '60 колонок CJK при ширине 50');
+  w.feed('a'.repeat(49) + '你\n', 50);
+  assert.equal(w.moved, 4, 'широкий символ в последней колонке переносится');
+  w.feed('💬'.repeat(25) + '\n', 50);
+  assert.equal(w.moved, 5);
+  w.feed('e\u0301'.repeat(50) + '\n', 50);
+  assert.equal(w.moved, 6, 'комбинируемые символы без ширины');
+
+  const k = new CursorModel();
+  k.feed('x\x1b[3A', 120);
+  assert.equal(k.moved, -3);
+  k.feed('\x1b[2B\x1b[G', 120);
+  assert.deepEqual([k.moved, k.col], [-1, 0]);
+  k.feed('\x1b7\x1b[28;1H\x1b[2Kстрока панели\x1b[29;1H\x1b[2K\n\nещё\x1b8', 120);
+  assert.deepEqual([k.moved, k.col, k.epoch], [-1, 0, 0], 'кадр панели не двигает курсор лога');
+  k.feed('\n\n\n\x1b[3A\x1b[J\x1b7\x1b[1;27r\x1b8', 120);
+  k.feed('\x1b7\x1b[r\x1b[28;1H\x1b[2K\x1b[29;1H\x1b[2K\x1b[30;1H\x1b[2K\x1b8', 120);
+  assert.deepEqual([k.moved, k.epoch], [-1, 0], 'reserve и release панели');
+  k.feed('? Вопрос\n❯ один\n  два\x1b[2A\x1b[10G', 120);
+  k.feed('\x1b[2B' + '\x1b[2K\x1b[1A'.repeat(2) + '\x1b[2K\x1b[G? Вопрос\n  один\n❯ два\x1b[2A\x1b[10G', 120);
+  k.feed('\x1b[2B' + '\x1b[2K\x1b[1A'.repeat(2) + '\x1b[2K\x1b[G✔ Вопрос два\x1b[13G\n\x1b[G\x1b[?25h', 120);
+  assert.deepEqual([k.moved, k.epoch], [0, 0], 'меню inquirer: относительные сдвиги, итог — одна строка');
+  k.feed('\x1b]8;;https://x\x07ссылка\x1b]8;;\x07', 120);
+  assert.deepEqual([k.moved, k.col], [0, 6], 'OSC без движения');
+  k.feed('\x1b[5;1H', 120);
+  assert.equal(k.epoch, 1, 'абсолютное позиционирование вне ESC7…ESC8 — сброс');
+  k.feed('\x1b[2J', 120);
+  assert.equal(k.epoch, 2);
+
+  const sp = new CursorModel();
+  sp.feed('\x1b[', 120);
+  sp.feed('3A', 120);
+  assert.equal(sp.moved, -3, 'последовательность, разрезанная на два write');
+});
+
+test('экран: расстояние до курсора по модели совпадает с эмулятором терминала', () => {
+  const out = new VtTty(30, 120);
+  startPanel(out);
+  try {
+    const model = new CursorModel();
+    const marks: { id: string; base: number }[] = [];
+    const put = (s: string) => {
+      model.feed(s, 120);
+      out.write(s);
+    };
+    const line = (body: string) => {
+      const id = `M${String(marks.length + 1).padStart(3, '0')}`;
+      marks.push({ id, base: model.moved });
+      put(`${id} ${body}\n`);
+    };
+    for (let i = 0; i < 12; i++) line('короткая');
+    line('длинная '.repeat(40));
+    line('emoji 💬 ⚡ 你好 '.repeat(12));
+    put('\x1b7\x1b[28;1H\x1b[2Kкадр панели\x1b8');
+    // Диалог: панель снята, меню inquirer нарисовано и перерисовано, ответ, панель вернулась.
+    put('\x1b7\x1b[r\x1b[28;1H\x1b[2K\x1b[29;1H\x1b[2K\x1b[30;1H\x1b[2K\x1b8');
+    put('? Вопрос\n❯ один\n  два\n  три\x1b[3A\x1b[10G');
+    put('\x1b[3B' + '\x1b[2K\x1b[1A'.repeat(3) + '\x1b[2K\x1b[G? Вопрос\n  один\n❯ два\n  три\x1b[3A\x1b[10G');
+    put('\x1b[3B' + '\x1b[2K\x1b[1A'.repeat(3) + '\x1b[2K\x1b[G✔ Вопрос два\x1b[13G\n\x1b[G\x1b[?25h');
+    put('\n\n\n\x1b[3A\x1b[J\x1b7\x1b[1;27r\x1b8');
+    for (let i = 0; i < 8; i++) line(i % 2 ? 'после диалога' : 'после диалога '.repeat(12));
+    let visible = 0;
+    for (const mk of marks) {
+      const row = out.vt.row(mk.id + ' ');
+      if (!row) continue;
+      visible++;
+      assert.equal(out.vt.r + 1 - (model.moved - mk.base), row, mk.id);
+    }
+    assert.ok(visible >= 10 && out.vt.history.some((l) => l.startsWith('M001')), `видно ${visible}`);
+  } finally {
+    panel.stop();
+  }
+});
+
+test('размышление без режима мыши: прежняя строка с числом символов', () => {
+  const printed: string[] = [];
+  console.log = (s: string) => void printed.push(String(s));
+  try {
+    log.thinking('implementer', 'abcde');
+    log.role('implementer', c.gray('… размышляет (5 симв.)'));
+    const t = (s: string) => s.replace(/\d\d:\d\d:\d\d/, 'T');
+    assert.equal(t(printed[0]!), t(printed[1]!));
+  } finally {
+    console.log = consoleLog;
+  }
+});
+
+test('раскрытый текст: форма слова скрытых строк, перенос по ширине, чистка текста', () => {
+  assert.deepEqual(
+    [1, 2, 5, 21, 25, 32].map(moreLines),
+    [1, 2, 5, 21, 25, 32].map((n, i) => `… ещё ${n} ${['строка', 'строки', 'строк', 'строка', 'строк', 'строки'][i]} — целиком в events.jsonl`),
+  );
+  const lines = thinkingLines('первая\tстрока\x07\x1b[31m\r\n\n\n\nвторая ' + 'слово '.repeat(20) + 'ы'.repeat(30) + ' 你好'.repeat(10) + ' 💬💬\n\n', 24);
+  assert.equal(lines[0], 'первая  строка[31m');
+  assert.equal(lines[1], '');
+  assert.ok(lines.at(-1) !== '');
+  for (let i = 1; i < lines.length; i++) assert.ok(lines[i] || lines[i - 1], 'пустые строки схлопнуты');
+  for (const l of lines) assert.ok(textWidth(l) <= 24 && !/[\x00-\x1f]/.test(l), l);
+  assert.ok(lines.join(' ').includes('ы'.repeat(24)));
+  assert.equal(textWidth('a\x1b[90m你💬\x1b[0m'), 5);
+  for (const l of wrapText('你好'.repeat(20), 10)) assert.ok(textWidth(l) <= 10);
+});
+
+test('экран: клик раскрывает размышление под строкой, лог ниже и панель на месте, история без потерь', () => {
+  const t = term();
+  try {
+    fill('A', 30);
+    log.thinking('implementer', T1240);
+    fill('B', 3);
+    const before = t.lines();
+    const y = t.row('▸ размышляет (1240 симв.)');
+    t.click('▸ размышляет (1240 симв.)');
+    const after = t.lines();
+    const h = t.row('▾ размышляет (1240 симв.)');
+    assert.ok(h > 0 && h < y, `строка размышления ушла вверх: ${h} < ${y}`);
+    assert.equal(t.row('▸ размышляет'), 0);
+    assert.deepEqual(tokens(after.slice(h, y).join(' '), 'w'), tokens(T1240, 'w'), 'текст по порядку и целиком');
+    for (const b of ['B01', 'B02', 'B03']) assert.equal(t.row(b), before.findIndex((l) => l.includes(b)) + 1, b);
+    assert.ok(after[27]!.includes('контроллер') && after[29]!.includes('run r1'), 'панель на месте');
+    const all = [...t.vt.history, ...after].join('\n').match(/\bA\d\d\b/g);
+    assert.deepEqual(all, Array.from({ length: 30 }, (_, i) => `A${String(i + 1).padStart(2, '0')}`), 'строки выше — в истории, по порядку, без потерь и дублей');
+    assert.equal(t.vt.wraps, 0, 'строки текста не переносятся терминалом');
+  } finally {
+    t.done();
+  }
+});
+
+test('экран: повторный клик по строке или по тексту сворачивает, лог поднимается вплотную', () => {
+  const t = term();
+  try {
+    fill('A', 30);
+    log.thinking('implementer', numbered('w', 80));
+    fill('B', 3);
+    t.click('▸ размышляет');
+    const h = t.row('▾ размышляет');
+    t.click('▾ размышляет');
+    assert.equal(t.row('▸ размышляет'), h);
+    assert.equal(t.row('B01'), h + 1);
+    assert.deepEqual(tokens(t.lines().join(' '), 'w'), []);
+    t.click('▸ размышляет');
+    const h2 = t.row('▾ размышляет');
+    assert.deepEqual(tokens(t.lines().join(' '), 'w'), tokens(numbered('w', 80), 'w'), 'текст раскрыт целиком');
+    screen.click(h2 + 3);
+    assert.equal(t.row('▸ размышляет'), h2, 'клик по строке текста');
+    assert.equal(t.row('B01'), h2 + 1);
+    log.info('C01');
+    assert.equal(t.row('C01'), t.row('B03') + 1, 'следующая строка — сразу под последней');
+    const all = [...t.vt.history, ...t.lines()].join('\n');
+    assert.equal(all.match(/\bA\d\d\b/g)?.length, 30, 'в истории нет дублей');
+  } finally {
+    t.done();
+  }
+});
+
+test('экран: клик мимо размышления ничего не меняет', () => {
+  const t = term();
+  try {
+    fill('A', 10);
+    log.thinking('implementer', T1240);
+    fill('B', 3);
+    const log27 = () => t.lines().slice(0, 27);
+    const before = log27();
+    for (const y of [t.row('A05'), t.row('B03') + 3, 28, 29, 30]) screen.click(y);
+    assert.deepEqual(log27(), before);
+  } finally {
+    t.done();
+  }
+});
+
+test('экран: лог продолжается под раскрытым, два размышления, клик по видимой части сворачивает', () => {
+  const t = term();
+  try {
+    fill('A', 30);
+    log.thinking('implementer', numbered('x', 40));
+    log.thinking('code-reviewer', numbered('y', 40));
+    fill('B', 2);
+    t.click('code-reviewer');
+    t.click('implementer');
+    const h = t.row('▾ размышляет (199 симв.)');
+    fill('D', 5);
+    assert.equal(t.row('▾ размышляет (199 симв.)'), h - 5, 'текст ушёл вверх вместе с логом');
+    assert.equal(t.row('D05'), t.vt.r);
+    assert.deepEqual(tokens(t.lines().join(' '), 'y'), tokens(numbered('y', 40), 'y'));
+    screen.click(h - 5 + 1);
+    assert.deepEqual(tokens(t.lines().join(' '), 'x'), [], 'первое свёрнуто');
+    assert.deepEqual(tokens(t.lines().join(' '), 'y'), tokens(numbered('y', 40), 'y'), 'второе не тронуто');
+    log.info('D06');
+    assert.equal(t.row('D06'), t.row('D05') + 1);
+  } finally {
+    t.done();
+  }
+});
+
+test('экран: длинное размышление — сколько влезает над строкой и «… ещё N строк»', () => {
+  for (const [n, hidden] of [
+    [40, '32 строки'],
+    [29, '21 строка'],
+    [33, '25 строк'],
+  ] as const) {
+    const t = term();
+    try {
+      fill('F', 40);
+      log.thinking('implementer', lined('L', n));
+      fill('E', 16);
+      assert.equal(t.row('▸ размышляет'), 10);
+      const before = t.lines();
+      screen.click(10);
+      const after = t.lines();
+      assert.equal(t.row('▾ размышляет'), 1);
+      for (let i = 1; i <= 8; i++) assert.ok(after[i]!.includes(`L0${i}`), after[i]);
+      assert.ok(after[9]!.includes(`… ещё ${hidden} — целиком в events.jsonl`), after[9]);
+      assert.deepEqual(after.slice(10, 26), before.slice(10, 26), 'лог ниже на месте');
+    } finally {
+      t.done();
+    }
+  }
+});
+
+test('экран: строка размышления в первой строке экрана не раскрывается', () => {
+  const t = term();
+  try {
+    fill('F', 40);
+    log.thinking('implementer', T1240);
+    fill('E', 25);
+    assert.equal(t.row('▸ размышляет'), 1);
+    const before = [...t.vt.history, ...t.lines()];
+    screen.click(1);
+    assert.deepEqual([...t.vt.history, ...t.lines()], before);
+  } finally {
+    t.done();
+  }
+});
+
+test('экран: узкое окно — строки текста без переноса, строка размышления в две строки экрана', () => {
+  for (const columns of [50, 44]) {
+    const t = term({ columns });
+    try {
+      fill('A', 30);
+      log.thinking('implementer', 'суперкалифрагилистикэкспиалидоцкийпример 你好世界你好世界你好 💬💬💬 конец');
+      fill('B', 2);
+      const wraps = t.vt.wraps;
+      const b1 = t.row('B01');
+      t.click('▸ размышляет');
+      assert.ok(t.row('▾ размышляет') > 0);
+      for (const l of t.lines()) assert.ok(textWidth(l) <= columns, l);
+      assert.ok(t.vt.wraps - wraps <= 1, 'переносится только переписанная строка размышления');
+      assert.equal(t.row('B01'), b1);
+      assert.ok(t.lines().join('').includes('конец'));
+      t.click('▾ размышляет');
+      assert.equal(t.row('B01'), t.row('▸ размышляет') + (columns === 44 ? 2 : 1));
+    } finally {
+      t.done();
+    }
+  }
+});
+
+test('экран: раскрытое размышление ушло за верх — клик по видимому тексту убирает его', () => {
+  const t = term();
+  try {
+    fill('F', 40);
+    log.thinking('implementer', lined('K', 10));
+    t.click('▸ размышляет');
+    assert.equal(t.row('▾ размышляет'), 16);
+    fill('G', 20);
+    assert.equal(t.row('размышляет'), 0);
+    assert.equal(t.row('K05'), 1);
+    screen.click(3);
+    assert.ok(!t.lines().join(' ').match(/\bK\d\d\b/), 'видимый текст удалён');
+    assert.equal(t.row('G01'), 1);
+    log.info('Z01');
+    assert.equal(t.row('Z01'), t.row('G20') + 1);
+    const before = t.lines();
+    screen.click(1);
+    assert.deepEqual(t.lines(), before, 'запись забыта');
+  } finally {
+    t.done();
+  }
+});
+
+test('экран: без панели — вся высота; вывод между запросом позиции и ответом — запрос снова', () => {
+  const t = term({ panel: false });
+  try {
+    fill('A', 40);
+    log.thinking('implementer', T1240);
+    log.info('B01');
+    t.out.defer = true;
+    t.click('▸ размышляет');
+    log.info('B02');
+    const asked = () => t.out.writes.filter((w) => w.includes('\x1b[6n')).length;
+    assert.equal(asked(), 1);
+    t.out.deliver();
+    assert.equal(asked(), 2, 'позиция устарела — второй запрос');
+    t.out.deliver();
+    assert.ok(t.row('▾ размышляет (1240 симв.)') > 0, 'раскрыто то, по чему кликнули, хотя лог успел сдвинуться');
+    assert.ok(t.out.writes.some((w) => w.includes('\x1b[r\x1b8')), 'область во всю высоту');
+    assert.equal(t.row('B02'), 30 - 1);
+    t.out.defer = false;
+    t.click('▾ размышляет');
+    assert.equal(t.row('B01'), t.row('▸ размышляет') + 1);
+  } finally {
+    t.done();
+  }
+});
+
+test('экран: после изменения размера окна прежние размышления не раскрываются, новые — да', () => {
+  const t = term();
+  try {
+    fill('A', 5);
+    log.thinking('implementer', T1240);
+    t.out.columns = 110;
+    t.out.emit('resize');
+    t.click('▸ размышляет');
+    assert.equal(t.row('▾'), 0);
+    log.thinking('code-reviewer', T1240);
+    t.click('code-reviewer │');
+    assert.ok(t.row('▾ размышляет') > 0 && t.lines()[t.row('▾ размышляет') - 1]!.includes('code-reviewer'));
+  } finally {
+    t.done();
+  }
+});
+
+test('экран: размышление под удержанием лога встаёт на экран при release, пустое — без пометки', () => {
+  const t = term();
+  try {
+    fill('A', 5);
+    log.hold();
+    log.thinking('implementer', T1240);
+    assert.equal(t.row('размышляет'), 0);
+    log.release();
+    t.click('▸ размышляет (1240 симв.)');
+    assert.ok(t.row('▾ размышляет (1240 симв.)') > 0);
+    log.thinking('implementer', '  ');
+    assert.ok(t.row('… размышляет (2 симв.)') > 0);
+  } finally {
+    t.done();
+  }
+});
+
+class FakeStdin extends EventEmitter {
+  isTTY = true;
+  raw: boolean[] = [];
+  flowing = false;
+  setRawMode(mode: boolean): this {
+    this.raw.push(mode);
+    return this;
+  }
+  resume(): this {
+    this.flowing = true;
+    return this;
+  }
+  pause(): this {
+    this.flowing = false;
+    return this;
+  }
+  ref(): this {
+    return this;
+  }
+  unref(): this {
+    return this;
+  }
+}
+
+test('мышь: разбор ввода терминала', () => {
+  const p = new InputParser();
+  assert.deepEqual(p.feed('\x1b[<0;5;7M\x1b[<0;5;7m'), [
+    { kind: 'press', button: 0, x: 5, y: 7 },
+    { kind: 'release', button: 0, x: 5, y: 7 },
+  ]);
+  assert.deepEqual(p.feed('\x1b[<2;1;1M\x1b[<32;3;3M'), [{ kind: 'press', button: 2, x: 1, y: 1 }, { kind: 'motion' }]);
+  assert.deepEqual(p.feed('\x1b[<64;3;3M\x1b[<65;3;3M'), [
+    { kind: 'wheel', up: true },
+    { kind: 'wheel', up: false },
+  ]);
+  assert.deepEqual(p.feed('\x1b[12;1R'), [{ kind: 'cursor', row: 12, col: 1 }]);
+  assert.deepEqual(p.feed('ab\x03'), [{ kind: 'interrupt' }]);
+  assert.deepEqual(p.feed('\x1b[<0;1'), []);
+  assert.deepEqual(p.feed('0;20M'), [{ kind: 'press', button: 0, x: 10, y: 20 }]);
+  assert.deepEqual(p.feed('\x1b[2'), []);
+  assert.deepEqual(p.feed('7;1R'), [{ kind: 'cursor', row: 27, col: 1 }]);
+  assert.deepEqual(p.feed('\x1bOA\x1b[Aq'), [], 'стрелки и буквы — мимо');
+});
+
+test('мышь: включение, клик, колесо с паузой 15 с, Ctrl+C группе, пауза диалога, идемпотентный stop', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const input = new FakeStdin();
+  const writes: string[] = [];
+  const out = { write: (s: string) => void writes.push(s) };
+  const clicks: number[][] = [];
+  const cursors: number[][] = [];
+  const kills: unknown[][] = [];
+  const kill = process.kill;
+  process.kill = ((...a: unknown[]) => (kills.push(a), true)) as typeof process.kill;
+  const sigint = process.listenerCount('SIGINT');
+  const handlers = { click: (x: number, y: number) => void clicks.push([x, y]), cursor: (r: number, col: number) => void cursors.push([r, col]) };
+  try {
+    mouse.start({ enabled: false, input, out, handlers });
+    assert.equal(writes.length, 0);
+    mouse.start({ enabled: true, input, out, handlers });
+    assert.equal(writes.at(-1), '\x1b[?1000h\x1b[?1006h');
+    assert.ok(input.raw.at(-1) && input.flowing);
+    assert.equal(process.listenerCount('SIGINT'), sigint + 1);
+    input.emit('data', '\x1b[<0;3;4M\x1b[<0;3;4m\x1b[<2;3;4M\x1b[<32;3;4M');
+    assert.deepEqual(clicks, [[3, 4]]);
+    input.emit('data', '\x1b[9;1R');
+    assert.deepEqual(cursors, [[9, 1]]);
+    input.emit('data', '\x03');
+    assert.deepEqual(kills, [[0, 'SIGINT']]);
+    input.emit('data', '\x1b[<64;1;1M');
+    assert.equal(writes.at(-1), '\x1b[?1000l');
+    const n = writes.length;
+    input.emit('data', '\x1b[<64;1;1M');
+    assert.equal(writes.length, n, 'дальше колесо терминала, а не наше');
+    t.mock.timers.tick(14_999);
+    assert.equal(writes.length, n);
+    t.mock.timers.tick(1);
+    assert.equal(writes.at(-1), '\x1b[?1000h');
+    input.emit('data', '\x1b[<64;1;1M');
+    mouse.pause();
+    assert.equal(writes.at(-1), '\x1b[?1000l\x1b[?1006l');
+    assert.ok(!input.raw.at(-1) && !input.flowing && input.listenerCount('data') === 0);
+    t.mock.timers.tick(15_000);
+    assert.equal(writes.at(-1), '\x1b[?1000l\x1b[?1006l', 'пауза колеса не включает отчёт во время диалога');
+    mouse.resume();
+    assert.equal(writes.at(-1), '\x1b[?1000h\x1b[?1006h');
+    assert.ok(input.raw.at(-1));
+    mouse.stop();
+    assert.equal(writes.at(-1), '\x1b[?1000l\x1b[?1006l');
+    assert.ok(!input.raw.at(-1) && input.listenerCount('data') === 0);
+    assert.equal(process.listenerCount('SIGINT'), sigint);
+    const m = writes.length;
+    mouse.stop();
+    assert.equal(writes.length, m);
+  } finally {
+    process.kill = kill;
+    mouse.stop();
+  }
+});
+
+test('режим мыши включается только при TTY stdin и stdout без --no-mouse', () => {
+  const on = { stdinTTY: true, stdoutTTY: true, env: {} };
+  assert.equal(mouseEnabled(on), true);
+  assert.equal(mouseEnabled({ ...on, stdinTTY: false }), false);
+  assert.equal(mouseEnabled({ ...on, stdoutTTY: undefined }), false);
+  assert.equal(mouseEnabled({ ...on, noMouse: true }), false);
+  assert.equal(mouseEnabled({ ...on, env: { AGENTFLOW_NO_MOUSE: '1' } }), false);
+});
+
+test('диалог: режим мыши снят на время меню, размышление до диалога раскрывается после', async () => {
+  const t = term();
+  const input = new FakeStdin();
+  mouse.start({ enabled: true, input, out: t.out, handlers: { click: (_x, y) => screen.click(y), cursor: (row) => screen.cursor(row) } });
+  t.out.onReply = (row, col) => void input.emit('data', `\x1b[${row};${col}R`);
+  const click = (text: string) => input.emit('data', `\x1b[<0;5;${t.row(text)}M\x1b[<0;5;${t.row(text)}m`);
+  try {
+    fill('A', 20);
+    log.thinking('spec-author', numbered('w', 80));
+    log.info('после размышления');
+    let during: unknown;
+    const io: PromptIO = {
+      select: async (cfg) => {
+        during = { raw: input.raw.at(-1), listeners: input.listenerCount('data') };
+        t.out.write('? Вопрос\n❯ один\n  два\n  три\x1b[3A\x1b[10G');
+        t.out.write('\x1b[3B' + '\x1b[2K\x1b[1A'.repeat(3) + '\x1b[2K\x1b[G? Вопрос\n  один\n❯ два\n  три\x1b[3A\x1b[10G');
+        click('▸ размышляет');
+        t.out.write('\x1b[3B' + '\x1b[2K\x1b[1A'.repeat(3) + '\x1b[2K\x1b[G✔ Вопрос один\x1b[15G\n\x1b[G\x1b[?25h');
+        return cfg.default!;
+      },
+      input: async () => '',
+      tty: () => true,
+    };
+    const key = await new Human(false, io).select({ title: 'Вопрос', options: [{ key: 'a', label: 'один' }, { key: 'b', label: 'два' }], recommended: 'a', rationale: 'r' });
+    assert.equal(key, 'a');
+    assert.deepEqual(during, { raw: false, listeners: 0 });
+    assert.equal(t.row('▾'), 0, 'во время диалога клик не раскрыл');
+    assert.ok(!t.out.writes.some((w) => w.includes('\x1b[6n')), 'позиция не запрашивалась');
+    assert.ok(input.raw.at(-1) && input.listenerCount('data') === 1, 'после диалога режим мыши снова включён');
+    click('▸ размышляет');
+    const h = t.row('▾ размышляет');
+    assert.ok(h > 0 && t.lines()[h - 1]!.includes('spec-author'));
+    assert.deepEqual(tokens(t.lines().join(' '), 'w'), tokens(numbered('w', 80), 'w'));
+  } finally {
+    mouse.stop();
+    t.done();
+  }
 });

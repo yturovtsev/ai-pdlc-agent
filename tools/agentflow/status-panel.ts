@@ -189,6 +189,11 @@ class Panel {
     this.draw();
   }
 
+  /** Нижняя строка области лога, пока панель на экране; иначе undefined — лог во всю высоту. */
+  logBottom(): number | undefined {
+    return this.active && !this.paused ? this.rows() - HEIGHT : undefined;
+  }
+
   /** На время диалога: область прокрутки снята, нижние строки свободны для меню. */
   pause(): void {
     if (!this.active || this.paused) return;

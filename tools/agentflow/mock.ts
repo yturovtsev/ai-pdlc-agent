@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { c, log } from './log.ts';
-import { decideAcl, describeTask, newTracker, spawnTools, syncPanel, Watchdog, type RoleCall, type RoleResult, type RoleRuntime } from './roles.ts';
+import { decideAcl, describeTask, newTracker, spawnTools, syncPanel, Watchdog, type RoleCall, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
 import type { SessionTracker } from './session-tracker.ts';
 import { KIT_BIN } from './config.ts';
 import { gateEnv } from './policy.ts';
@@ -147,6 +147,20 @@ export function slugify(text) {
 }
 `;
 
+/** Сколько размышлений присылает сессия под think-long:<роль>, по одному в секунду. */
+const THINK_LONG = 30;
+
+/** Размышление mock-роли: фиксированный текст в несколько абзацев, чтобы раскрытие по клику было видно. */
+function mockThinking(role: string, meta: TaskMeta): string {
+  return [
+    `Я ${role}, задача: ${describeTask(meta) || meta.kind}. Сначала перечитаю промпт контроллера целиком: что от меня ждут, какие файлы мне разрешено менять и в каком формате вернуть ответ. Ошибиться в формате дороже, чем потратить лишний ход на чтение.`,
+    'Intent простой — функция slugify(text): строка в нижнем регистре, всё, что не латиница и не цифры, превращается в один дефис, а дефисы по краям убираются. Неочевидные места — кириллица и пустая строка. По примерам intent кириллица отбрасывается, а пустая строка даёт пустую строку, а не ошибку.',
+    'Что может пойти не так: несколько разделителей подряд («a  --  b») должны дать один дефис; строка из одних разделителей — пустую строку; не строка на входе — TypeError с понятным сообщением. Это стоит держать в голове и при ревью, и при тестах, и при финальной проверке трассируемости.',
+    'План: прочитать нужные файлы, сделать свою часть, сверить результат с требованиями REQ-* и сценариями SCN-*, затем вернуть ответ строго по контракту. Если что-то в intent противоречит спеке, лучше спросить, чем угадывать: решение человека дешевле лишнего раунда исправлений, а раунд исправлений дешевле ошибки, найденной на приёмке.',
+    'Отдельно про ACL: писать можно только в разрешённые пути, shell — только agentflow-gate с операцией из policy. Если вызов отклонят, причину и разрешённое контроллер вернёт в ответе инструмента; повторять тот же вызов бессмысленно, лучше выбрать разрешённый путь или сказать, чего не хватает.',
+  ].join('\n\n');
+}
+
 function json(v: unknown): string {
   return 'Готово.\n```json\n' + JSON.stringify(v, null, 2) + '\n```';
 }
@@ -193,6 +207,20 @@ async function mockSession(rt: RoleRuntime, call: RoleCall, session: string, tra
   };
   // Те же сообщения потока, что у настоящей сессии, чтобы `agentflow agents` работал и в mock.
   rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'system', subtype: 'init', session_id: session, model: `${role.model} (mock)`, tools: spawnTools(rt.policy, role, call.readOnly), permission_mode: 'default' } });
+
+  // Размышление, как у модели в thinking mode: строка в логе и блок thinking в events.jsonl.
+  const think = (text: string) => {
+    rt.ledger({ ev: 'sdk', step: call.label, role: role.name, msg: { type: 'assistant', session_id: session, parent_tool_use_id: null, message: { role: 'assistant', content: [{ type: 'thinking', thinking: text }] } } });
+    log.thinking(role.name, text);
+    tracker.event();
+    syncPanel(tracker);
+  };
+  if (meta.thinkLong) {
+    for (let i = 1; i <= THINK_LONG; i++) {
+      think(`Шаг ${i}/${THINK_LONG}. ${mockThinking(role.name, meta)}`);
+      await new Promise((done) => setTimeout(done, 1000));
+    }
+  } else think(mockThinking(role.name, meta));
 
   const write = (rel: string, content: string) => {
     log.toolUse(role.name, 'write_file', rel);

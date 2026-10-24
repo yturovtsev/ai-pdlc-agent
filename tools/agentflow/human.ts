@@ -3,9 +3,10 @@
 import { input, select } from '@inquirer/prompts';
 import type { DiscussReply } from './context-builder.ts';
 import { c, log } from './log.ts';
+import { mouse } from './mouse.ts';
 import type { DiscussTurn, QuestionOption } from './state.ts';
 import { panel } from './status-panel.ts';
-import { Blocked, now } from './util.ts';
+import { Blocked, now, pluralRu } from './util.ts';
 
 export interface Option<K extends string = string> {
   key: K;
@@ -25,10 +26,11 @@ export interface Choice<K extends string = string> {
 }
 
 /**
- * Меню inquirer рисуется без панели: она убрана на время диалога и возвращается после ответа.
- * Лог удержан: работающая сессия (диалог вмешательства) не рвёт меню, её строки выйдут после.
+ * Меню inquirer рисуется без панели и без режима мыши: они убраны на время диалога и возвращаются
+ * после ответа. Лог удержан: работающая сессия (диалог вмешательства) не рвёт меню, её строки выйдут после.
  */
 async function paused<T>(fn: () => Promise<T>): Promise<T> {
+  mouse.pause();
   panel.pause();
   log.hold();
   try {
@@ -36,6 +38,7 @@ async function paused<T>(fn: () => Promise<T>): Promise<T> {
   } finally {
     log.release();
     panel.resume();
+    mouse.resume();
   }
 }
 
@@ -251,8 +254,5 @@ export class Human {
 
 /** «1 реплика», «2 реплики», «5 реплик». */
 export function replies(n: number): string {
-  const d = n % 10;
-  const dd = n % 100;
-  const word = d === 1 && dd !== 11 ? 'реплика' : d >= 2 && d <= 4 && (dd < 12 || dd > 14) ? 'реплики' : 'реплик';
-  return `${n} ${word}`;
+  return pluralRu(n, 'реплика', 'реплики', 'реплик');
 }

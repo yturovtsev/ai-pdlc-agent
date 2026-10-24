@@ -39,11 +39,13 @@ import { INJECT_HELP, Injector, parseInject } from './inject.ts';
 import { aclRetryAddendum, diagnose, INTERVENTION_OPTIONS, recommendIntervention } from './intervention.ts';
 import { c, log, setLogSink } from './log.ts';
 import { runMock } from './mock.ts';
+import { mouse, mouseEnabled } from './mouse.ts';
 import { OpenSpec, topoOrder, type ArtifactNode } from './openspec.ts';
 import { loadPolicy, qwenExecutable, type Policy } from './policy.ts';
 import { printLoopSummary, writeAcceptanceReport } from './report.ts';
 import { decide, countBySeverity, validateReview, type Decision, type Expectation, type Review, type ReviewFinding } from './review-validator.ts';
 import { expandGlob, loadRoles, mcpViolations, mcpWarnings, roleFiles, runRole, stallMs, type RoleCall, type RoleDef, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
+import { screen } from './screen.ts';
 import { artifactFiles, artifactSnapshot, artifactText, codeSnapshot, specDigest } from './snapshot.ts';
 import { clock, panelEnabled, panel } from './status-panel.ts';
 import { RunStore, STAGES, type BatchState, type DiscussTurn, type Finding, type Question, type QuestionOption, type RunState, type Stage } from './state.ts';
@@ -53,6 +55,8 @@ import { Blocked, exec, extractJson, matchesAny, now, oneLine, sha256, short, st
 let ROOT = KIT;
 /** --no-panel: без панели статуса внизу терминала. */
 let NO_PANEL = false;
+/** --no-mouse: без режима мыши (клик по размышлению не раскрывает его). */
+let NO_MOUSE = false;
 const ROLE_NAMES = ['spec-author', 'spec-reviewer', 'implementer', 'code-reviewer', 'acceptance-tester'];
 
 interface Ctx {
@@ -159,6 +163,11 @@ function afterIntervention(label: string, name: string, res: RoleResult): string
   return res.intervention?.kind === 'acl-streak' ? '\n\n' + aclRetryAddendum(res.intervention.denials) : '';
 }
 
+/** Точки inject первой сессии роли: stall:<роль> (молчит) и think-long:<роль> (долго размышляет). */
+function sessionInject(ctx: Ctx, name: string): Partial<TaskMeta> {
+  return { ...(ctx.inject.take(`stall:${name}`) ? { silent: true } : {}), ...(ctx.inject.take(`think-long:${name}`) ? { thinkLong: true } : {}) };
+}
+
 /** Вызов роли с повторами на инфраструктурных ошибках (таймаут, пустой ответ, сбой CLI). */
 async function callRole(
   ctx: Ctx,
@@ -171,7 +180,7 @@ async function callRole(
   writeContext(ctx.contextsDir, opts.label, prompt);
   const tries = ctx.policy.limits.infraRetries + 1;
   const intervene = interventionHandler(ctx, opts.label);
-  let silent = ctx.inject.take(`stall:${name}`);
+  let once = sessionInject(ctx, name);
   let addendum = '';
   for (let series = 1; ; series++) {
     let lastError = '';
@@ -184,10 +193,10 @@ async function callRole(
         cwd: ctx.wt,
         readOnly: opts.readOnly,
         resume: attempt === 1 && series === 1 ? opts.resume : undefined,
-        meta: silent ? { ...meta, silent } : meta,
+        meta: { ...meta, ...once },
         intervene,
       });
-      silent = false;
+      once = {};
       account(ctx, r, res);
       checkMcp(ctx, name, opts.readOnly, res);
       if (res.ok) return res;
@@ -270,7 +279,7 @@ async function callReviewer(
   const r = role(ctx, name);
   const tries = ctx.policy.limits.infraRetries + 1;
   const intervene = interventionHandler(ctx, label);
-  let silent = ctx.inject.take(`stall:${name}`);
+  let once = sessionInject(ctx, name);
   let addendum = '';
   for (let series = 1; ; series++) {
     let lastError = '';
@@ -280,8 +289,8 @@ async function callReviewer(
         addendum;
       const tag = series === 1 && attempt === 1 ? label : `${label}-retry${series}.${attempt}`;
       writeContext(ctx.contextsDir, tag, p);
-      const res = await runRole(ctx.rt, { role: r, prompt: p, label, cwd: ctx.wt, meta: silent ? { ...meta, silent } : meta, intervene });
-      silent = false;
+      const res = await runRole(ctx.rt, { role: r, prompt: p, label, cwd: ctx.wt, meta: { ...meta, ...once }, intervene });
+      once = {};
       account(ctx, r, res);
       checkMcp(ctx, name, false, res);
       if (!res.ok) {
@@ -1622,6 +1631,9 @@ async function pipeline(ctx: Ctx): Promise<void> {
     stallMs: stallMs(ctx.rt),
     enabled: panelEnabled({ isTTY: out.isTTY, rows: out.rows, cols: out.columns, noPanel: NO_PANEL, env: process.env }),
   });
+  const clicks = mouseEnabled({ stdinTTY: process.stdin.isTTY, stdoutTTY: out.isTTY, noMouse: NO_MOUSE, env: process.env });
+  screen.start({ enabled: clicks, out, err: process.stderr, logBottom: () => panel.logBottom() });
+  mouse.start({ enabled: clicks, input: process.stdin, out, handlers: { click: (_x, y) => screen.click(y), cursor: (row) => screen.cursor(row) } });
   log.info(`схема OpenSpec: ${status.schemaName} · артефакты: ${ctx.graph.map((n) => n.id).join(' → ')} · apply требует: ${status.applyRequires.join(', ') || '—'}`);
   ctx.store.save();
   try {
@@ -1656,6 +1668,8 @@ async function pipeline(ctx: Ctx): Promise<void> {
     console.log(`\nпричина записана в ${ctx.store.statePath}; продолжить после исправления: agentflow resume ${s.runId}`);
     process.exitCode = 2;
   } finally {
+    mouse.stop();
+    screen.stop();
     panel.stop();
   }
 }
@@ -1928,7 +1942,8 @@ const USAGE = `agentflow — конвейер spec-driven разработки �
       --mock             роли без моделей (только демо-проект kit)
       --no-clarify       пропустить шаг уточнения intent
       --no-panel         без панели статуса внизу терминала (или AGENTFLOW_NO_PANEL=1)
-  agentflow resume <run-id> [--no-panel]
+      --no-mouse         без режима мыши: клик по «▸ размышляет» не раскрывает текст (или AGENTFLOW_NO_MOUSE=1)
+  agentflow resume <run-id> [--no-panel] [--no-mouse]
   agentflow status [<run-id>]
   agentflow agents [<run-id>]              список субагентов: роль, сессия, модель из ответа API
   agentflow smoke                          smoke-тесты корпоративного CLI в этом репозитории
@@ -1944,6 +1959,7 @@ async function main(): Promise<void> {
       mock: { type: 'boolean', default: false },
       'no-clarify': { type: 'boolean', default: false },
       'no-panel': { type: 'boolean', default: false },
+      'no-mouse': { type: 'boolean', default: false },
       'agentflow-schema': { type: 'boolean', default: false },
       repo: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
@@ -1956,6 +1972,7 @@ async function main(): Promise<void> {
   }
   ROOT = await resolveRepo(values.repo);
   NO_PANEL = values['no-panel'];
+  NO_MOUSE = values['no-mouse'];
   if (cmd === 'init') {
     await initRepo(values['agentflow-schema']);
   } else if (cmd === 'changes') {

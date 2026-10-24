@@ -19,6 +19,7 @@ export const INJECT_ALL = [
 export const INJECT_HELP = [
   ...INJECT_ALL.filter((p) => !p.startsWith('stall:')),
   'stall:<роль> — первая сессия роли молчит, пока сторож её не прервёт (в mock порог 2 с)',
+  'think-long:<роль> — первая сессия роли 30 с присылает размышления раз в секунду (проверка клика по ним)',
   'kill-after:<stage> — убить контроллер после этапа (проверка resume)',
 ];
 

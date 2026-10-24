@@ -94,6 +94,8 @@ export interface TaskMeta {
   discuss?: { id: string; options: { label: string; description?: string }[]; recommended: number };
   /** Fault injection stall:<роль>: mock-сессия молчит до прерывания. */
   silent?: boolean;
+  /** Fault injection think-long:<роль>: mock-сессия 30 с присылает размышления раз в секунду. */
+  thinkLong?: boolean;
 }
 
 /** Над чем работает вызов — для панели статуса и события spawn. */
@@ -506,7 +508,7 @@ async function runSession(rt: RoleRuntime, call: RoleCall, sessionId: string, ef
         if (m.message.model) models.add(m.message.model);
         for (const b of m.message.content) {
           if (b.type === 'text' && b.text.trim()) log.role(role.name, '«' + oneLine(b.text, 220) + '»');
-          else if (b.type === 'thinking') log.role(role.name, c.gray(`… размышляет (${b.thinking.length} симв.)`));
+          else if (b.type === 'thinking') log.thinking(role.name, b.thinking);
           else if (b.type === 'tool_use') {
             if (b.name.startsWith(MCP_PREFIX)) mcpUses.set(b.id, b.name);
             tracker.toolUse(b.id, b.name, toolArg(b.input), parent);

@@ -1,9 +1,10 @@
 // Консольный рендер конвейера: фазы, петли с номером раунда, запуск субагентов,
 // их вызовы инструментов, решения ACL, гейты и вердикты. Всё дублируется в events.jsonl.
 import type { AclCategory, AclDecision } from './roles.ts';
+import { screen, textWidth, wrapText, type ThinkingView } from './screen.ts';
 import type { DenialGroup } from './session-tracker.ts';
-import { panel } from './status-panel.ts';
-import { oneLine } from './util.ts';
+import { fit, panel } from './status-panel.ts';
+import { oneLine, pluralRu } from './util.ts';
 
 const useColor = process.stdout.isTTY && !process.env['NO_COLOR'];
 const paint = (code: string) => (s: string) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -41,14 +42,41 @@ export function setLogSink(fn: Sink): void {
 // параллельным выводом работающей сессии. events.jsonl пишется сразу.
 const HELD_MAX = 2000;
 let held = 0;
-let buffer: string[] = [];
+let buffer: { s: string; view?: ThinkingView }[] = [];
 let dropped = 0;
 
-function line(text: string): void {
-  const s = c.gray('│ '.repeat(depth)) + text;
-  if (!held) return console.log(s);
-  if (buffer.length < HELD_MAX) buffer.push(s);
+const indent = () => c.gray('│ '.repeat(depth));
+
+function line(text: string, view?: ThinkingView): void {
+  const s = indent() + text;
+  if (!held) return print(s, view);
+  if (buffer.length < HELD_MAX) buffer.push({ s, view });
   else dropped++;
+}
+
+/** Строка размышления встаёт на экран в момент фактического вывода: после удержания — при release. */
+function print(s: string, view?: ThinkingView): void {
+  const mark = view && screen.mark();
+  console.log(s);
+  if (mark) screen.register(mark, view!);
+}
+
+/** Текст размышления для раскрытия: без управляющих символов, пустые строки схлопнуты, перенос по ширине. */
+export function thinkingLines(text: string, width: number): string[] {
+  const out: string[] = [];
+  const clean = text.replace(/\r\n?/g, '\n').replace(/\t/g, '  ').replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
+  for (const raw of clean.split('\n')) {
+    const l = raw.trimEnd();
+    if (l) out.push(...wrapText(l, width));
+    else if (out.length && out.at(-1) !== '') out.push('');
+  }
+  while (out.at(-1) === '') out.pop();
+  return out;
+}
+
+/** Строка о скрытой части раскрытого размышления. */
+export function moreLines(hidden: number): string {
+  return `… ещё ${pluralRu(hidden, 'строка', 'строки', 'строк')} — целиком в events.jsonl`;
 }
 
 /** Местное время события HH:MM:SS. */
@@ -116,6 +144,34 @@ export const log = {
     line(paintRole(role, `  ${role} │ `) + c.gray(clockTime()) + ' ' + text);
   },
 
+  /**
+   * Размышление роли. В режиме мыши строка свёрнута (▸) и раскрывается кликом: текст рисует экран
+   * по этому описанию. Без режима мыши — прежняя строка с числом символов.
+   */
+  thinking(role: string, text: string): void {
+    const chars = `размышляет (${text.length} симв.)`;
+    if (!screen.active() || !text.trim()) return log.role(role, c.gray(`… ${chars}`));
+    const pre = indent();
+    const name = paintRole(role, `  ${role} │ `);
+    const time = clockTime();
+    const header = (open: boolean) => name + c.gray(time) + ' ' + c.gray(`${open ? '▾' : '▸'} ${chars}`);
+    // Текст стоит под временем строки; в узком окне — без префикса, лишь бы терминал не переносил строки.
+    const lead = textWidth(pre + name) + time.length + 1;
+    const pad = (columns: number) =>
+      columns - lead - 1 >= 20 ? { p: pre + name + ' '.repeat(time.length + 1), w: columns - lead - 1 } : { p: '  ', w: columns - 3 };
+    line(header(false), {
+      header: (open) => pre + header(open),
+      body: (columns) => {
+        const { p, w } = pad(columns);
+        return thinkingLines(text, w).map((l) => p + c.gray(l));
+      },
+      more: (hidden, columns) => {
+        const { p, w } = pad(columns);
+        return p + c.gray(fit(moreLines(hidden), w));
+      },
+    });
+  },
+
   /** Удержать вывод на время диалога; вложенные удержания складываются. */
   hold(): void {
     held++;
@@ -125,7 +181,7 @@ export const log = {
     if (!held || --held) return;
     const out = buffer;
     buffer = [];
-    for (const s of out) console.log(s);
+    for (const { s, view } of out) print(s, view);
     if (dropped) console.log(c.gray(`… ещё ${dropped} строк лога не показано — они в events.jsonl`));
     dropped = 0;
   },
