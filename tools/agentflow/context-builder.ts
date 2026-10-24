@@ -5,8 +5,8 @@ import { join } from 'node:path';
 import { KIT, layered } from './config.ts';
 import type { ApplyTask, Instructions } from './openspec.ts';
 import { contractExample } from './review-validator.ts';
-import type { Finding, Question } from './state.ts';
-import { listFiles } from './util.ts';
+import type { Clarification, DiscussTurn, Finding, Question, QuestionOption } from './state.ts';
+import { extractJson, listFiles } from './util.ts';
 
 export interface Rubric {
   name: string;
@@ -148,7 +148,7 @@ export interface BaseCtx {
   /** openspec/changes/<change> относительно worktree. */
   changeDir: string;
   intent: string;
-  clarifications: { question: string; answer: string }[];
+  clarifications: Clarification[];
 }
 
 function header(step: string, ctx: BaseCtx): string {
@@ -164,7 +164,8 @@ function header(step: string, ctx: BaseCtx): string {
 
 function intentBlock(ctx: BaseCtx): string {
   const cl = ctx.clarifications.length
-    ? '\n\n### Уточнения пользователя\n' + ctx.clarifications.map((q) => `- В: ${q.question}\n  О: ${q.answer}`).join('\n')
+    ? '\n\n### Уточнения пользователя\n' +
+      ctx.clarifications.map((q) => `- В: ${q.question}\n  О: ${q.answer}${q.discussion?.length ? '\n' + formatDiscussion(q.discussion, '  ') : ''}`).join('\n')
     : '';
   return `## Intent пользователя\n\n${ctx.intent.trim()}${cl}`;
 }
@@ -194,6 +195,102 @@ export function clarifyPrompt(ctx: BaseCtx): string {
   ]
     .join('\n')
     .replace(/\n{3,}/g, '\n\n');
+}
+
+/** Ответ роли в обсуждении длиннее этого обрезается в уточнениях и находках: полный — в contexts/ и events.jsonl. */
+const DISCUSS_ANSWER_CAP = 1500;
+
+/** Переписка обсуждения вопроса для промптов следующих ролей и находки человека. */
+export function formatDiscussion(turns: DiscussTurn[], indent = '', cap = DISCUSS_ANSWER_CAP): string {
+  const cut = (t: string) => (t.length > cap ? t.slice(0, cap) + ' …' : t);
+  return [`${indent}Обсуждение (${turns.length}):`, ...turns.map((t) => `${indent}- Человек: ${t.message}\n${indent}  Роль: ${cut(t.answer)}`)].join('\n');
+}
+
+export interface DiscussInput {
+  id: string;
+  question: string;
+  why?: string;
+  options: QuestionOption[];
+  recommended: number;
+  rationale?: string;
+  /** Файлы артефакта, к которому относится вопрос (относительно worktree). */
+  files: string[];
+  history: DiscussTurn[];
+  message: string;
+}
+
+export function discussPrompt(ctx: BaseCtx, d: DiscussInput): string {
+  return [
+    header(`обсуждение вопроса ${d.id}`, ctx),
+    '',
+    'Ты задал человеку вопрос с вариантами ответа. Прежде чем выбрать, человек хочет его обсудить.',
+    'Этот шаг только на чтение: файлов не создавай и не меняй. Читать код, спеки и артефакты можно.',
+    '',
+    intentBlock(ctx),
+    '',
+    '## Вопрос',
+    '',
+    d.question,
+    d.why ? `\nОт ответа зависит: ${d.why}` : '',
+    '',
+    '### Варианты',
+    d.options.map((o, i) => `${i}. ${o.label}${o.description ? ` — ${o.description}` : ''}${i === d.recommended ? ' (рекомендуешь)' : ''}`).join('\n'),
+    d.rationale ? `\nПочему рекомендуешь: ${d.rationale}` : '',
+    d.files.length ? `\n## Артефакт вопроса (прочитай сами файлы)\n${d.files.map((f) => `- ${f}`).join('\n')}` : '',
+    '',
+    '## Обсуждение до сих пор',
+    d.history.length ? d.history.map((t, i) => `### Реплика ${i + 1}\nЧеловек: ${t.message}\n\nТы: ${t.answer}`).join('\n\n') : '(это первая реплика)',
+    '',
+    '## Новая реплика человека',
+    '',
+    d.message,
+    '',
+    '## Как отвечать',
+    'Ответь на реплику по существу: последствия вариантов, отличия, ссылки на файлы (путь:строка), если они помогают.',
+    'Не выбирай за человека. Меняй варианты, только если обсуждение показало, что они неполны или неточны:',
+    'тогда верни весь новый список (2-6 вариантов), индекс рекомендуемого и обоснование. Иначе options не возвращай.',
+    '',
+    '## Формат ответа',
+    'Закончи ответ одним JSON-блоком:',
+    '```json',
+    '{"answer":"ответ человеку","options":[{"label":"вариант","description":"последствия"}],"recommended":0,"rationale":"почему этот вариант"}',
+    '```',
+  ]
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
+/** Разобранный ответ реплики: варианты — только если роль их заменила и они допустимы. */
+export interface DiscussReply {
+  answer: string;
+  options?: QuestionOption[];
+  recommended?: number;
+  rationale?: string;
+}
+
+/**
+ * Ответ роли в обсуждении. Разговор, а не гейт: без JSON ответом считается весь текст.
+ * Недопустимые варианты отбрасываются молча — остаются прежние.
+ */
+export function parseDiscussReply(text: string): DiscussReply | { error: string } {
+  const j = extractJson(text) as Record<string, unknown> | undefined;
+  // JSON без answer: ответом считается текст вне JSON-блоков; без JSON — весь текст без обрамления кода.
+  const fromJson = typeof j?.['answer'] === 'string' ? j['answer'].trim() : '';
+  const answer = fromJson || (j ? text.replace(/```[\s\S]*?```/g, '') : text.replace(/```[\w-]*\n?|```/g, '')).trim();
+  if (!answer) return { error: 'роль вернула пустой ответ' };
+  const raw = Array.isArray(j?.['options']) ? (j!['options'] as unknown[]) : undefined;
+  const options = raw
+    ?.map((o) =>
+      typeof o === 'string'
+        ? { label: o.trim() }
+        : { label: String((o as Record<string, unknown>)?.['label'] ?? '').trim(), description: (o as Record<string, unknown>)?.['description'] as string | undefined },
+    )
+    .map((o) => (o.description ? o : { label: o.label }));
+  if (!options || options.length < 2 || options.length > 6 || options.some((o) => !o.label)) return { answer };
+  const rec = Number(j!['recommended']);
+  const recommended = Number.isInteger(rec) && rec >= 0 && rec < options.length ? rec : 0;
+  const rationale = typeof j!['rationale'] === 'string' ? j!['rationale'] : undefined;
+  return { answer, options, recommended, ...(rationale ? { rationale } : {}) };
 }
 
 export function authorPrompt(

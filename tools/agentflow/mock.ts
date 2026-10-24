@@ -239,6 +239,18 @@ async function mockSession(rt: RoleRuntime, call: RoleCall, session: string, tra
         ],
       });
       break;
+    case 'discuss': {
+      // Варианты те же, у рекомендуемого уточнено описание: проверяется путь обновления вариантов,
+      // а выбор автопилота не меняется.
+      const d = meta.discuss ?? { id: '?', options: [], recommended: 0 };
+      const message = call.prompt.split('## Новая реплика человека')[1]?.split('## Как отвечать')[0]?.trim() ?? '';
+      text = json({
+        answer: `mock: на реплику «${message}» — варианты отличаются последствиями из их описаний; рекомендую «${d.options[d.recommended]?.label ?? '?'}».`,
+        options: d.options.map((o, i) => (i === d.recommended ? { ...o, description: `${o.description ?? o.label} (уточнено в обсуждении)` } : o)),
+        recommended: d.recommended,
+      });
+      break;
+    }
     case 'author': {
       for (const [file, content] of Object.entries(ARTIFACTS[meta.artifact ?? ''] ?? {})) write(`${meta.changeDir}/${file}`, content);
       const responses = (call.prompt.match(/^- ([A-Z]+-\d+) \[/gm) ?? []).map((m) => ({ id: m.slice(2, -2), resolution: 'fixed', evidence: 'mock: перечитано по рубрике' }));

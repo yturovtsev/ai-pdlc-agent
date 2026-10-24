@@ -80,7 +80,7 @@ export function loadRoles(repo: string): Map<string, RoleDef> {
 
 /** Метаданные шага: настоящей модели не нужны, по ним работает mock-раннер. */
 export interface TaskMeta {
-  kind: 'clarify' | 'author' | 'spec-review' | 'holistic' | 'implement' | 'code-review' | 'acceptance' | 'final-review';
+  kind: 'clarify' | 'discuss' | 'author' | 'spec-review' | 'holistic' | 'implement' | 'code-review' | 'acceptance' | 'final-review';
   artifact?: string;
   generates?: string;
   changeDir?: string;
@@ -90,6 +90,8 @@ export interface TaskMeta {
   target?: string;
   batchId?: string;
   requirements?: { id: string; name: string; scenarios: { id: string; name: string }[] }[];
+  /** Обсуждение вопроса: id и текущие варианты — по ним отвечает mock-роль. */
+  discuss?: { id: string; options: { label: string; description?: string }[]; recommended: number };
   /** Fault injection stall:<роль>: mock-сессия молчит до прерывания. */
   silent?: boolean;
 }
@@ -99,6 +101,8 @@ export function describeTask(meta: TaskMeta): string {
   switch (meta.kind) {
     case 'clarify':
       return 'уточнение intent';
+    case 'discuss':
+      return `обсуждение вопроса ${meta.discuss?.id ?? ''}`.trim();
     case 'author':
       return `пишет ${meta.generates ?? meta.artifact ?? 'артефакт'}`;
     case 'spec-review':

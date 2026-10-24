@@ -3,7 +3,7 @@
 import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { batchesFromTasks, parseTasks } from './context-builder.ts';
+import { batchesFromTasks, discussPrompt, formatDiscussion, parseDiscussReply, parseTasks } from './context-builder.ts';
 import { deepMerge, KIT } from './config.ts';
 import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,7 +14,9 @@ import { aclDenyMessage, apiErrorIn, decideAcl, loadRoles, runRole, Watchdog, de
 import { loadPolicy, type Policy } from './policy.ts';
 import { runMock } from './mock.ts';
 import { aclRetryAddendum, diagnose, recommendIntervention, type Intervention, type InterventionDecision } from './intervention.ts';
-import { Human } from './human.ts';
+import { Human, replies, type Discuss, type PromptIO, type QuestionView } from './human.ts';
+import type { DiscussReply } from './context-builder.ts';
+import type { DiscussTurn } from './state.ts';
 import { normalize } from './snapshot.ts';
 import { globToRegExp } from './util.ts';
 import { log } from './log.ts';
@@ -447,6 +449,7 @@ test('панель: хуки лога и пауза на время диалог
 
 test('цель вызова роли для панели: по виду шага', () => {
   assert.equal(describeTask({ kind: 'clarify' }), 'уточнение intent');
+  assert.equal(describeTask({ kind: 'discuss', discuss: { id: 'Q-2', options: [], recommended: 0 } }), 'обсуждение вопроса Q-2');
   assert.equal(describeTask({ kind: 'author', artifact: 'design', generates: 'design.md' }), 'пишет design.md');
   assert.equal(describeTask({ kind: 'author', artifact: 'specs', generates: 'specs/**/*.md' }), 'пишет specs/**/*.md');
   assert.equal(describeTask({ kind: 'spec-review', artifact: 'design', target: 'design' }), 'ревью design');
@@ -619,6 +622,7 @@ test('policy: пороги сторожа и серии отказов по ум
   const kit = loadPolicy(KIT);
   assert.equal(kit.limits.stallMinutes, 15);
   assert.equal(kit.limits.aclDenialStreak, 5);
+  assert.equal(kit.limits.discussTurns, 5);
   const repo = mkdtempSync(join(tmpdir(), 'agentflow-policy-'));
   mkdirSync(join(repo, '.agentflow'));
   writeFileSync(join(repo, '.agentflow/policy.yaml'), 'limits:\n  batchRounds: 4\n');
@@ -626,6 +630,7 @@ test('policy: пороги сторожа и серии отказов по ум
   assert.equal(own.limits.batchRounds, 4);
   assert.equal(own.limits.stallMinutes, 15);
   assert.equal(own.limits.aclDenialStreak, 5);
+  assert.equal(own.limits.discussTurns, 5);
 });
 
 const kitRt = (over: Partial<RoleRuntime> = {}): RoleRuntime => {
@@ -744,4 +749,168 @@ test('сторож: диалог серии ACL не закрывается со
   };
   assert.deepEqual(await run('acl-streak'), { aborted: false, outcome: 'retry', session: true });
   assert.deepEqual(await run('stall'), { aborted: true, outcome: undefined, session: false });
+});
+
+const turn = (message: string, answer: string) => ({ at: '2026-10-24T10:00:00Z', message, answer });
+const baseCtx = { change: 'c', changeDir: 'openspec/changes/c', intent: 'intent', clarifications: [] };
+
+test('промпт реплики обсуждения: вопрос, варианты, переписка и новая реплика', () => {
+  const p = discussPrompt(baseCtx, {
+    id: 'Q-1',
+    question: 'Что возвращать?',
+    why: 'сценарий пустой строки',
+    options: [{ label: 'Пустую строку', description: 'как в intent' }, { label: 'Бросать RangeError' }],
+    recommended: 0,
+    rationale: 'так в intent',
+    files: ['openspec/changes/c/specs/a/spec.md'],
+    history: [turn('M1 как это для вызывающего кода?', 'A1 ничего не ломает')],
+    message: 'M2 а если строка из пробелов?',
+  });
+  for (const s of ['Что возвращать?', 'Пустую строку', 'Бросать RangeError', 'M1 как это', 'A1 ничего', 'M2 а если', 'openspec/changes/c/specs/a/spec.md', 'только на чтение']) assert.ok(p.includes(s), s);
+});
+
+test('уточнение с перепиской выводится в блоке intent', () => {
+  const p = discussPrompt({ ...baseCtx, clarifications: [{ question: 'Кириллица?', answer: 'Отбрасывать', discussion: [turn('чем отличается?', 'таблицей транслитерации')] }] }, {
+    id: 'Q-2',
+    question: 'q',
+    options: [{ label: 'a' }, { label: 'b' }],
+    recommended: 0,
+    files: [],
+    history: [],
+    message: 'm',
+  });
+  assert.match(p, /О: Отбрасывать\n {2}Обсуждение \(1\):\n {2}- Человек: чем отличается\?\n {4}Роль: таблицей транслитерации/);
+  assert.ok(formatDiscussion([turn('m', 'x'.repeat(2000))]).includes('x'.repeat(1500) + ' …'));
+});
+
+test('разбор ответа реплики обсуждения', () => {
+  const opts = (n: number) => Array.from({ length: n }, (_, i) => ({ label: `v${i}` }));
+  const js = (o: Record<string, unknown>) => 'текст\n```json\n' + JSON.stringify(o) + '\n```';
+  assert.deepEqual(parseDiscussReply(js({ answer: 'A', options: opts(3), recommended: 2, rationale: 'R' })), { answer: 'A', options: opts(3), recommended: 2, rationale: 'R' });
+  assert.deepEqual(parseDiscussReply('просто объяснение'), { answer: 'просто объяснение' });
+  assert.deepEqual(parseDiscussReply(js({ answer: 'A', options: opts(1) })), { answer: 'A' });
+  assert.deepEqual(parseDiscussReply(js({ answer: 'A', options: opts(7) })), { answer: 'A' });
+  assert.deepEqual(parseDiscussReply(js({ answer: 'A', options: [{ label: 'a' }, { label: '' }] })), { answer: 'A' });
+  assert.equal((parseDiscussReply(js({ answer: 'A', options: opts(3), recommended: 9 })) as { recommended: number }).recommended, 0);
+  assert.deepEqual(parseDiscussReply(js({ note: 'x' })), { answer: 'текст' });
+  assert.ok('error' in parseDiscussReply('  '));
+});
+
+type Menu = Parameters<PromptIO['select']>[0];
+/** Сценарий ввода человека: ответы меню по очереди (ключ или функция от меню) и строки ввода. */
+function scripted(selects: (string | ((m: Menu) => string))[], inputs: string[] = []) {
+  const menus: Menu[] = [];
+  const io: PromptIO = {
+    select: async (m) => {
+      menus.push(m);
+      const s = selects.shift();
+      if (s === undefined) throw new Error(`нет ответа для меню «${m.message}»`);
+      return typeof s === 'function' ? s(m) : s;
+    },
+    input: async () => inputs.shift() ?? '',
+    tty: () => true,
+  };
+  return { io, menus };
+}
+const keys = (m: Menu) => m.choices.map((ch) => ch.value);
+const q2 = { question: 'Что возвращать?', options: [{ label: 'Пустую строку' }, { label: 'Бросать RangeError' }], recommended: 1, rationale: 'r' };
+function discussStub(replies: (DiscussReply | { error: string })[], over: Partial<Discuss> = {}) {
+  const calls: { message: string; history: DiscussTurn[] }[] = [];
+  const turns: { turn: DiscussTurn; q: QuestionView }[] = [];
+  const d: Discuss = {
+    role: 'spec-author',
+    history: [],
+    limit: 5,
+    reply: async (message, history) => {
+      calls.push({ message, history: [...history] });
+      return replies.shift() ?? { answer: 'ok' };
+    },
+    onTurn: (turn, q) => turns.push({ turn, q: structuredClone(q) }),
+    ...over,
+  };
+  return { d, calls, turns };
+}
+
+test('вопрос автора: Enter выбирает рекомендацию, «Обсудить» только с discuss', async () => {
+  const a = scripted([(m) => m.default!]);
+  assert.deepEqual(await new Human(false, a.io).question(q2), { answer: 'Бросать RangeError', discussion: [] });
+  assert.deepEqual(keys(a.menus[0]!), ['1', '0', 'own']);
+  const b = scripted([(m) => m.default!]);
+  await new Human(false, b.io).question(q2, discussStub([]).d);
+  assert.deepEqual(keys(b.menus[0]!), ['1', '0', 'own', 'discuss']);
+});
+
+test('обсуждение: реплика, ответ роли и снова меню того же вопроса', async () => {
+  const s = scripted(['discuss', '0'], ['как это отразится на вызывающем коде?']);
+  const st = discussStub([{ answer: 'A1' }]);
+  const r = await new Human(false, s.io).question(q2, st.d);
+  assert.equal(r.answer, 'Пустую строку');
+  assert.deepEqual(r.discussion.map((t) => [t.message, t.answer, t.optionsChanged]), [['как это отразится на вызывающем коде?', 'A1', undefined]]);
+  assert.equal(st.calls.length, 1);
+  assert.deepEqual(keys(s.menus[1]!), keys(s.menus[0]!));
+  assert.equal(st.turns.length, 1);
+});
+
+test('обсуждение: вторая реплика получает первую, пустой ввод роль не вызывает', async () => {
+  const s = scripted(['discuss', 'discuss', 'discuss', '1'], ['M1', '   ', 'M2']);
+  const st = discussStub([{ answer: 'A1' }, { answer: 'A2' }]);
+  const r = await new Human(false, s.io).question(q2, st.d);
+  assert.deepEqual(st.calls.map((c) => c.message), ['M1', 'M2']);
+  assert.deepEqual(st.calls[1]!.history.map((t) => [t.message, t.answer]), [['M1', 'A1']]);
+  assert.equal(r.discussion.length, 2);
+});
+
+test('обсуждение: роль заменила варианты — новое меню и сохранённый вопрос', async () => {
+  const s = scripted(['discuss', (m) => m.default!], ['а третий вариант?']);
+  const opts = [{ label: 'a' }, { label: 'b' }, { label: 'c', description: 'новый' }];
+  const st = discussStub([{ answer: 'A', options: opts, recommended: 2, rationale: 'R2' }]);
+  const r = await new Human(false, s.io).question(q2, st.d);
+  assert.equal(r.answer, 'c');
+  assert.deepEqual(keys(s.menus[1]!), ['2', '0', '1', 'own', 'discuss']);
+  assert.match(s.menus[1]!.choices[0]!.description!, /R2/);
+  assert.equal(r.discussion[0]!.optionsChanged, true);
+  assert.deepEqual(st.turns[0]!.q.options, opts);
+});
+
+test('обсуждение: сбой реплики — причина, меню снова, в переписку не идёт', async () => {
+  const s = scripted(['discuss', '0'], ['M1']);
+  const st = discussStub([{ error: 'CLI exited with code 1' }]);
+  const r = await new Human(false, s.io).question(q2, st.d);
+  assert.equal(r.answer, 'Пустую строку');
+  assert.deepEqual(r.discussion, []);
+  assert.equal(st.turns.length, 0);
+  assert.equal(s.menus.length, 2);
+});
+
+test('обсуждение: лимит реплик — диалог, продолжение до следующего кратного', async () => {
+  const hist = (n: number) => Array.from({ length: n }, (_, i) => ({ at: 'x', message: `m${i}`, answer: `a${i}` }));
+  // Пять реплик: «Обсудить» → диалог лимита, рекомендован возврат к выбору.
+  const a = scripted(['discuss', (m) => m.default!, '0']);
+  await new Human(false, a.io).question(q2, discussStub([], { history: hist(5) }).d);
+  assert.equal(a.menus[1]!.default, 'choose');
+  assert.match(a.menus[1]!.message, /5 реплик/);
+  assert.deepEqual(keys(a.menus[1]!).sort(), ['choose', 'continue']);
+  // «Продолжить» → ещё пять реплик без диалога, на десятой — снова диалог.
+  const b = scripted(['discuss', 'continue', ...Array(4).fill('discuss'), 'discuss', 'choose', '0'], ['m5', 'm6', 'm7', 'm8', 'm9']);
+  const st = discussStub([], { history: hist(5) });
+  const r = await new Human(false, b.io).question(q2, st.d);
+  assert.equal(r.discussion.length, 10);
+  assert.deepEqual(b.menus.map((m) => (keys(m).includes('continue') ? 'limit' : 'q')), ['q', 'limit', 'q', 'q', 'q', 'q', 'q', 'limit', 'q']);
+  // limit = 0 — диалога нет.
+  const c = scripted(['discuss', '0'], ['m']);
+  await new Human(false, c.io).question(q2, discussStub([], { history: hist(7), limit: 0 }).d);
+  assert.equal(c.menus.length, 2);
+});
+
+test('обсуждение при автопилоте: только реплика inject, ответ — рекомендация', async () => {
+  const none = discussStub([]);
+  assert.equal((await new Human(true).question(q2, none.d)).answer, 'Бросать RangeError');
+  assert.equal(none.calls.length, 0);
+  const inj = discussStub([{ answer: 'A' }], { autoMessage: 'Чем варианты отличаются?' });
+  const r = await new Human(true).question(q2, inj.d);
+  assert.deepEqual([r.answer, inj.calls.length, r.discussion.length], ['Бросать RangeError', 1, 1]);
+});
+
+test('склонение реплик', () => {
+  assert.deepEqual([1, 2, 5, 11, 12, 21, 22, 25].map(replies), ['1 реплика', '2 реплики', '5 реплик', '11 реплик', '12 реплик', '21 реплика', '22 реплики', '25 реплик']);
 });

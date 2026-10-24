@@ -30,17 +30,39 @@ export interface Finding {
   waiver?: { reason: string; at: string; snapshot: string };
 }
 
+export interface QuestionOption {
+  label: string;
+  description?: string;
+}
+
+/** Реплика обсуждения вопроса: текст человека и ответ роли. */
+export interface DiscussTurn {
+  at: string;
+  message: string;
+  answer: string;
+  /** Роль заменила варианты или рекомендацию в этой реплике. */
+  optionsChanged?: boolean;
+}
+
+/** Уточнение intent: вопрос шага уточнений, ответ человека и переписка обсуждения. */
+export interface Clarification {
+  question: string;
+  answer: string;
+  discussion?: DiscussTurn[];
+}
+
 export interface Question {
   id: string;
   question: string;
   why?: string;
-  options?: { label: string; description?: string }[];
+  options?: QuestionOption[];
   /** Индекс рекомендуемого варианта и обоснование — от автора вопроса. */
   recommended?: number;
   rationale?: string;
   artifact: string;
   from: string;
   answer?: string;
+  discussion?: DiscussTurn[];
 }
 
 export interface LoopEntry {
@@ -119,7 +141,7 @@ export interface RunState {
   options: { autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[] };
   versions: { prompts: string; policy: string; sdk: string; openspec: string; openspecBin?: string };
   stagesDone: Stage[];
-  intent: { source: string; text: string; clarifications: { question: string; answer: string }[] };
+  intent: { source: string; text: string; clarifications: Clarification[] };
   spec: {
     order: string[];
     /** Схема OpenSpec change (из .openspec.yaml change или config.yaml репозитория). */

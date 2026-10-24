@@ -15,12 +15,15 @@ import {
   authorPrompt,
   clarifyPrompt,
   codeReviewPrompt,
+  discussPrompt,
   finalReviewPrompt,
+  formatDiscussion,
   holisticPrompt,
   implementerPrompt,
   indexRequirements,
   loadRubric,
   batchesFromTasks,
+  parseDiscussReply,
   specReviewPrompt,
   writeContext,
   type BaseCtx,
@@ -31,7 +34,7 @@ import { showAgents } from './agents.ts';
 import { KIT, resolveRepo } from './config.ts';
 import { runGates, gatesSummary, type GateResult } from './gates.ts';
 import { addWorktree, changedPaths, commitAll, diff, diffNoIndex, ensureRepo, head } from './git.ts';
-import { Human } from './human.ts';
+import { Human, replies, type Discuss } from './human.ts';
 import { INJECT_HELP, Injector, parseInject } from './inject.ts';
 import { aclRetryAddendum, diagnose, INTERVENTION_OPTIONS, recommendIntervention } from './intervention.ts';
 import { c, log, setLogSink } from './log.ts';
@@ -43,7 +46,7 @@ import { decide, countBySeverity, validateReview, type Decision, type Expectatio
 import { expandGlob, loadRoles, mcpViolations, mcpWarnings, roleFiles, runRole, stallMs, type RoleCall, type RoleDef, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
 import { artifactFiles, artifactSnapshot, artifactText, codeSnapshot, specDigest } from './snapshot.ts';
 import { clock, panelEnabled, panel } from './status-panel.ts';
-import { RunStore, STAGES, type BatchState, type Finding, type RunState, type Stage } from './state.ts';
+import { RunStore, STAGES, type BatchState, type DiscussTurn, type Finding, type Question, type QuestionOption, type RunState, type Stage } from './state.ts';
 import { Blocked, exec, extractJson, matchesAny, now, oneLine, sha256, short, stamp } from './util.ts';
 
 /** Целевой репозиторий: git-корень, из которого запущен agentflow (или --repo). Задаётся в main. */
@@ -194,6 +197,65 @@ async function callRole(
     }
     await infraExhausted(ctx, `${opts.label}: роль ${name}`, lastError, series);
   }
+}
+
+/** Реплика автопилота при fault injection discuss-question. */
+const DISCUSS_INJECT_MESSAGE = 'Чем варианты отличаются для вызывающего кода?';
+
+/**
+ * Обсуждение вопроса с ролью, которая его задала. Реплика — одна сессия только на чтение без
+ * серии повторов: человек ждёт ответа перед меню и при сбое повторит сам. Переписка и уточнённые
+ * варианты вопроса из state (persist) сохраняются после каждой реплики — для resume.
+ */
+function discussFor(ctx: Ctx, q: { id: string; from: string; artifact?: string; options?: QuestionOption[] }, persist?: Question): Discuss {
+  const name = q.from;
+  const r = role(ctx, name);
+  const n = q.artifact ? ctx.graph.find((x) => x.id === q.artifact) : undefined;
+  const files = n ? filesOf(ctx, n) : [];
+  const intervene = interventionHandler(ctx, `discuss-${q.id}`);
+  const autoMessage = q.options?.length && ctx.inject.take('discuss-question') ? DISCUSS_INJECT_MESSAGE : undefined;
+  return {
+    role: name,
+    history: persist?.discussion ?? [],
+    limit: ctx.policy.limits.discussTurns,
+    autoMessage,
+    reply: async (message, history, v) => {
+      const turn = history.length + 1;
+      const label = `discuss-${q.id}-${turn}`;
+      const prompt = discussPrompt(base(ctx), { id: q.id, question: v.question, why: v.why, options: v.options, recommended: v.recommended, rationale: v.rationale, files, history, message });
+      writeContext(ctx.contextsDir, label, prompt);
+      const res = await runRole(ctx.rt, {
+        role: r,
+        prompt,
+        label,
+        cwd: ctx.wt,
+        readOnly: true,
+        meta: { kind: 'discuss', discuss: { id: q.id, options: v.options, recommended: v.recommended } },
+        intervene,
+      });
+      account(ctx, r, res);
+      checkMcp(ctx, name, true, res);
+      afterIntervention(label, name, res);
+      const out = res.ok ? parseDiscussReply(res.text) : { error: res.error ?? 'неизвестная ошибка' };
+      ctx.store.loop(`discuss:${q.id}`, turn, 'error' in out ? 'ERROR' : 'REPLY', 'error' in out ? out.error : undefined);
+      return out;
+    },
+    onTurn: (t, v) => {
+      if (!persist) return;
+      Object.assign(persist, { options: v.options, recommended: v.recommended, rationale: v.rationale, discussion: [...(persist.discussion ?? []), t] });
+      ctx.store.save();
+    },
+  };
+}
+
+/** Комментарий решения по вопросу: число реплик обсуждения видно в ACCEPTANCE.md. */
+function questionComment(question: string, discussion: DiscussTurn[]): string {
+  return discussion.length ? `${question} · обсуждение: ${replies(discussion.length)}` : question;
+}
+
+/** Решение человека по вопросу для автора: ответ и, если было, обсуждение. */
+function questionDecision(question: string, answer: string, discussion: DiscussTurn[]): string {
+  return `Решение человека по вопросу «${question}»: ${answer}` + (discussion.length ? '\n' + formatDiscussion(discussion, '  ') : '');
 }
 
 /** Вызов ревьюера: битый JSON и нарушение контракта — ошибка шага, а не вердикт. */
@@ -443,9 +505,10 @@ async function artifactGate(ctx: Ctx, n: ArtifactNode, snap: string, round: numb
     log.info(c.bold(`Вопросы по «${n.id}» (${pending.length}): выбери вариант стрелками`));
     const answered: Finding[] = [];
     for (const q of pending) {
-      q.answer = await ctx.human.question(q);
-      s.decisions.push({ at: now(), gate: `question:${n.id}`, decision: q.answer, comment: q.question });
-      answered.push(humanFinding(ctx, n, `Решение человека по вопросу «${q.question}»: ${q.answer}`, 'Отрази решение в артефакте и согласуй с ним остальные разделы'));
+      const { answer, discussion } = await ctx.human.question(q, discussFor(ctx, q, q));
+      q.answer = answer;
+      s.decisions.push({ at: now(), gate: `question:${n.id}`, decision: answer, comment: questionComment(q.question, discussion) });
+      answered.push(humanFinding(ctx, n, questionDecision(q.question, answer, discussion), 'Отрази решение в артефакте и согласуй с ним остальные разделы'));
     }
     ctx.store.save();
     log.info('ответы уходят spec-author → правка → ревью → снова твоё ревью');
@@ -855,10 +918,11 @@ async function stageClarify(ctx: Ctx): Promise<void> {
   const j = extractJson(res.text) as { questions?: QuestionItem[] } | undefined;
   const qs = (j?.questions ?? []).filter((q) => q.question);
   if (!qs.length) log.step('уточнений не требуется');
-  for (const q of qs) {
-    const options = (q.options ?? []).map((o) => (typeof o === 'string' ? { label: o } : { label: String(o.label ?? ''), description: o.description }));
-    const answer = await ctx.human.question({ ...q, options });
-    st(ctx).intent.clarifications.push({ question: q.question, answer });
+  for (const [i, q] of qs.entries()) {
+    const options = (q.options ?? []).map((o) => (typeof o === 'string' ? { label: o } : { label: String(o.label ?? ''), description: o.description })).filter((o) => o.label);
+    const { answer, discussion } = await ctx.human.question({ ...q, options }, discussFor(ctx, { id: `clarify-${i + 1}`, from: 'spec-author', options }));
+    st(ctx).intent.clarifications.push({ question: q.question, answer, ...(discussion.length ? { discussion } : {}) });
+    st(ctx).decisions.push({ at: now(), gate: 'clarify', decision: answer, comment: questionComment(q.question, discussion) });
   }
   ctx.store.save();
 }
@@ -899,10 +963,11 @@ async function stageApproval(ctx: Ctx): Promise<void> {
     if (pending.length) {
       const groups = new Map<string, Finding[]>();
       for (const q of pending) {
-        q.answer = await ctx.human.question(q);
-        s.decisions.push({ at: now(), gate: 'approval:question', decision: q.answer, comment: q.question });
+        const { answer, discussion } = await ctx.human.question(q, discussFor(ctx, q, q));
+        q.answer = answer;
+        s.decisions.push({ at: now(), gate: 'approval:question', decision: answer, comment: questionComment(q.question, discussion) });
         const n = node(ctx, q.artifact) ?? ctx.graph[0]!;
-        groups.set(n.id, [...(groups.get(n.id) ?? []), humanFinding(ctx, n, `Решение человека по вопросу «${q.question}»: ${q.answer}`, 'Отрази решение в артефакте')]);
+        groups.set(n.id, [...(groups.get(n.id) ?? []), humanFinding(ctx, n, questionDecision(q.question, answer, discussion), 'Отрази решение в артефакте')]);
       }
       ctx.store.save();
       await reaccept(ctx, groups);

@@ -13,6 +13,7 @@ export const INJECT_ALL = [
   'artifact-stuck:specs', // одна и та же находка все автоматические раунды → диалог «лимит исчерпан»
   'batch-stuck:2', // то же для task batch 2 в apply
   'stall:implementer', // первая сессия implementer молчит → сторож простоя, диалог вмешательства, повтор шага
+  'discuss-question', // первый вопрос с вариантами: автопилот задаёт реплику обсуждения → сессия роли только на чтение
 ];
 
 export const INJECT_HELP = [

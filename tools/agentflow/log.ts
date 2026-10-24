@@ -230,6 +230,13 @@ export const log = {
     emit('error', { text });
   },
 
+  /** Ответ роли в обсуждении вопроса: блок под вопросом, целиком — и в консоль, и в events.jsonl. */
+  discuss(role: string, answer: string): void {
+    line(c.bold(c.cyan(`💬 ${role} отвечает:`)));
+    for (const l of answer.split('\n')) line('   ' + l);
+    emit('discuss', { role, answer });
+  },
+
   human(text: string): void {
     line(c.bold(c.yellow('☺ ты: ')) + text);
     emit('human', { text });

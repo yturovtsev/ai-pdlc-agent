@@ -31,6 +31,8 @@ export interface Policy {
     stallMinutes: number;
     /** Отказов ACL подряд до диалога вмешательства; 0 — проверка выключена. */
     aclDenialStreak: number;
+    /** Реплик обсуждения вопроса до диалога «продолжить или выбрать»; 0 — без диалога. */
+    discussTurns: number;
   };
   git: { branchPrefix: string };
   gates: {
@@ -64,6 +66,7 @@ export function loadPolicy(repo: string): Policy {
   // Policy, собранная до появления ключей (старая копия kit), получает значения по умолчанию.
   p.limits.stallMinutes ??= 15;
   p.limits.aclDenialStreak ??= 5;
+  p.limits.discussTurns ??= 5;
   return { ...p, denyAll: p.denyAll ?? [], sources: files, sha: sha256(texts.join('\n---\n')) };
 }
 
