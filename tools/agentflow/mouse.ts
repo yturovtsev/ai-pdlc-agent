@@ -7,8 +7,12 @@ const REPORT_ON = `${ESC}[?1000h${ESC}[?1006h`;
 const REPORT_OFF = `${ESC}[?1000l${ESC}[?1006l`;
 const CLICKS_ON = `${ESC}[?1000h`;
 const CLICKS_OFF = `${ESC}[?1000l`;
-/** Сколько колесо прокручивает историю терминала без перехвата. */
-export const WHEEL_PAUSE_MS = 15_000;
+/**
+ * Сколько колесо прокручивает историю терминала без перехвата. iTerm2 сообщает колесо и клик только
+ * над живым экраном, над историей колесо прокручивает само: пауза нужна лишь первому сдвигу, а длинная
+ * съедала клики сразу после прокрутки.
+ */
+export const WHEEL_PAUSE_MS = 1_000;
 
 export function mouseEnabled(o: { stdinTTY?: boolean; stdoutTTY?: boolean; noMouse?: boolean; env?: Record<string, string | undefined> }): boolean {
   return !!o.stdinTTY && !!o.stdoutTTY && !o.noMouse && o.env?.['AGENTFLOW_NO_MOUSE'] !== '1';

@@ -21,7 +21,7 @@ import type { DiscussTurn } from './state.ts';
 import { normalize } from './snapshot.ts';
 import { globToRegExp } from './util.ts';
 import { c, log, moreLines, thinkingLines } from './log.ts';
-import { InputParser, mouse, mouseEnabled } from './mouse.ts';
+import { InputParser, mouse, mouseEnabled, WHEEL_PAUSE_MS } from './mouse.ts';
 import { charWidth, CursorModel, screen, textWidth, wrapText } from './screen.ts';
 import { SessionTracker, WAITING_MODEL } from './session-tracker.ts';
 import { fit, panel, panelEnabled, renderPanel, stepLevel, stripAnsi, type PanelState } from './status-panel.ts';
@@ -1506,7 +1506,7 @@ test('мышь: разбор ввода терминала', () => {
   assert.deepEqual(p.feed('\x1bOA\x1b[Aq'), [], 'стрелки и буквы — мимо');
 });
 
-test('мышь: включение, клик, колесо с паузой 15 с, Ctrl+C группе, пауза диалога, идемпотентный stop', (t) => {
+test('мышь: включение, клик, колесо с паузой, Ctrl+C группе, пауза диалога, идемпотентный stop', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const input = new FakeStdin();
   const writes: string[] = [];
@@ -1536,7 +1536,7 @@ test('мышь: включение, клик, колесо с паузой 15 с
     const n = writes.length;
     input.emit('data', '\x1b[<64;1;1M');
     assert.equal(writes.length, n, 'дальше колесо терминала, а не наше');
-    t.mock.timers.tick(14_999);
+    t.mock.timers.tick(WHEEL_PAUSE_MS - 1);
     assert.equal(writes.length, n);
     t.mock.timers.tick(1);
     assert.equal(writes.at(-1), '\x1b[?1000h');
@@ -1544,7 +1544,7 @@ test('мышь: включение, клик, колесо с паузой 15 с
     mouse.pause();
     assert.equal(writes.at(-1), '\x1b[?1000l\x1b[?1006l');
     assert.ok(!input.raw.at(-1) && !input.flowing && input.listenerCount('data') === 0);
-    t.mock.timers.tick(15_000);
+    t.mock.timers.tick(WHEEL_PAUSE_MS);
     assert.equal(writes.at(-1), '\x1b[?1000l\x1b[?1006l', 'пауза колеса не включает отчёт во время диалога');
     mouse.resume();
     assert.equal(writes.at(-1), '\x1b[?1000h\x1b[?1006h');
@@ -1559,6 +1559,30 @@ test('мышь: включение, клик, колесо с паузой 15 с
   } finally {
     process.kill = kill;
     mouse.stop();
+  }
+});
+
+test('колесо: клик через 2 с после прокрутки раскрывает размышление', (tt) => {
+  tt.mock.timers.enable({ apis: ['setTimeout'] });
+  const t = term();
+  const input = new FakeStdin();
+  mouse.start({ enabled: true, input, out: t.out, handlers: { click: (_x, y) => screen.click(y), cursor: (row) => screen.cursor(row) } });
+  t.out.onReply = (row, col) => void input.emit('data', `\x1b[${row};${col}R`);
+  try {
+    fill('A', 20);
+    log.thinking('implementer', numbered('w', 80));
+    log.info('после размышления');
+    for (let i = 0; i < 3; i++) input.emit('data', '\x1b[<65;5;5M');
+    tt.mock.timers.tick(2_000);
+    const w = t.out.writes;
+    assert.ok(w.lastIndexOf('\x1b[?1000h') > w.lastIndexOf('\x1b[?1000l'), 'перехват снова включён');
+    const y = t.row('▸ размышляет');
+    input.emit('data', `\x1b[<0;5;${y}M\x1b[<0;5;${y}m`);
+    assert.ok(t.row('▾ размышляет') > 0);
+    assert.deepEqual(tokens(t.lines().join(' '), 'w'), tokens(numbered('w', 80), 'w'));
+  } finally {
+    mouse.stop();
+    t.done();
   }
 });
 
