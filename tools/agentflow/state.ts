@@ -154,7 +154,8 @@ export interface RunState {
   worktree: string;
   branch: string;
   baseCommit: string;
-  options: { autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[] };
+  /** skip — роли, выключенные в настройках run: их шаги пропускаются. */
+  options: { autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[]; skip: string[] };
   versions: { prompts: string; policy: string; sdk: string; openspec: string; openspecBin?: string };
   stagesDone: Stage[];
   intent: { source: string; text: string; clarifications: Clarification[] };
@@ -207,6 +208,7 @@ export class RunStore {
     // state.json прогонов до перехода дальше и обсуждения решений.
     this.state.proceeded ??= [];
     this.state.dialogs ??= {};
+    this.state.options.skip ??= [];
     return this.state;
   }
 

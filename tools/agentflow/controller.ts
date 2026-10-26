@@ -51,6 +51,7 @@ import { expandGlob, loadRoles, mcpViolations, mcpWarnings, roleFiles, runRole, 
 import { screen } from './screen.ts';
 import { artifactFiles, artifactSnapshot, artifactText, codeSnapshot, specDigest } from './snapshot.ts';
 import { clock, panelEnabled, panel } from './status-panel.ts';
+import { fromMenu, parseSkipRoles, ROLES, settingsMenu, skippedSteps, type RunSettings } from './run-settings.ts';
 import { RunStore, STAGES, type BatchState, type DiscussTurn, type Finding, type Question, type QuestionOption, type RunState, type Stage } from './state.ts';
 import { Blocked, exec, extractJson, matchesAny, now, oneLine, sha256, short, stamp } from './util.ts';
 
@@ -60,7 +61,6 @@ let ROOT = KIT;
 let NO_PANEL = false;
 /** --no-mouse: без режима мыши (клик по размышлению не раскрывает его). */
 let NO_MOUSE = false;
-const ROLE_NAMES = ['spec-author', 'spec-reviewer', 'implementer', 'code-reviewer', 'acceptance-tester'];
 
 interface Ctx {
   root: string;
@@ -88,6 +88,8 @@ const changeDir = (ctx: Ctx) => `openspec/changes/${st(ctx).change}`;
 const changeDirAbs = (ctx: Ctx) => join(ctx.wt, changeDir(ctx));
 const base = (ctx: Ctx): BaseCtx => ({ change: st(ctx).change, changeDir: changeDir(ctx), intent: st(ctx).intent.text, clarifications: st(ctx).intent.clarifications });
 const node = (ctx: Ctx, id: string) => ctx.graph.find((n) => n.id === id)!;
+/** Роль включена в настройках run: шаги выключенной пропускаются. */
+const on = (ctx: Ctx, role: string) => !st(ctx).options.skip.includes(role);
 
 // ───────────────────────────── вызовы ролей ─────────────────────────────
 
@@ -156,6 +158,7 @@ const DISCUSS_DIALOG_MESSAGE = 'Какие из находок действит�
  */
 function talk<K extends string>(ctx: Ctx, gate: string, roles: string[], files: string[], ch: Choice<K>, o: { exhausted?: boolean } = {}): Choice<K> {
   const s = st(ctx);
+  roles = roles.filter((r) => on(ctx, r));
   const key = `${gate}#${Object.keys(s.dialogs).filter((k) => k.startsWith(`${gate}#`)).length + 1}`;
   const history: DiscussTurn[] = [];
   const scope = ctx.scopes.top();
@@ -170,7 +173,7 @@ function talk<K extends string>(ctx: Ctx, gate: string, roles: string[], files: 
       roles,
       history,
       limit: ctx.policy.limits.discussTurns,
-      autoMessage: o.exhausted && ctx.inject.take('discuss-dialog') ? DISCUSS_DIALOG_MESSAGE : undefined,
+      autoMessage: o.exhausted && roles.length > 0 && ctx.inject.take('discuss-dialog') ? DISCUSS_DIALOG_MESSAGE : undefined,
       reply: (name, message, prev) => {
         const turn = prev.length + 1;
         const label = `dialog-${key.replace(/[^\p{L}\p{N}]+/gu, '-')}-${turn}`;
@@ -539,6 +542,22 @@ function stored(ctx: Ctx, loop: string, fs: ReviewFinding[]): Finding[] {
   return fs.map((f) => st(ctx).findings.find((x) => x.step === loop && x.id === f.id && x.status === 'open')!).filter(Boolean);
 }
 
+/** Вердикт финала без code-reviewer: только полные гейты, красные — одна находка critical. */
+function gatesOnlyReview(gates: GateResult[], snap: string, round: number): Review {
+  const red = gates.filter((g) => !g.ok);
+  return {
+    status: red.length ? 'REVISE' : 'PASS',
+    role: 'gates',
+    target: 'final',
+    snapshotId: snap,
+    round,
+    checks: [],
+    findings: red.length
+      ? [{ id: `GATES-${round}`, severity: 'critical', location: red[0]!.logPath, problem: `полные гейты красные: ${red.map((g) => g.op).join(', ')}`, evidence: gatesSummary(gates, 20) }]
+      : [],
+  };
+}
+
 /** Fault injection blocked:<петля>: ревьюер не может проверить — BLOCKED с недостающим контекстом. */
 function injectBlocked(ctx: Ctx, loop: string, review: Review): Review {
   if (!ctx.inject.take(`blocked:${loop}`)) return review;
@@ -844,6 +863,21 @@ async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: 
   let session: string | undefined;
   let reviewOnly = !!opts.reviewFirst;
   const history: string[][] = [];
+  /** Ревью человеком — после PASS ревьюера или без spec-reviewer; true — артефакт принят. */
+  const toHuman = async (snap: string, round: number): Promise<boolean> => {
+    const g = await artifactGate(ctx, n, snap, round);
+    if (g.kind === 'accept') {
+      a.status = 'accepted';
+      a.snapshot = snap;
+      ctx.store.save();
+      log.info(c.green(`«${n.id}» принят тобой · snapshot ${short(snap)}`));
+      return true;
+    }
+    if (g.kind === 'self') reviewOnly = true;
+    else toFix = g.findings;
+    budget = round + max;
+    return false;
+  };
   for (let round = 1; ; round++) {
     a.rounds++;
     ctx.store.save();
@@ -891,6 +925,13 @@ async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: 
       log.step('детерминированная валидация пройдена (файлы, openspec status/validate, формат)');
       const snap = snapshotOf(ctx, n);
       log.step(`snapshot артефакта ${short(snap)}`);
+      if (!on(ctx, 'spec-reviewer')) {
+        ctx.store.loop(loop, round, 'SKIPPED', 'spec-reviewer выключен');
+        log.verdict('SKIPPED', 'spec-reviewer выключен в настройках run', 'твоё ревью артефакта');
+        log.loopClose(`«${n.id}» без ревью spec-reviewer`);
+        if (await toHuman(snap, round)) return;
+        continue;
+      }
       const instrPath = join(ctx.contextsDir, `instructions-${n.id}.json`);
       writeFileSync(instrPath, JSON.stringify(await ctx.os.instructions(n.id, s.change), null, 2));
       let fixDiffPath: string | undefined;
@@ -981,17 +1022,7 @@ async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: 
       if (d.verdict === 'PASS') {
         log.verdict('PASS', counts, 'твоё ревью артефакта');
         log.loopClose(`ревьюер принял «${n.id}» на раунде ${round}`);
-        const g = await artifactGate(ctx, n, snap, round);
-        if (g.kind === 'accept') {
-          a.status = 'accepted';
-          a.snapshot = snap;
-          ctx.store.save();
-          log.info(c.green(`«${n.id}» принят тобой · snapshot ${short(snap)}`));
-          return;
-        }
-        if (g.kind === 'self') reviewOnly = true;
-        else toFix = g.findings;
-        budget = round + max;
+        if (await toHuman(snap, round)) return;
         continue;
       }
 
@@ -1041,6 +1072,12 @@ function artifactOfLocation(ctx: Ctx, location: string): string | undefined {
 
 /** Сквозное ревью: свежий spec-reviewer по всему пакету; после лимита раундов решаешь ты. */
 async function holisticLoop(ctx: Ctx): Promise<void> {
+  if (!on(ctx, 'spec-reviewer')) {
+    Object.assign(st(ctx).spec, { holisticPassed: true, holisticDigest: currentDigest(ctx) });
+    ctx.store.loop('holistic', 1, 'SKIPPED', 'spec-reviewer выключен');
+    log.step('сквозное ревью пропущено: spec-reviewer выключен в настройках run');
+    return;
+  }
   const scope: PassScope = { loop: 'holistic', label: 'снять находки сквозного ревью → согласование спеки' };
   await passLoop(ctx, scope, () => holisticRounds(ctx), (reason) => {
     const snap = currentDigest(ctx);
@@ -1198,7 +1235,7 @@ async function freezeProblems(ctx: Ctx): Promise<string[]> {
   }
   const v = await ctx.os.validate(s.change);
   if (!v.valid) out.push(`openspec validate --strict: ${v.issues.map((i) => i.message).join('; ')}`);
-  if (!s.spec.holisticPassed || s.spec.holisticDigest !== currentDigest(ctx)) out.push('сквозное ревью не пройдено на текущей редакции пакета');
+  if (on(ctx, 'spec-reviewer') && (!s.spec.holisticPassed || s.spec.holisticDigest !== currentDigest(ctx))) out.push('сквозное ревью не пройдено на текущей редакции пакета');
   return out;
 }
 
@@ -1237,7 +1274,7 @@ async function stageApproval(ctx: Ctx): Promise<void> {
       title: 'Заморозить спеку и запустить apply?',
       context: [
         ...ctx.graph.map((n) => `✓ ${n.id.padEnd(10)} раундов ${s.spec.artifacts[n.id]!.rounds} · ${short(s.spec.artifacts[n.id]!.snapshot ?? '')} · ${filesOf(ctx, n).join(', ')}`),
-        `сквозное ревью PASS · openspec validate --strict чист · digest ${short(currentDigest(ctx))}`,
+        `${on(ctx, 'spec-reviewer') ? 'сквозное ревью PASS' : 'сквозное ревью выключено (spec-reviewer)'} · openspec validate --strict чист · digest ${short(currentDigest(ctx))}`,
         ...(waived.length ? [`снято waiver: ${waived.map((f) => f.id).join(', ')}`] : []),
         ...(logged.length ? [`minor/nit в журнале: ${logged.length}`] : []),
       ],
@@ -1247,7 +1284,7 @@ async function stageApproval(ctx: Ctx): Promise<void> {
         { key: 'stop', label: 'Остановить run (BLOCKED, потом resume)' },
       ],
       recommended: 'freeze',
-      rationale: 'все условия freeze выполнены: артефакты приняты тобой на текущих редакциях, сквозное ревью и validate чистые',
+      rationale: `все условия freeze выполнены: артефакты приняты тобой на текущих редакциях, ${on(ctx, 'spec-reviewer') ? 'сквозное ревью и validate чистые' : 'validate чист'}`,
     });
     if (k === 'freeze') {
       s.decisions.push({ at: now(), gate: 'approval', decision: 'approved' });
@@ -1477,6 +1514,16 @@ async function batchRounds(ctx: Ctx, b: BatchState): Promise<void> {
   let budget = max;
   let fresh = false;
   let lastDiff: string | undefined;
+  /** Батч принят: после PASS code-reviewer или по зелёным гейтам без него. */
+  const done = async (verdict: string, note: string, round: number): Promise<void> => {
+    b.status = 'done';
+    for (const t of b.tasks) t.done = true;
+    tickTasks(b.tasks);
+    b.head = await commitAll(ctx.wt, `agentflow(${st(ctx).change}): batch ${b.id} выполнен`);
+    ctx.store.save();
+    log.verdict(verdict, note, 'батч принят');
+    log.loopClose(`batch ${b.id} принят на раунде ${round}`);
+  };
   for (let round = 1; ; round++) {
     b.rounds++;
     ctx.store.save();
@@ -1520,6 +1567,10 @@ async function batchRounds(ctx: Ctx, b: BatchState): Promise<void> {
       }
       const snap = codeSnapshot(b.base, headSha, diffText);
       log.step(`коммит ${headSha.slice(0, 10)} · snapshot кода ${short(snap)} (base ${b.base.slice(0, 8)} → head ${headSha.slice(0, 8)})`);
+      if (!on(ctx, 'code-reviewer')) {
+        ctx.store.loop(loop, round, 'SKIPPED', 'code-reviewer выключен');
+        return done('SKIPPED', 'гейты зелёные, code-reviewer выключен в настройках run', round);
+      }
 
       ctx.store.setStep(`apply:${b.id}:review`);
       const rubric = loadRubric(ctx.root, 'batch');
@@ -1573,16 +1624,7 @@ async function batchRounds(ctx: Ctx, b: BatchState): Promise<void> {
         budget = Math.max(budget, round + 1);
         continue;
       }
-      if (d.verdict === 'PASS') {
-        b.status = 'done';
-        for (const t of b.tasks) t.done = true;
-        tickTasks(b.tasks);
-        b.head = await commitAll(ctx.wt, `agentflow(${st(ctx).change}): batch ${b.id} выполнен`);
-        ctx.store.save();
-        log.verdict('PASS', counts, 'батч принят');
-        log.loopClose(`batch ${b.id} принят на раунде ${round}`);
-        return;
-      }
+      if (d.verdict === 'PASS') return done('PASS', counts, round);
       failures.push(`раунд ${round}: ${d.blocking.map((f) => `${f.id} ${f.problem}`).join('; ')}`);
       log.verdict('REVISE', counts, round < budget ? `раунд ${round + 1}: ${round + 1 === 3 ? 'новый implementer' : 'та же сессия implementer'}` : 'автоматические раунды кончились');
       log.loopClose('REVISE');
@@ -1673,6 +1715,13 @@ async function runAcceptance(ctx: Ctx, extra: Finding[], label: string): Promise
 
 async function stageAcceptance(ctx: Ctx): Promise<void> {
   log.phase('ACCEPTANCE · acceptance-tester по замороженной спеке');
+  if (!on(ctx, 'acceptance-tester')) {
+    const s = st(ctx);
+    s.acceptance = { status: 'SKIPPED', snapshot: s.spec.freeze!.digest, report: null };
+    ctx.store.loop('acceptance', 1, 'SKIPPED', 'acceptance-tester выключен');
+    log.step('acceptance пропущен: acceptance-tester выключен в настройках run');
+    return;
+  }
   const scope: PassScope = { loop: 'acceptance', label: 'считать acceptance пройденным → финальное ревью' };
   await passLoop(
     ctx,
@@ -1723,8 +1772,12 @@ async function finalRounds(ctx: Ctx): Promise<void> {
     log.step(`snapshot ${short(snap)} · head ${headSha.slice(0, 10)}`);
     const reqs = requirements(ctx);
     const rubric = loadRubric(ctx.root, 'final');
-    ctx.store.setStep('final:review');
-    let review = await callReviewer(
+    // Без code-reviewer вердикт дают полные гейты: красные — находка critical, дальше тот же раунд implementer.
+    const reviewed = on(ctx, 'code-reviewer');
+    ctx.store.setStep(reviewed ? 'final:review' : 'final:gates-only');
+    let review = !reviewed
+      ? gatesOnlyReview(gates, snap, round)
+      : await callReviewer(
       ctx,
       'code-reviewer',
       finalReviewPrompt(base(ctx), {
@@ -1738,6 +1791,7 @@ async function finalRounds(ctx: Ctx): Promise<void> {
         gates: gatesSummary(gates),
         acceptancePath: join(ctx.contextsDir, 'acceptance-report.json'),
         acceptanceDir: ctx.policy.acceptance.dir,
+        acceptanceOff: !on(ctx, 'acceptance-tester'),
         rubric,
         snapshotId: snap,
         prior: openFindings(ctx, loop),
@@ -1746,11 +1800,11 @@ async function finalRounds(ctx: Ctx): Promise<void> {
       { role: 'code-reviewer', target: 'final', snapshotId: snap, round, mandatoryChecks: rubric.mandatory, needAssessments: true, requireTrace: reqs.map((r) => r.id) },
       `final-r${round}-review`,
     );
-    if (ctx.inject.take('final-revise')) review = injectRevise(review, `${diffPath}:1`, round);
-    review = injectBlocked(ctx, loop, review);
+    if (reviewed && ctx.inject.take('final-revise')) review = injectRevise(review, `${diffPath}:1`, round);
+    if (reviewed) review = injectBlocked(ctx, loop, review);
     const d = decide(review, 'apply');
     await applyReview(ctx, loop, round, review, d);
-    ctx.store.loop(loop, round, d.verdict, d.reason);
+    ctx.store.loop(loop, round, reviewed ? d.verdict : d.verdict === 'PASS' ? 'SKIPPED' : 'RED', reviewed ? d.reason : 'code-reviewer выключен: только полные гейты');
     let blocking: Finding[];
     if (d.verdict === 'BLOCKED') {
       log.verdict('BLOCKED', d.reason, 'решаешь ты');
@@ -1768,9 +1822,9 @@ async function finalRounds(ctx: Ctx): Promise<void> {
       ];
       budget = Math.max(budget, round + 1);
     } else if (d.verdict === 'PASS') {
-      s.final = { status: 'PASS', snapshot: snap, rounds: round, traceability: review.traceability ?? [] };
+      s.final = { status: reviewed ? 'PASS' : 'GATES_ONLY', snapshot: snap, rounds: round, traceability: review.traceability ?? [] };
       ctx.store.save();
-      log.verdict('PASS', countBySeverity(review.findings), 'отчёт приёмки');
+      log.verdict(reviewed ? 'PASS' : 'SKIPPED', reviewed ? countBySeverity(review.findings) : 'полные гейты зелёные, code-reviewer выключен в настройках run', 'отчёт приёмки');
       log.loopClose('финальное ревью пройдено');
       return;
     } else {
@@ -1787,8 +1841,9 @@ async function finalRounds(ctx: Ctx): Promise<void> {
     if (hint) blocking.push(synthetic(ctx, loop, round, 'human', { problem: `Указание человека: ${hint}`, location: 'final', evidence: 'решение человека' }));
     hint = undefined;
     const accDir = ctx.policy.acceptance.dir.replace(/\/$/, '') + '/';
-    const e2e = blocking.filter((f) => f.location.startsWith(accDir));
-    const code = blocking.filter((f) => !f.location.startsWith(accDir));
+    // Без acceptance-tester находки по тестам тоже исправляет implementer.
+    const e2e = on(ctx, 'acceptance-tester') ? blocking.filter((f) => f.location.startsWith(accDir)) : [];
+    const code = blocking.filter((f) => !e2e.includes(f));
     log.verdict('REVISE', countBySeverity(review.findings), `раунд исправлений ${round}/${Math.max(budget - 1, round)}: ${code.length ? 'implementer' : ''}${code.length && e2e.length ? ' + ' : ''}${e2e.length ? 'acceptance-tester' : ''}`);
     if (code.length) {
       const batch: TaskBatch = { id: `final-${round}`, title: 'исправления по финальному ревью', tasks: code.map((f, i) => ({ id: `F.${i + 1}`, text: `${f.id}: ${f.requiredChange ?? f.problem}` })) };
@@ -1827,15 +1882,23 @@ async function stageHumanAcceptance(ctx: Ctx): Promise<void> {
   const mc = manualCheck(ctx);
   const byHuman = (loop: string) => s.proceeded.find((p) => p.loop === loop);
   const fin = byHuman('final');
-  const finalLine = fin ? `финальное ревью пройдено решением человека: ${fin.reason}` : `финальное ревью ${s.final?.status ?? '—'}`;
+  const finalLine = fin
+    ? `финальное ревью пройдено решением человека: ${fin.reason}`
+    : s.final?.status === 'GATES_ONLY'
+      ? 'финальное ревью: только полные гейты (code-reviewer выключен)'
+      : `финальное ревью ${s.final?.status ?? '—'}`;
   const accBy = byHuman('acceptance');
-  const accLine = accBy ? `acceptance пройден решением человека: ${accBy.reason}` : `${passed}/${total} acceptance-сценариев прошли`;
+  const accLine = accBy
+    ? `acceptance пройден решением человека: ${accBy.reason}`
+    : s.acceptance?.status === 'SKIPPED'
+      ? 'acceptance не запускался (acceptance-tester выключен)'
+      : `${passed}/${total} acceptance-сценариев прошли`;
   const k = await ctx.human.select({
     title: 'Принять change?',
     context: [
       `отчёт: ${join(ctx.runDir, 'ACCEPTANCE.md')}`,
       `код для ручного теста: ${ctx.wt} (ветка ${s.branch})`,
-      `${finalLine} · ${accBy ? accLine : `acceptance ${passed}/${total} сценариев PASS`}`,
+      `${finalLine} · ${accBy || s.acceptance?.status === 'SKIPPED' ? accLine : `acceptance ${passed}/${total} сценариев PASS`}`,
       ...(s.proceeded.length ? [`пройдено решением человека: ${s.proceeded.map((p) => p.loop).join(', ')} — см. ACCEPTANCE.md`] : []),
       ...(mc ? [mc.replace(/\n+/g, ' · ')] : []),
     ],
@@ -1844,7 +1907,7 @@ async function stageHumanAcceptance(ctx: Ctx): Promise<void> {
       { key: 'reject', label: 'Отклонить', description: 'run завершается со статусом rejected, причина — в отчёт' },
     ],
     recommended: 'accept',
-    rationale: `${fin ? finalLine : 'финальное ревью PASS'}, ${accLine} — осталась твоя ручная проверка`,
+    rationale: `${fin || s.final?.status === 'GATES_ONLY' ? finalLine : 'финальное ревью PASS'}, ${accLine} — осталась твоя ручная проверка`,
   });
   const comment = k === 'reject' ? await ctx.human.text('Причина отказа', 'не прошла ручная проверка') : undefined;
   s.decisions.push({ at: now(), gate: 'acceptance', decision: k === 'accept' ? 'accepted' : 'rejected', comment });
@@ -1910,7 +1973,7 @@ function writeManifest(ctx: Ctx): void {
     policy_sources: ctx.policy.sources,
     git: { branch: s.branch, worktree: s.worktree, base: s.baseCommit },
     models: Object.fromEntries(
-      ROLE_NAMES.map((n) => {
+      ROLES.map((n) => {
         const r = ctx.roles.get(n)!;
         return [n, { id: r.model, effort: r.effort ?? null, resolved: s.models[n]?.actual ?? [] }];
       }),
@@ -1975,7 +2038,7 @@ async function pipeline(ctx: Ctx): Promise<void> {
   panel.start({
     runId: s.runId,
     change: s.change,
-    roles: ctx.roles.size,
+    roles: ROLES.length - s.options.skip.length,
     launches: Object.values(s.usage).reduce((n, u) => n + u.calls, 0),
     phase: `этап ${s.stage}`,
     stallMs: stallMs(ctx.rt),
@@ -1984,6 +2047,7 @@ async function pipeline(ctx: Ctx): Promise<void> {
   const clicks = mouseEnabled({ stdinTTY: process.stdin.isTTY, stdoutTTY: out.isTTY, noMouse: NO_MOUSE, env: process.env });
   screen.start({ enabled: clicks, out, err: process.stderr, logBottom: () => panel.logBottom() });
   mouse.start({ enabled: clicks, input: process.stdin, out, handlers: { click: (_x, y) => screen.click(y), cursor: (row) => screen.cursor(row) } });
+  if (s.options.skip.length) log.warn(`выключены роли: ${s.options.skip.join(', ')} · пропускаются: ${skippedSteps(s.options.skip).join('; ')}`);
   log.info(`схема OpenSpec: ${status.schemaName} · артефакты: ${ctx.graph.map((n) => n.id).join(' → ')} · apply требует: ${status.applyRequires.join(', ') || '—'}`);
   ctx.store.save();
   try {
@@ -2043,13 +2107,13 @@ function intentFromChange(dir: string, change: string): string {
   return `Существующий change «${change}»: доведи его до приёмки по схеме репозитория.`;
 }
 
-async function startRun(args: { intent?: string; change?: string; autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[] }): Promise<void> {
+async function startRun(args: { intent?: string; change?: string; autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[]; skipRoles?: string }): Promise<void> {
   await ensureRepo(ROOT);
   if (!existsSync(join(ROOT, 'openspec'))) throw new Error(`в ${ROOT} нет openspec/: выполни agentflow init (или openspec init)`);
   const policy = loadPolicy(ROOT);
   const roles = loadRoles(ROOT);
   for (const w of mcpWarnings(policy, roles)) log.warn(w);
-  for (const n of ROLE_NAMES) if (!roles.has(n)) throw new Error(`нет файла роли ${n}.md ни в kit, ни в .agentflow/agents/`);
+  for (const n of ROLES) if (!roles.has(n)) throw new Error(`нет файла роли ${n}.md ни в kit, ни в .agentflow/agents/`);
   const dirty = (await changedPaths(ROOT)).filter((p) => !p.startsWith('.agentflow-runs/'));
 
   const intent = args.intent ? readIntent(args.intent) : undefined;
@@ -2060,6 +2124,7 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
   const existing = existsSync(mainChangeDir);
   if (!intent && !existing) throw new Error(`change ${change} не найден в openspec/changes/: для нового change нужен intent`);
   const intentText = intent?.text ?? intentFromChange(mainChangeDir, change);
+  const settings = await runSettings(args);
 
   const runStamp = stamp();
   const runId = `${runStamp}-${change}`;
@@ -2101,7 +2166,7 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
     worktree: wt,
     branch,
     baseCommit,
-    options: { autoApprove: args.autoApprove, mock: args.mock, clarify: args.clarify, inject: args.inject },
+    options: { autoApprove: settings.autoApprove, mock: args.mock, clarify: settings.clarify, inject: args.inject, skip: settings.skip },
     versions: { prompts: promptsRevision(ROOT), policy: policy.sha, sdk: sdkVersion(), openspec: await os.version(), openspecBin: os.bin },
     stagesDone: [],
     intent: { source: intent?.source ?? `openspec/changes/${change}`, text: intentText, clarifications: [] },
@@ -2128,12 +2193,26 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
   log.info(`worktree ${wt}${carry.length ? ` · перенесено незакоммиченное из openspec/: ${carry.length} файлов` : ''}`);
   log.info(`kit ${KIT} · policy: ${policy.sources.join(' + ')}`);
   log.info(`CLI: ${qwenExecutable(policy) ?? 'встроенный в SDK'} · SDK ${store.state.versions.sdk} · OpenSpec ${store.state.versions.openspec} (${os.bin})${args.mock ? c.yellow(' · MOCK-роли') : ''}`);
-  for (const n of ROLE_NAMES) {
+  for (const n of ROLES) {
     const r = roles.get(n)!;
+    if (settings.skip.includes(n)) {
+      log.info(c.gray(`  ${n.padEnd(18)} → выключена в настройках run`));
+      continue;
+    }
     log.info(`  ${n.padEnd(18)} → ${r.model} · effort ${policy.qwen.effortViaSdk ? r.effort ?? 'по умолчанию' : 'по умолчанию (effortViaSdk: false)'} · ${r.file}`);
   }
   if (args.inject.length) log.inject(`включены точки: ${args.inject.join(', ')}`);
   await pipeline(ctx);
+}
+
+/**
+ * Настройки run: флаги, а в интерактивном терминале без --auto-approve и --skip-roles — меню с
+ * галочками. Ошибка флага и отказ от меню — до создания ветки и worktree.
+ */
+async function runSettings(args: { autoApprove: boolean; clarify: boolean; skipRoles?: string }): Promise<RunSettings> {
+  const flags: RunSettings = { skip: parseSkipRoles(args.skipRoles), clarify: args.clarify, autoApprove: args.autoApprove };
+  if (args.autoApprove || args.skipRoles !== undefined || !process.stdin.isTTY || !process.stdout.isTTY) return flags;
+  return fromMenu(await new Human(false).checklist('Настройки run: пробел — отметить, Enter — запуск', settingsMenu(flags)));
 }
 
 async function resumeRun(runId: string): Promise<void> {
@@ -2293,6 +2372,8 @@ const USAGE = `agentflow — конвейер spec-driven разработки �
                            ${INJECT_HELP.join('\n                           ')}
       --mock             роли без моделей (только демо-проект kit)
       --no-clarify       пропустить шаг уточнения intent
+      --skip-roles <р,р>  выключить роли без диалога настроек: spec-reviewer, code-reviewer, acceptance-tester
+                         (в TTY без --auto-approve и --skip-roles перед стартом — меню настроек с галочками)
       --no-panel         без панели статуса внизу терминала (или AGENTFLOW_NO_PANEL=1)
       --no-mouse         без режима мыши: клик по «▸ размышляет» не раскрывает текст (или AGENTFLOW_NO_MOUSE=1)
   agentflow resume <run-id> [--no-panel] [--no-mouse]
@@ -2310,6 +2391,7 @@ async function main(): Promise<void> {
       inject: { type: 'string' },
       mock: { type: 'boolean', default: false },
       'no-clarify': { type: 'boolean', default: false },
+      'skip-roles': { type: 'string' },
       'no-panel': { type: 'boolean', default: false },
       'no-mouse': { type: 'boolean', default: false },
       'agentflow-schema': { type: 'boolean', default: false },
@@ -2330,7 +2412,7 @@ async function main(): Promise<void> {
   } else if (cmd === 'changes') {
     await showChanges();
   } else if (cmd === 'run') {
-    await startRun({ intent: arg, change: values.change, autoApprove: values['auto-approve'], mock: values.mock, clarify: !values['no-clarify'], inject: parseInject(values.inject) });
+    await startRun({ intent: arg, change: values.change, autoApprove: values['auto-approve'], mock: values.mock, clarify: !values['no-clarify'], inject: parseInject(values.inject), skipRoles: values['skip-roles'] });
   } else if (cmd === 'resume') {
     if (!arg) throw new Error('укажи run-id (agentflow status)');
     await resumeRun(arg);

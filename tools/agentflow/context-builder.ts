@@ -651,6 +651,8 @@ export function finalReviewPrompt(
     gates: string;
     acceptancePath: string;
     acceptanceDir: string;
+    /** acceptance-tester выключен в настройках run: отчёта и тестов нет. */
+    acceptanceOff?: boolean;
     rubric: Rubric;
     snapshotId: string;
     prior: Finding[];
@@ -664,8 +666,9 @@ export function finalReviewPrompt(
     '## Манифест контекста',
     `- полный diff фазы apply: ${a.diffPath}`,
     `- спека: ${a.specFiles.join(', ')}`,
-    `- отчёт acceptance-tester: ${a.acceptancePath}`,
-    `- ${a.acceptanceDir}/ и ${a.acceptanceDir}/evidence/ — acceptance-тесты и доказательства`,
+    ...(a.acceptanceOff
+      ? ['- acceptance-tester выключен в настройках run: отчёта acceptance нет, сценарии сверяй по коду и unit-тестам']
+      : [`- отчёт acceptance-tester: ${a.acceptancePath}`, `- ${a.acceptanceDir}/ и ${a.acceptanceDir}/evidence/ — acceptance-тесты и доказательства`]),
     '',
     '## Индекс требований — каждое requirementId обязано быть в traceability[]',
     requirementsTable(a.reqs),

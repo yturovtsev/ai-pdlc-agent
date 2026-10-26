@@ -1,6 +1,6 @@
 // Диалоги с человеком: выбор стрелками из вариантов, рекомендуемый вариант подсвечен и
 // обоснован. Без TTY и без --auto-approve решение человека невозможно → BLOCKED.
-import { input, select } from '@inquirer/prompts';
+import { checkbox, input, select } from '@inquirer/prompts';
 import type { DiscussReply } from './context-builder.ts';
 import { c, log } from './log.ts';
 import { mouse } from './mouse.ts';
@@ -76,12 +76,22 @@ export interface PromptIO {
     context?: { signal?: AbortSignal },
   ): Promise<string>;
   input(config: { message: string }): Promise<string>;
+  checkbox(config: { message: string; pageSize?: number; choices: CheckItem[] }): Promise<string[]>;
   tty(): boolean;
+}
+
+/** Пункт меню с галочками: disabled — галочку не снять и не поставить, рядом причина. */
+export interface CheckItem {
+  value: string;
+  name: string;
+  checked: boolean;
+  disabled?: string;
 }
 
 const INQUIRER: PromptIO = {
   select: (config, context) => select(config, context),
   input: (config) => input(config),
+  checkbox: (config) => checkbox(config),
   tty: () => !!process.stdin.isTTY,
 };
 
@@ -242,6 +252,16 @@ export class Human {
     }
     log.info(c.gray(`  выбрано: ${all.find((o) => o.key === answer)?.label}`));
     return answer;
+  }
+
+  /** Меню с галочками (пробел — отметить, Enter — подтвердить); автопилот берёт исходные галочки. */
+  async checklist(title: string, items: CheckItem[]): Promise<string[]> {
+    const initial = items.filter((i) => i.checked).map((i) => i.value);
+    if (this.auto) return initial;
+    this.ensureTty(title);
+    const picked = await paused(() => this.io.checkbox({ message: title, pageSize: Math.max(items.length, 7), choices: items }));
+    // Недоступные отмеченные пункты терминал может не вернуть: они остаются, как были.
+    return [...new Set([...picked, ...items.filter((i) => i.disabled && i.checked).map((i) => i.value)])];
   }
 
   async text(question: string, autoAnswer: string): Promise<string> {

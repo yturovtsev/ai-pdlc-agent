@@ -3,6 +3,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { c } from './log.ts';
 import type { RunState } from './state.ts';
+import { skippedSteps } from './run-settings.ts';
 import { short } from './util.ts';
 
 export function loopSummary(s: RunState): { loop: string; rounds: number; path: string }[] {
@@ -37,6 +38,12 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
     `- ветка: \`${s.branch}\`, worktree: \`${s.worktree}\``,
     `- база: \`${s.baseCommit.slice(0, 10)}\`, digest спеки: \`${s.spec.freeze ? short(s.spec.freeze.digest) : 'не заморожена'}\``,
     '',
+    '## Настройки прогона',
+    '',
+    `- выключены роли: ${s.options?.skip?.length ? s.options.skip.join(', ') : 'нет'}`,
+    ...skippedSteps(s.options?.skip ?? []).map((x) => `- пропущено — ${x}`),
+    `- уточнение intent: ${s.options?.clarify === false ? 'нет' : 'да'} · автопилот: ${s.options?.autoApprove ? 'да' : 'нет'}`,
+    '',
     '## Пройденные петли',
     '',
     '| Петля | Раундов | Вердикты |',
@@ -55,7 +62,9 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
       ? '| Требование | Сценарий | Код | Тесты | Evidence | Итог |\n| --- | --- | --- | --- | --- | --- |'
       : s.final?.status === 'PASSED_BY_HUMAN'
         ? '(финальное ревью пройдено решением человека — трассировки нет)'
-        : '(финальное ревью не пройдено)',
+        : s.final?.status === 'GATES_ONLY'
+          ? '(ревью кода выключено в настройках run — финал по полным гейтам, трассировки нет)'
+          : '(финальное ревью не пройдено)',
     ...trace.map((t) => `| ${t.requirementId} | ${t.scenarioId ?? ''} | ${(t.code ?? []).join(', ')} | ${(t.tests ?? []).join(', ')} | ${t.evidence ?? ''} | ${t.result} |`),
     '',
     '## Acceptance-сценарии',

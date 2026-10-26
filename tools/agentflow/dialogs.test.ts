@@ -22,6 +22,7 @@ function scripted(selects: (string | ((m: Menu) => string))[], inputs: string[] 
       return typeof s === 'function' ? s(m) : s;
     },
     input: async () => inputs.shift() ?? '',
+    checkbox: async () => [],
     tty: () => true,
   };
   return { io, menus };

@@ -811,6 +811,7 @@ function scripted(selects: (string | ((m: Menu) => string))[], inputs: string[] 
       return typeof s === 'function' ? s(m) : s;
     },
     input: async () => inputs.shift() ?? '',
+    checkbox: async () => [],
     tty: () => true,
   };
   return { io, menus };
@@ -1616,6 +1617,7 @@ test('диалог: режим мыши снят на время меню, ра�
         return cfg.default!;
       },
       input: async () => '',
+      checkbox: async () => [],
       tty: () => true,
     };
     const key = await new Human(false, io).select({ title: 'Вопрос', options: [{ key: 'a', label: 'один' }, { key: 'b', label: 'два' }], recommended: 'a', rationale: 'r' });
@@ -1636,11 +1638,12 @@ test('диалог: режим мыши снят на время меню, ра�
 
 test('state.json прогона до перехода дальше загружается: proceeded и dialogs пустые', () => {
   const dir = mkdtempSync(join(tmpdir(), 'agentflow-state-'));
-  writeFileSync(join(dir, 'state.json'), JSON.stringify({ runId: 'r', decisions: [], findings: [] }));
+  writeFileSync(join(dir, 'state.json'), JSON.stringify({ runId: 'r', decisions: [], findings: [], options: { autoApprove: false } }));
   const store = new RunStore(dir);
   const s = store.load();
   assert.deepEqual(s.proceeded, []);
   assert.deepEqual(s.dialogs, {});
+  assert.deepEqual(s.options.skip, []);
   store.save();
   assert.deepEqual(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).proceeded, []);
 });
