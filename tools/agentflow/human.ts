@@ -123,7 +123,13 @@ export class Human {
   constructor(
     readonly auto: boolean,
     private readonly io: PromptIO = INQUIRER,
+    /** Автопилот режима --auto-until-review: не переходит дальше (askHuman), своя отметка в логе. */
+    readonly strict = false,
   ) {}
+
+  private get mark(): string {
+    return this.strict ? '(--auto-until-review)' : '(--auto-approve)';
+  }
 
   private ensureTty(what: string): void {
     if (!this.io.tty()) throw new Blocked(`нужно решение человека (${what}), а терминал не интерактивный: запусти в TTY или с --auto-approve`);
@@ -216,7 +222,7 @@ export class Human {
         log.info(c.gray(`  (${ch.autoPick!.why}) → ${pick.label}`));
         return pick.key;
       }
-      log.info(c.gray(`  (--auto-approve) → ${rec.label}`));
+      log.info(c.gray(`  ${this.mark} → ${rec.label}`));
       return rec.key;
     }
     if (signal?.aborted) return undefined;
@@ -266,7 +272,7 @@ export class Human {
 
   async text(question: string, autoAnswer: string): Promise<string> {
     if (this.auto) {
-      log.human(`${question}\n${c.gray('   (--auto-approve) →')} ${autoAnswer}`);
+      log.human(`${question}\n${c.gray(`   ${this.mark} →`)} ${autoAnswer}`);
       return autoAnswer;
     }
     this.ensureTty(question);

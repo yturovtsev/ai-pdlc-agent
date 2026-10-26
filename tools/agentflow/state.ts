@@ -144,7 +144,8 @@ export const STAGES: Stage[] = [
 export interface RunState {
   runId: string;
   change: string;
-  status: 'running' | 'blocked' | 'accepted' | 'rejected' | 'failed';
+  /** awaiting-review — run режима --auto-until-review запаркован на приёмке, ждёт resume человека. */
+  status: 'running' | 'blocked' | 'awaiting-review' | 'accepted' | 'rejected' | 'failed';
   stage: Stage;
   step: string;
   stopReason?: string;
@@ -155,7 +156,10 @@ export interface RunState {
   branch: string;
   baseCommit: string;
   /** skip — роли, выключенные в настройках run: их шаги пропускаются. */
-  options: { autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[]; skip: string[] };
+  /** untilReview — режим --auto-until-review: автопилот до приёмки, без waiver и перехода дальше. */
+  options: { autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[]; skip: string[]; untilReview?: boolean };
+  /** Решения перешли от автопилота режима к человеку: парковка на приёмке или BLOCKED. */
+  handover?: { at: string; reason: string };
   versions: { prompts: string; policy: string; sdk: string; openspec: string; openspecBin?: string };
   stagesDone: Stage[];
   intent: { source: string; text: string; clarifications: Clarification[] };

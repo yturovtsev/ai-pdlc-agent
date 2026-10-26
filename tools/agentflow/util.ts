@@ -138,3 +138,14 @@ export class Blocked extends Error {
     this.name = 'Blocked';
   }
 }
+
+/**
+ * Run режима --auto-until-review дошёл до приёмки: не остановка, а ожидание человека. Не наследник
+ * Blocked — места, которые ловят остановку, не должны принять за неё парковку.
+ */
+export class Parked extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'Parked';
+  }
+}

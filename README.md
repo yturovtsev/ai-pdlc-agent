@@ -140,11 +140,12 @@ npm run smoke              # корпоративный CLI: модели из /
 ```bash
 npm run agentflow -- run tasks/01-slugify.md                 # интерактивно: уточнения, согласование, приёмка
 npm run agentflow -- run tasks/01-slugify.md --inject all    # то же, но каждая петля принудительно проходит REVISE
+npm run agentflow -- run tasks/01-slugify.md --auto-until-review   # без участия до приёмки: run ждёт тебя на «Принять change?»
 npm run agentflow -- run tasks/03-incomplete.md              # неполный intent: ожидаются вопросы человеку или BLOCKED, а не догадки
 npm run agentflow -- run "Добавь функцию truncate(text, n)" --change add-truncate
 npm run agentflow -- status [<run-id>]                       # состояние и сводка пройденных петель
 npm run agentflow -- agents [<run-id>]                       # список субагентов: роль, сессия, модель из ответа API
-npm run agentflow -- resume <run-id>                         # продолжить после BLOCKED, сбоя или kill
+npm run agentflow -- resume <run-id>                         # продолжить после BLOCKED, сбоя или kill; приёмка запаркованного run
 ```
 
 ### Настройки run
@@ -159,12 +160,38 @@ npm run agentflow -- resume <run-id>                         # продолжи�
   исправляет implementer, после лимита — диалог исчерпания);
 - **acceptance-tester** — этапа acceptance нет, находки финала исправляет implementer.
 
-Без TTY, с `--auto-approve` или с `--skip-roles <роль,роль>` меню нет: настройки берутся из флагов
+Без TTY, с `--auto-approve`, `--auto-until-review` или с `--skip-roles <роль,роль>` меню нет: настройки берутся из флагов
 (`--no-clarify`, `--auto-approve`, `--skip-roles code-reviewer,acceptance-tester`). Обязательную или
 неизвестную роль в `--skip-roles` run отклоняет до создания ветки. Настройки пишутся в `state.json`,
 `resume` их сохраняет; пропущенные петли в сводке — `SKIPPED`, в `ACCEPTANCE.md` — раздел «Настройки
 прогона». Точки `--inject` выключенной роли (`batch-revise`, `final-revise`, `blocked:final` без
 code-reviewer и т. п.) не срабатывают.
+
+### Без участия до приёмки: `--auto-until-review`
+
+Прогон, который ты проверишь в конце (например, на ночь): конвейер сам пишет спеку и код и
+останавливается на приёмке change.
+
+- **До приёмки решает автопилот** — как `--auto-approve`: уточнения intent и вопросы автора, ревью
+  каждого артефакта, freeze, диалоги исчерпания, вмешательство, блокеры. В логе у таких решений
+  `(--auto-until-review) →`. Меню настроек run не показывается.
+- **Блокирующие находки не снимаются.** Waiver и «Всё равно перейти дальше» автопилот режима не
+  выбирает никогда, даже по точке `--inject proceed:<петля>` (в логе — что переход пропущен). Если
+  рекомендован waiver (автор оспорил все находки, сквозное ревью повторяет те же), берётся ещё раунд
+  исправлений; на третьем исчерпании рекомендация «Остановить» — run в BLOCKED. Minor и nit, как
+  всегда, только в журнал.
+- **Парковка.** Дойдя до «Принять change?», run пишет `ACCEPTANCE.md`, получает статус
+  `awaiting-review` и завершается с кодом 0 — и в TTY, и без него. В конце лога — отчёт, worktree
+  с кодом для ручной проверки, ветка и `agentflow resume <run-id>`. Resume сразу открывает
+  «Принять change?» (роли не запускаются); без TTY run остаётся в `awaiting-review`, код 2.
+- **Решения переходят к тебе** после парковки или остановки в BLOCKED: время и причина — в
+  `state.json` (`handover`), и все следующие решения этого run, в том числе после resume, — твои.
+  После сбоя контроллера или kill (`--inject kill-after:<этап>`) resume продолжает с автопилотом.
+- **Отчёт.** В `ACCEPTANCE.md` раздел «Режим прогона»: число решений автопилота, когда и почему
+  решения перешли к тебе, открытые critical/major, waiver и переходы дальше (у запаркованного run — 0).
+
+С `--auto-approve` флаг несовместим: run не стартует. `--auto-approve` по-прежнему решает всё,
+включая приёмку, archive и рекомендованный waiver.
 
 ### Где решаешь ты
 

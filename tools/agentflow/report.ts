@@ -21,6 +21,24 @@ export function printLoopSummary(s: RunState): void {
   }
 }
 
+/** Раздел «Режим прогона» — только для run режима --auto-until-review. */
+function modeSection(s: RunState): string[] {
+  if (!s.options?.untilReview) return [];
+  const h = s.handover;
+  const auto = h ? s.decisions.filter((d) => d.at <= h.at).length : s.decisions.length;
+  const blocking = s.findings.filter((f) => (f.severity === 'critical' || f.severity === 'major') && (f.status === 'open' || f.status === 'fixed' || f.status === 'disputed'));
+  return [
+    '## Режим прогона',
+    '',
+    '- режим: `--auto-until-review` — решения до приёмки принимает автопилот, waiver и переход дальше он не выбирает',
+    `- решений автопилота: ${auto}`,
+    `- решения переданы человеку: ${h ? `${h.at} — ${h.reason}` : 'нет, автопилот ещё ведёт run'}`,
+    `- открытых находок critical и major: ${blocking.length}${blocking.length ? ` (${blocking.map((f) => f.id).join(', ')})` : ''}`,
+    `- waiver: ${s.findings.filter((f) => f.status === 'waived').length} · переходов дальше: ${(s.proceeded ?? []).length}`,
+    '',
+  ];
+}
+
 export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: string): string {
   const path = join(runDir, 'ACCEPTANCE.md');
   const trace = (s.final?.traceability ?? []) as { requirementId: string; scenarioId?: string; code?: string[]; tests?: string[]; evidence?: string; result: string }[];
@@ -32,7 +50,7 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
   const md = [
     `# Приёмка: ${s.change}`,
     '',
-    `Статус конвейера: **${s.status === 'running' ? 'готово к приёмке' : s.status.toUpperCase()}**${s.stopReason ? ` — ${s.stopReason}` : ''}.`,
+    `Статус конвейера: **${s.status === 'running' ? 'готово к приёмке' : s.status === 'awaiting-review' ? 'ждёт ревью человека' : s.status.toUpperCase()}**${s.stopReason ? ` — ${s.stopReason}` : ''}.`,
     '',
     `- run: \`${s.runId}\``,
     `- ветка: \`${s.branch}\`, worktree: \`${s.worktree}\``,
@@ -42,8 +60,9 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
     '',
     `- выключены роли: ${s.options?.skip?.length ? s.options.skip.join(', ') : 'нет'}`,
     ...skippedSteps(s.options?.skip ?? []).map((x) => `- пропущено — ${x}`),
-    `- уточнение intent: ${s.options?.clarify === false ? 'нет' : 'да'} · автопилот: ${s.options?.autoApprove ? 'да' : 'нет'}`,
+    `- уточнение intent: ${s.options?.clarify === false ? 'нет' : 'да'} · автопилот: ${s.options?.autoApprove ? 'да' : s.options?.untilReview ? 'до приёмки (--auto-until-review)' : 'нет'}`,
     '',
+    ...modeSection(s),
     '## Пройденные петли',
     '',
     '| Петля | Раундов | Вердикты |',

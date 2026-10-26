@@ -3,6 +3,7 @@
 // диалог бросает PassLoop, петля ловит его и закрывается решением человека. Так диалоги глубоко
 // внутри вызова роли (серия сбоев CLI, простой) не знают, какую петлю они проходят.
 import type { Choice, Human, Option } from './human.ts';
+import { log } from './log.ts';
 import { Blocked } from './util.ts';
 
 export const STOP = 'stop';
@@ -82,8 +83,13 @@ export async function askHuman<K extends string>(human: Human, ch: Choice<K>, o:
     disabled = await scope.check?.();
     tail.push({ key: PROCEED, label: `Всё равно перейти дальше: ${scope.label}`, description: 'нужна причина; петля засчитывается решением человека', ...(disabled ? { disabled } : {}) });
   }
-  // Автопилот переходит дальше только по точке inject и только если пункт доступен.
-  const injected = !!scope && !disabled && human.auto && !!o.inject?.(`proceed:${scope.loop}`);
+  // Автопилот переходит дальше только по точке inject и только если пункт доступен. Автопилот режима
+  // --auto-until-review точку берёт (она не всплывёт в следующем диалоге петли), но дальше не переходит.
+  let injected = !!scope && !disabled && human.auto && !!o.inject?.(`proceed:${scope.loop}`);
+  if (injected && human.strict) {
+    log.warn(`режим --auto-until-review: переход дальше по proceed:${scope!.loop} пропущен — блокирующие находки снимает только человек`);
+    injected = false;
+  }
   const menu: Choice<string> = {
     ...ch,
     options: ch.options.filter((x) => x.key !== STOP),

@@ -36,6 +36,7 @@ import { showAgents } from './agents.ts';
 import { KIT, resolveRepo } from './config.ts';
 import { runGates, gatesSummary, type GateResult } from './gates.ts';
 import { addWorktree, changedPaths, commitAll, diff, diffNoIndex, ensureRepo, head } from './git.ts';
+import { autopilotOn, checkModeFlags, untilReviewPick } from './autopilot.ts';
 import { askHuman, blocker, PassLoop, Scopes, type PassScope } from './dialogs.ts';
 import { Human, replies, type Choice, type Discuss } from './human.ts';
 import { INJECT_HELP, Injector, parseInject } from './inject.ts';
@@ -53,7 +54,7 @@ import { artifactFiles, artifactSnapshot, artifactText, codeSnapshot, specDigest
 import { clock, panelEnabled, panel } from './status-panel.ts';
 import { fromMenu, parseSkipRoles, ROLES, settingsMenu, skippedSteps, type RunSettings } from './run-settings.ts';
 import { RunStore, STAGES, type BatchState, type DiscussTurn, type Finding, type Question, type QuestionOption, type RunState, type Stage } from './state.ts';
-import { Blocked, exec, extractJson, matchesAny, now, oneLine, sha256, short, stamp } from './util.ts';
+import { Blocked, exec, extractJson, matchesAny, now, oneLine, Parked, sha256, short, stamp } from './util.ts';
 
 /** Целевой репозиторий: git-корень, из которого запущен agentflow (или --repo). Задаётся в main. */
 let ROOT = KIT;
@@ -147,6 +148,12 @@ function closeLoop(ctx: Ctx, scope: PassScope, reason: string, snapshot: string)
   s.decisions.push({ at: now(), gate: `proceed:${scope.loop}`, decision: 'proceed', comment: reason });
   ctx.store.save();
   log.warn(`${scope.loop}: пройдено решением человека — ${scope.label}${open.length ? ` · сняты ${open.map((f) => f.id).join(', ')}` : ''} · причина: ${reason}`);
+}
+
+/** Режим --auto-until-review: автопилот берёт ещё раунд вместо рекомендованного waiver. */
+function modePick(ctx: Ctx, recommended: string): { autoPick?: { key: 'more'; why: string } } {
+  const pick = st(ctx).options.untilReview ? untilReviewPick(recommended) : undefined;
+  return pick ? { autoPick: pick } : {};
 }
 
 /** Реплика автопилота при fault injection discuss-dialog. */
@@ -797,6 +804,7 @@ async function artifactExhausted(ctx: Ctx, n: ArtifactNode, round: number, toFix
       ],
       recommended,
       rationale,
+      ...modePick(ctx, recommended),
     },
     { exhausted: true },
   );
@@ -1150,6 +1158,7 @@ async function holisticRounds(ctx: Ctx): Promise<void> {
     log.loopClose('REVISE → петли артефактов');
     if (round >= budget) {
       const files = ctx.graph.flatMap((n) => filesOf(ctx, n));
+      const recommended = exhaustedBefore(ctx, 'exhausted:holistic') >= 2 ? 'stop' : stuck(history) ? 'waive' : 'more';
       const ch = talk(ctx, 'exhausted:holistic', ['spec-reviewer', 'spec-author'], files, {
         title: `Сквозное ревью: ${round} раунда без PASS`,
         context: blocking.map((f) => `${f.id} [${f.severity}] → ${f.artifact ?? artifactOfLocation(ctx, f.location) ?? '?'}: ${oneLine(f.problem, 110)}`),
@@ -1158,7 +1167,8 @@ async function holisticRounds(ctx: Ctx): Promise<void> {
           { key: 'waive', label: 'Снять оставшиеся находки сквозного ревью с причиной (waiver)' },
           { key: 'stop', label: 'Остановить run (BLOCKED, потом resume)' },
         ],
-        recommended: exhaustedBefore(ctx, 'exhausted:holistic') >= 2 ? 'stop' : stuck(history) ? 'waive' : 'more',
+        recommended,
+        ...modePick(ctx, recommended),
         rationale:
           exhaustedBefore(ctx, 'exhausted:holistic') >= 2
             ? 'лимит исчерпан уже не первый раз — продление не помогает, нужен разбор человеком'
@@ -1876,6 +1886,7 @@ async function stageReport(ctx: Ctx): Promise<void> {
 async function stageHumanAcceptance(ctx: Ctx): Promise<void> {
   log.phase('ПРИЁМКА · человеческий шлюз 2 из 2');
   const s = st(ctx);
+  if (ctx.human.auto && s.options.untilReview) throw new Parked('парковка на приёмке');
   const acc = s.acceptance?.report as { checks?: { result: string }[] } | undefined;
   const passed = acc?.checks?.filter((x) => x.result === 'PASS').length ?? 0;
   const total = acc?.checks?.length ?? 0;
@@ -2011,7 +2022,7 @@ function makeCtx(root: string, runDir: string, store: RunStore, policy: Policy, 
     roles,
     os: new OpenSpec(root, s.worktree, s.versions.openspecBin),
     rt,
-    human: new Human(s.options.autoApprove),
+    human: new Human(autopilotOn(s.options, s.handover), undefined, !!s.options.untilReview),
     inject: new Injector(store),
     scopes: new Scopes(),
     graph: [],
@@ -2048,6 +2059,13 @@ async function pipeline(ctx: Ctx): Promise<void> {
   screen.start({ enabled: clicks, out, err: process.stderr, logBottom: () => panel.logBottom() });
   mouse.start({ enabled: clicks, input: process.stdin, out, handlers: { click: (_x, y) => screen.click(y), cursor: (row) => screen.cursor(row) } });
   if (s.options.skip.length) log.warn(`выключены роли: ${s.options.skip.join(', ')} · пропускаются: ${skippedSteps(s.options.skip).join('; ')}`);
+  if (s.options.untilReview) {
+    log.info(
+      s.handover
+        ? c.yellow(`режим --auto-until-review: решения принимает человек с ${s.handover.at} (${s.handover.reason})`)
+        : c.yellow('режим --auto-until-review: решения до приёмки — автопилот без waiver и перехода дальше, run паркуется на «Принять change?»'),
+    );
+  }
   log.info(`схема OpenSpec: ${status.schemaName} · артефакты: ${ctx.graph.map((n) => n.id).join(' → ')} · apply требует: ${status.applyRequires.join(', ') || '—'}`);
   ctx.store.save();
   try {
@@ -2066,6 +2084,19 @@ async function pipeline(ctx: Ctx): Promise<void> {
     printLoopSummary(s);
     console.log('\n' + c.green(c.bold(`✔ run ${s.runId}: change ${s.change} принят`)));
   } catch (e) {
+    if (e instanceof Parked) {
+      s.status = 'awaiting-review';
+      s.handover = { at: now(), reason: e.message };
+      ctx.store.save();
+      const report = writeAcceptanceReport(ctx.runDir, s, manualCheck(ctx));
+      writeManifest(ctx);
+      printLoopSummary(s);
+      console.log('\n' + c.yellow(c.bold(`⏸ run ${s.runId}: change ${s.change} ждёт твоего ревью`)));
+      console.log(`отчёт: ${report}`);
+      console.log(`код для ручного теста: ${s.worktree} (ветка ${s.branch})`);
+      console.log(`принять или отклонить: agentflow resume ${s.runId}`);
+      return;
+    }
     if (!(e instanceof Blocked)) {
       s.status = 'failed';
       s.stopReason = e instanceof Error ? e.stack ?? e.message : String(e);
@@ -2074,6 +2105,8 @@ async function pipeline(ctx: Ctx): Promise<void> {
     }
     if (s.status === 'running') s.status = 'blocked';
     s.stopReason = e.message;
+    // Остановка режима — решения этого run дальше принимает человек, и после resume тоже.
+    if (s.options.untilReview && !s.handover) s.handover = { at: now(), reason: `BLOCKED: ${oneLine(e.message, 200)}` };
     ctx.store.save();
     log.error(`${s.status.toUpperCase()}: ${e.message}`);
     writeAcceptanceReport(ctx.runDir, s, manualCheck(ctx));
@@ -2107,7 +2140,9 @@ function intentFromChange(dir: string, change: string): string {
   return `Существующий change «${change}»: доведи его до приёмки по схеме репозитория.`;
 }
 
-async function startRun(args: { intent?: string; change?: string; autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[]; skipRoles?: string }): Promise<void> {
+async function startRun(args: { intent?: string; change?: string; autoApprove: boolean; untilReview: boolean; mock: boolean; clarify: boolean; inject: string[]; skipRoles?: string }): Promise<void> {
+  const flagError = checkModeFlags(args.autoApprove, args.untilReview);
+  if (flagError) throw new Error(flagError);
   await ensureRepo(ROOT);
   if (!existsSync(join(ROOT, 'openspec'))) throw new Error(`в ${ROOT} нет openspec/: выполни agentflow init (или openspec init)`);
   const policy = loadPolicy(ROOT);
@@ -2166,7 +2201,7 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
     worktree: wt,
     branch,
     baseCommit,
-    options: { autoApprove: settings.autoApprove, mock: args.mock, clarify: settings.clarify, inject: args.inject, skip: settings.skip },
+    options: { autoApprove: settings.autoApprove, mock: args.mock, clarify: settings.clarify, inject: args.inject, skip: settings.skip, ...(args.untilReview ? { untilReview: true } : {}) },
     versions: { prompts: promptsRevision(ROOT), policy: policy.sha, sdk: sdkVersion(), openspec: await os.version(), openspecBin: os.bin },
     stagesDone: [],
     intent: { source: intent?.source ?? `openspec/changes/${change}`, text: intentText, clarifications: [] },
@@ -2206,12 +2241,13 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
 }
 
 /**
- * Настройки run: флаги, а в интерактивном терминале без --auto-approve и --skip-roles — меню с
+ * Настройки run: флаги, а в интерактивном терминале без --auto-approve, --auto-until-review и --skip-roles — меню с
  * галочками. Ошибка флага и отказ от меню — до создания ветки и worktree.
  */
-async function runSettings(args: { autoApprove: boolean; clarify: boolean; skipRoles?: string }): Promise<RunSettings> {
+async function runSettings(args: { autoApprove: boolean; untilReview: boolean; clarify: boolean; skipRoles?: string }): Promise<RunSettings> {
   const flags: RunSettings = { skip: parseSkipRoles(args.skipRoles), clarify: args.clarify, autoApprove: args.autoApprove };
-  if (args.autoApprove || args.skipRoles !== undefined || !process.stdin.isTTY || !process.stdout.isTTY) return flags;
+  // Режим --auto-until-review — прогон без участия: меню ждало бы человека до старта.
+  if (args.autoApprove || args.untilReview || args.skipRoles !== undefined || !process.stdin.isTTY || !process.stdout.isTTY) return flags;
   return fromMenu(await new Human(false).checklist('Настройки run: пробел — отметить, Enter — запуск', settingsMenu(flags)));
 }
 
@@ -2222,6 +2258,11 @@ async function resumeRun(runId: string): Promise<void> {
   store.load();
   if (store.state.status === 'accepted') {
     console.log(`run ${runId} уже принят`);
+    return;
+  }
+  if (store.state.status === 'awaiting-review' && !process.stdin.isTTY) {
+    console.log(`run ${runId} ждёт ревью человека на приёмке: запусти agentflow resume ${runId} в интерактивном терминале`);
+    process.exitCode = 2;
     return;
   }
   const policy = loadPolicy(ROOT);
@@ -2244,7 +2285,7 @@ function showStatus(runId?: string): void {
     if (!ids.length) console.log('запусков нет');
     for (const id of ids) {
       const s = JSON.parse(readFileSync(join(runsDir, id, 'state.json'), 'utf8')) as RunState;
-      console.log(`${id}  ${s.status.padEnd(9)} этап ${s.stage}${s.stopReason ? ` — ${s.stopReason.split('\n')[0]}` : ''}`);
+      console.log(`${id}  ${s.status.padEnd(15)} этап ${s.stage}${s.stopReason ? ` — ${s.stopReason.split('\n')[0]}` : ''}`);
     }
     return;
   }
@@ -2368,12 +2409,15 @@ const USAGE = `agentflow — конвейер spec-driven разработки �
   agentflow run --change <id>              существующий change: готовые артефакты — на ревью,
                                            недостающие пишет spec-author, выполненные задачи пропускаются
       --auto-approve     решения человека — рекомендуемые варианты (для прогонов без участия)
+      --auto-until-review  автопилот до приёмки: спека, freeze и код без человека, блокирующие находки
+                         не снимаются (нет waiver и перехода дальше); run ждёт приёмки (awaiting-review),
+                         принять или отклонить — agentflow resume <run-id>
       --inject <точки>   fault injection: all или через запятую:
                            ${INJECT_HELP.join('\n                           ')}
       --mock             роли без моделей (только демо-проект kit)
       --no-clarify       пропустить шаг уточнения intent
       --skip-roles <р,р>  выключить роли без диалога настроек: spec-reviewer, code-reviewer, acceptance-tester
-                         (в TTY без --auto-approve и --skip-roles перед стартом — меню настроек с галочками)
+                         (в TTY без --auto-approve, --auto-until-review и --skip-roles — меню настроек с галочками)
       --no-panel         без панели статуса внизу терминала (или AGENTFLOW_NO_PANEL=1)
       --no-mouse         без режима мыши: клик по «▸ размышляет» не раскрывает текст (или AGENTFLOW_NO_MOUSE=1)
   agentflow resume <run-id> [--no-panel] [--no-mouse]
@@ -2388,6 +2432,7 @@ async function main(): Promise<void> {
     options: {
       change: { type: 'string' },
       'auto-approve': { type: 'boolean', default: false },
+      'auto-until-review': { type: 'boolean', default: false },
       inject: { type: 'string' },
       mock: { type: 'boolean', default: false },
       'no-clarify': { type: 'boolean', default: false },
@@ -2412,7 +2457,7 @@ async function main(): Promise<void> {
   } else if (cmd === 'changes') {
     await showChanges();
   } else if (cmd === 'run') {
-    await startRun({ intent: arg, change: values.change, autoApprove: values['auto-approve'], mock: values.mock, clarify: !values['no-clarify'], inject: parseInject(values.inject), skipRoles: values['skip-roles'] });
+    await startRun({ intent: arg, change: values.change, autoApprove: values['auto-approve'], untilReview: values['auto-until-review'], mock: values.mock, clarify: !values['no-clarify'], inject: parseInject(values.inject), skipRoles: values['skip-roles'] });
   } else if (cmd === 'resume') {
     if (!arg) throw new Error('укажи run-id (agentflow status)');
     await resumeRun(arg);
