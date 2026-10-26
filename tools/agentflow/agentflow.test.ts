@@ -4,7 +4,7 @@
 import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { batchesFromTasks, discussPrompt, formatDiscussion, parseDiscussReply, parseTasks } from './context-builder.ts';
+import { batchesFromTasks, decisionDiscussPrompt, discussPrompt, formatDiscussion, parseDecisionReply, parseDiscussReply, parseTasks } from './context-builder.ts';
 import { deepMerge, KIT } from './config.ts';
 import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,7 +17,7 @@ import { runMock } from './mock.ts';
 import { aclRetryAddendum, diagnose, recommendIntervention, type Intervention, type InterventionDecision } from './intervention.ts';
 import { Human, replies, type Discuss, type PromptIO, type QuestionView } from './human.ts';
 import type { DiscussReply } from './context-builder.ts';
-import type { DiscussTurn } from './state.ts';
+import { RunStore, type DiscussTurn } from './state.ts';
 import { normalize } from './snapshot.ts';
 import { globToRegExp } from './util.ts';
 import { c, log, moreLines, thinkingLines } from './log.ts';
@@ -1632,4 +1632,77 @@ test('диалог: режим мыши снят на время меню, ра�
     mouse.stop();
     t.done();
   }
+});
+
+test('state.json прогона до перехода дальше загружается: proceeded и dialogs пустые', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agentflow-state-'));
+  writeFileSync(join(dir, 'state.json'), JSON.stringify({ runId: 'r', decisions: [], findings: [] }));
+  const store = new RunStore(dir);
+  const s = store.load();
+  assert.deepEqual(s.proceeded, []);
+  assert.deepEqual(s.dialogs, {});
+  store.save();
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).proceeded, []);
+});
+
+test('обсуждение решения: промпт, разбор ответа, mock-ответ, цель вызова', async () => {
+  const base = { change: 'add-slugify', intent: 'slugify', clarifications: [] } as unknown as Parameters<typeof decisionDiscussPrompt>[0];
+  const p = decisionDiscussPrompt(base, {
+    gate: 'exhausted:batch 2',
+    role: 'implementer',
+    title: 'batch 2: 3 автоматических раунда без PASS',
+    context: ['CR-1 [major] пустая строка'],
+    options: [{ label: 'Ещё раунд' }, { label: 'Всё равно перейти дальше', disabled: 'нельзя' }],
+    recommended: 'Ещё раунд',
+    rationale: 'находки меняются',
+    files: ['contexts/batch-2-r3.diff'],
+    history: [
+      { at: 'x', message: 'M1', answer: 'A1', role: 'code-reviewer' },
+      { at: 'x', message: 'M2', answer: 'A2', role: 'implementer' },
+    ],
+    message: 'почему не сходится?',
+  });
+  assert.match(p, /обсуждение решения exhausted:batch 2/);
+  assert.match(p, /только на чтение/);
+  assert.match(p, /CR-1 \[major\] пустая строка/);
+  assert.match(p, /- Ещё раунд \(рекомендует контроллер\)/);
+  assert.match(p, /недоступен: нельзя/);
+  assert.match(p, /contexts\/batch-2-r3\.diff/);
+  assert.match(p, /Человек: M1\n\ncode-reviewer: A1/);
+  assert.match(p, /Человек: M2\n\nТы: A2/);
+  assert.match(p, /## Новая реплика человека\n\nпочему не сходится\?/);
+  assert.deepEqual(parseDecisionReply('просто текст'), { answer: 'просто текст' });
+  assert.deepEqual(parseDecisionReply('```json\n{"answer":"A","options":[{"label":"x"},{"label":"y"}]}\n```'), { answer: 'A' });
+  assert.ok('error' in parseDecisionReply('  '));
+  assert.equal(describeTask({ kind: 'discuss-decision', gate: 'blocked:final' }), 'обсуждение решения blocked:final');
+  assert.match(formatDiscussion([{ at: 'x', message: 'M', answer: 'A', role: 'code-reviewer' }]), /code-reviewer: A/);
+  const res = await runMock(kitRt({ mock: runMock }), {
+    role: loadRoles(KIT).get('code-reviewer')!,
+    prompt: p,
+    label: 'discuss-decision',
+    cwd: '.',
+    readOnly: true,
+    meta: { kind: 'discuss-decision', gate: 'exhausted:batch 2' },
+  });
+  assert.ok(res.ok);
+  assert.match((parseDecisionReply(res.text) as { answer: string }).answer, /почему не сходится\?/);
+});
+
+test('вмешательство: переход дальше никогда не рекомендуется, по решению proceed сессия прерывается', async () => {
+  const step = { label: WAITING_MODEL, since: 0 };
+  for (let nth = 1; nth <= 6; nth++) assert.notEqual(recommendIntervention({ kind: 'stall', role: 'implementer', step, idleMs: 1, denials: [] }, nth).choice, 'proceed');
+  for (const category of ['permission', 'expected'] as const) {
+    const ev: Intervention = { kind: 'acl-streak', role: 'implementer', step, idleMs: 1, denials: [{ tool: 'write_file', target: 'x', reason: 'r', category, hint: 'h', at: 0 } as never] };
+    assert.notEqual(recommendIntervention(ev, 1).choice, 'proceed');
+  }
+  const res = await runMock(kitRt({ mock: runMock }), {
+    role: loadRoles(KIT).get('implementer')!,
+    prompt: 'x',
+    label: 'probe',
+    cwd: '.',
+    meta: { kind: 'implement', batchId: '1', silent: true },
+    intervene: async () => 'proceed',
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.intervention?.decision, 'proceed');
 });

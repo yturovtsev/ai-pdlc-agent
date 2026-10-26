@@ -14,6 +14,7 @@ export const INJECT_ALL = [
   'batch-stuck:2', // то же для task batch 2 в apply
   'stall:implementer', // первая сессия implementer молчит → сторож простоя, диалог вмешательства, повтор шага
   'discuss-question', // первый вопрос с вариантами: автопилот задаёт реплику обсуждения → сессия роли только на чтение
+  'discuss-dialog', // первый диалог исчерпания: автопилот задаёт реплику первой роли петли, затем выбирает рекомендацию
 ];
 
 export const INJECT_HELP = [
@@ -21,6 +22,8 @@ export const INJECT_HELP = [
   'stall:<роль> — первая сессия роли молчит, пока сторож её не прервёт (в mock порог 2 с)',
   'think-long:<роль> — первая сессия роли 30 с присылает размышления раз в секунду (проверка клика по ним)',
   'kill-after:<stage> — убить контроллер после этапа (проверка resume)',
+  'proceed:<петля> — в первом диалоге петли автопилот выбирает «Всё равно перейти дальше» (clarify, artifact:<id>, holistic, batch:<id>, acceptance, final)',
+  'blocked:<петля> — первое ревью петли возвращает BLOCKED → диалог блокера (artifact:<id>, holistic, batch:<id>, acceptance, final)',
 ];
 
 export function parseInject(arg: string | undefined): string[] {

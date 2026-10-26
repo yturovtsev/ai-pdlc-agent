@@ -13,6 +13,8 @@ export interface Option<K extends string = string> {
   label: string;
   /** Что произойдёт при выборе; показывается под меню для подсвеченного варианта. */
   description?: string;
+  /** Вариант виден, но недоступен: причина показывается рядом, курсор его пропускает. */
+  disabled?: string;
 }
 
 export interface Choice<K extends string = string> {
@@ -23,6 +25,25 @@ export interface Choice<K extends string = string> {
   recommended: K;
   /** Почему рекомендован именно этот вариант. */
   rationale: string;
+  /** Хвост меню после пунктов обсуждения: «Остановить run», переход дальше. */
+  tail?: Option<K>[];
+  /** Автопилот выбирает этот вариант вместо рекомендации (fault injection). */
+  autoPick?: { key: K; why: string };
+  /** Пункты «Обсудить с <роль>…» перед хвостом меню: реплика роли, затем снова это меню. */
+  discuss?: DecisionDiscuss;
+}
+
+/** Обсуждение решения с ролями петли. Переписка — живой массив: реплики дописываются в него. */
+export interface DecisionDiscuss {
+  roles: string[];
+  history: DiscussTurn[];
+  /** limits.discussTurns: через столько реплик — диалог «продолжить или выбрать»; 0 — без диалога. */
+  limit: number;
+  reply(role: string, message: string, history: DiscussTurn[]): Promise<{ answer: string } | { error: string }>;
+  /** Реплика удалась: сохранить переписку. */
+  onTurn(turn: DiscussTurn): void;
+  /** Fault injection discuss-dialog: реплика первой роли до первого меню. */
+  autoMessage?: string;
 }
 
 /**
@@ -45,7 +66,13 @@ async function paused<T>(fn: () => Promise<T>): Promise<T> {
 /** Ввод человека: по умолчанию @inquirer/prompts и TTY процесса, в unit-тестах — сценарий ответов. */
 export interface PromptIO {
   select(
-    config: { message: string; default?: string; loop?: boolean; pageSize?: number; choices: { value: string; name: string; short?: string; description?: string }[] },
+    config: {
+      message: string;
+      default?: string;
+      loop?: boolean;
+      pageSize?: number;
+      choices: { value: string; name: string; short?: string; description?: string; disabled?: boolean | string }[];
+    },
     context?: { signal?: AbortSignal },
   ): Promise<string>;
   input(config: { message: string }): Promise<string>;
@@ -84,7 +111,7 @@ export interface Discuss {
 
 export class Human {
   constructor(
-    private readonly auto: boolean,
+    readonly auto: boolean,
     private readonly io: PromptIO = INQUIRER,
   ) {}
 
@@ -93,28 +120,99 @@ export class Human {
   }
 
   async select<K extends string>(ch: Choice<K>): Promise<K> {
-    return (await this.choose(ch))!;
+    return (await this.withDiscuss(ch))!;
   }
 
   /** Диалог, который можно закрыть извне: при отмене через signal возвращает undefined. */
   async selectOrCancel<K extends string>(ch: Choice<K>, signal: AbortSignal): Promise<K | undefined> {
-    return this.choose(ch, signal);
+    return this.withDiscuss(ch, signal);
+  }
+
+  /** Меню решения с обсуждением: пункт «Обсудить с <роль>…» — реплика и снова то же меню. */
+  private async withDiscuss<K extends string>(ch: Choice<K>, signal?: AbortSignal): Promise<K | undefined> {
+    const d = ch.discuss;
+    if (!d?.roles.length) return this.choose(ch, signal);
+    if (d.autoMessage) {
+      log.info(c.gray(`  реплика обсуждения (fault injection): ${d.autoMessage}`));
+      await this.decisionTurn(d, d.roles[0]!, d.autoMessage);
+    }
+    const confirmed = { n: -1 };
+    for (;;) {
+      const k = await this.choose(
+        {
+          ...ch,
+          context: [...(ch.context ?? []), ...(d.history.length ? [`обсуждение: ${replies(d.history.length)}`] : [])],
+          options: [
+            ...ch.options,
+            ...d.roles.map((r) => ({ key: `discuss:${r}` as K, label: `Обсудить с ${r}…`, description: 'реплика роли в сессии только на чтение, затем снова это меню' })),
+          ],
+        },
+        signal,
+      );
+      if (k === undefined || !k.startsWith('discuss:')) return k;
+      if (!(await this.limitPassed(d.limit, d.history.length, confirmed, 'По решению'))) continue;
+      const role = k.slice('discuss:'.length);
+      const message = await this.message(role, ch.title);
+      if (message) await this.decisionTurn(d, role, message);
+    }
+  }
+
+  /** Неудачная реплика в переписку не идёт: решение остаётся открытым, меню показывается снова. */
+  private async decisionTurn(d: DecisionDiscuss, role: string, message: string): Promise<void> {
+    const r = await d.reply(role, message, d.history);
+    if ('error' in r) {
+      log.warn(`${role}: ответа на реплику нет (${r.error}) — решение остаётся открытым`);
+      return;
+    }
+    const t: DiscussTurn = { at: now(), message, answer: r.answer, role };
+    d.history.push(t);
+    log.discuss(role, r.answer);
+    d.onTurn(t);
+  }
+
+  /** Диалог лимита реплик: false — человек вернулся к выбору. Подтверждение действует до следующего кратного. */
+  private async limitPassed(limit: number, n: number, confirmed: { n: number }, what: string): Promise<boolean> {
+    if (!(limit > 0 && n > 0 && n % limit === 0 && confirmed.n !== n)) return true;
+    const k = await this.select({
+      title: `${what} уже ${replies(n)} обсуждения`,
+      options: [
+        { key: 'choose', label: 'Вернуться к выбору варианта' },
+        { key: 'continue', label: 'Продолжить обсуждение', description: `ещё ${replies(limit)} до следующего такого вопроса` },
+      ],
+      recommended: 'choose',
+      rationale: `${replies(n)} (limits.discussTurns: ${limit}) обычно хватает, чтобы выбрать`,
+    });
+    if (k === 'choose') return false;
+    confirmed.n = n;
+    return true;
+  }
+
+  private async message(role: string, what: string): Promise<string> {
+    this.ensureTty(what);
+    return (await paused(() => this.io.input({ message: `Вопрос или комментарий для ${role}` }))).trim();
   }
 
   private async choose<K extends string>(ch: Choice<K>, signal?: AbortSignal): Promise<K | undefined> {
-    const rec = ch.options.find((o) => o.key === ch.recommended) ?? ch.options[0]!;
+    const all = [...ch.options, ...(ch.tail ?? [])];
+    const rec = all.find((o) => o.key === ch.recommended) ?? all[0]!;
+    if (rec.disabled) throw new Error(`рекомендован недоступный вариант «${rec.label}»`);
     console.log('');
     log.human(c.bold(ch.title));
     for (const line of ch.context ?? []) log.info(c.gray('  ' + line));
     log.info(c.green(`  ★ рекомендуется: ${rec.label}`) + c.gray(` — ${ch.rationale}`));
     if (this.auto) {
+      const pick = ch.autoPick && all.find((o) => o.key === ch.autoPick!.key && !o.disabled);
+      if (pick) {
+        log.info(c.gray(`  (${ch.autoPick!.why}) → ${pick.label}`));
+        return pick.key;
+      }
       log.info(c.gray(`  (--auto-approve) → ${rec.label}`));
       return rec.key;
     }
     if (signal?.aborted) return undefined;
     this.ensureTty(ch.title);
     // Рекомендуемый вариант первым, под курсором и с пометкой; остальные в исходном порядке.
-    const ordered = [rec, ...ch.options.filter((o) => o !== rec)];
+    const ordered = [rec, ...all.filter((o) => o !== rec)];
     const answer = await paused(async () => {
       try {
         return (await this.io.select(
@@ -128,6 +226,7 @@ export class Human {
               name: o === rec ? c.green(`★ ${o.label} (рекомендуется)`) : `  ${o.label}`,
               short: o.label,
               description: o === rec ? `${o.description ?? ''}${o.description ? '\n' : ''}Почему: ${ch.rationale}` : o.description,
+              ...(o.disabled ? { disabled: o.disabled } : {}),
             })),
           },
           { signal },
@@ -141,7 +240,7 @@ export class Human {
       log.info(c.gray('  диалог закрыт без выбора'));
       return undefined;
     }
-    log.info(c.gray(`  выбрано: ${ch.options.find((o) => o.key === answer)?.label}`));
+    log.info(c.gray(`  выбрано: ${all.find((o) => o.key === answer)?.label}`));
     return answer;
   }
 
@@ -178,7 +277,7 @@ export class Human {
       await this.discussTurn(discuss, discuss.autoMessage, history, view);
     }
     // Продолжение после диалога лимита подтверждено для этого числа реплик.
-    let confirmed = -1;
+    const confirmed = { n: -1 };
     for (;;) {
       const key = await this.select({
         title: q.question,
@@ -194,22 +293,8 @@ export class Human {
       const rec = view.options[view.recommended]!.label;
       if (key === 'own') return { answer: await this.text(q.question, rec), discussion: history };
       if (key !== 'discuss' || !discuss) return { answer: view.options[Number(key)]!.label, discussion: history };
-      const n = history.length;
-      if (discuss.limit > 0 && n > 0 && n % discuss.limit === 0 && confirmed !== n) {
-        const k = await this.select({
-          title: `По вопросу уже ${replies(n)} обсуждения`,
-          options: [
-            { key: 'choose', label: 'Вернуться к выбору варианта' },
-            { key: 'continue', label: 'Продолжить обсуждение', description: `ещё ${replies(discuss.limit)} до следующего такого вопроса` },
-          ],
-          recommended: 'choose',
-          rationale: `${replies(n)} (limits.discussTurns: ${discuss.limit}) обычно хватает, чтобы выбрать`,
-        });
-        if (k === 'choose') continue;
-        confirmed = n;
-      }
-      this.ensureTty(q.question);
-      const message = (await paused(() => this.io.input({ message: `Вопрос или комментарий для ${discuss.role}` }))).trim();
+      if (!(await this.limitPassed(discuss.limit, history.length, confirmed, 'По вопросу'))) continue;
+      const message = await this.message(discuss.role, q.question);
       if (message) await this.discussTurn(discuss, message, history, view);
     }
   }

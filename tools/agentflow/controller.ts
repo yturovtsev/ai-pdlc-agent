@@ -15,6 +15,7 @@ import {
   authorPrompt,
   clarifyPrompt,
   codeReviewPrompt,
+  decisionDiscussPrompt,
   discussPrompt,
   finalReviewPrompt,
   formatDiscussion,
@@ -23,6 +24,7 @@ import {
   indexRequirements,
   loadRubric,
   batchesFromTasks,
+  parseDecisionReply,
   parseDiscussReply,
   specReviewPrompt,
   writeContext,
@@ -34,9 +36,10 @@ import { showAgents } from './agents.ts';
 import { KIT, resolveRepo } from './config.ts';
 import { runGates, gatesSummary, type GateResult } from './gates.ts';
 import { addWorktree, changedPaths, commitAll, diff, diffNoIndex, ensureRepo, head } from './git.ts';
-import { Human, replies, type Discuss } from './human.ts';
+import { askHuman, blocker, PassLoop, Scopes, type PassScope } from './dialogs.ts';
+import { Human, replies, type Choice, type Discuss } from './human.ts';
 import { INJECT_HELP, Injector, parseInject } from './inject.ts';
-import { aclRetryAddendum, diagnose, INTERVENTION_OPTIONS, recommendIntervention } from './intervention.ts';
+import { aclRetryAddendum, diagnose, INTERVENTION_OPTIONS, recommendIntervention, type InterventionChoice } from './intervention.ts';
 import { c, log, setLogSink } from './log.ts';
 import { runMock } from './mock.ts';
 import { mouse, mouseEnabled } from './mouse.ts';
@@ -73,6 +76,8 @@ interface Ctx {
   rt: RoleRuntime;
   human: Human;
   inject: Injector;
+  /** Петли, которые сейчас можно пройти решением человека: верхняя — текущая. */
+  scopes: Scopes;
   graph: ArtifactNode[];
   /** Артефакты, которые требует apply (файл задач) — из схемы репозитория. */
   tracked: Set<string>;
@@ -111,9 +116,156 @@ function account(ctx: Ctx, r: RoleDef, res: RoleResult): void {
   ctx.store.save();
 }
 
+/** Диалог с «Остановить run»: хвост меню, переход дальше по текущей петле, точки inject контроллера. */
+async function ask<K extends string>(ctx: Ctx, ch: Choice<K>): Promise<K> {
+  return (await askHuman(ctx.human, ch, { scopes: ctx.scopes, inject: (p) => ctx.inject.take(p) }))!;
+}
+
+/**
+ * Петля в своей области: «Всё равно перейти дальше» в любом её диалоге закрывает её через onPass.
+ * Глубина лога возвращается к той, что была до петли: переход мог случиться посреди раунда.
+ */
+function passLoop<T>(ctx: Ctx, scope: PassScope, fn: () => Promise<T>, onPass: (reason: string) => T | Promise<T>): Promise<T> {
+  const depth = log.depth();
+  return ctx.scopes.passable(scope, fn, (reason) => {
+    log.depth(depth);
+    return onPass(reason);
+  });
+}
+
+/** Петля пройдена решением человека: её незакрытые находки снимаются с причиной, переход — в state.json. */
+function closeLoop(ctx: Ctx, scope: PassScope, reason: string, snapshot: string): void {
+  const s = st(ctx);
+  const open = openFindings(ctx, scope.loop);
+  for (const f of open) {
+    f.status = 'waived';
+    f.waiver = { reason, at: now(), snapshot };
+  }
+  s.proceeded.push({ at: now(), loop: scope.loop, label: scope.label, reason, findings: open.map((f) => f.id) });
+  s.decisions.push({ at: now(), gate: `proceed:${scope.loop}`, decision: 'proceed', comment: reason });
+  ctx.store.save();
+  log.warn(`${scope.loop}: пройдено решением человека — ${scope.label}${open.length ? ` · сняты ${open.map((f) => f.id).join(', ')}` : ''} · причина: ${reason}`);
+}
+
+/** Реплика автопилота при fault injection discuss-dialog. */
+const DISCUSS_DIALOG_MESSAGE = 'Какие из находок действительно блокируют и что даст каждый вариант?';
+
+/**
+ * Обсуждение решения с ролями петли: реплика — сессия только на чтение без серии повторов, как у
+ * вопроса. Переписка пишется в state.json под гейтом и номером показа диалога.
+ */
+function talk<K extends string>(ctx: Ctx, gate: string, roles: string[], files: string[], ch: Choice<K>, o: { exhausted?: boolean } = {}): Choice<K> {
+  const s = st(ctx);
+  const key = `${gate}#${Object.keys(s.dialogs).filter((k) => k.startsWith(`${gate}#`)).length + 1}`;
+  const history: DiscussTurn[] = [];
+  const scope = ctx.scopes.top();
+  const options = [
+    ...ch.options.filter((x) => x.key !== 'stop'),
+    { label: 'Остановить run (BLOCKED, потом resume)' },
+    ...(scope ? [{ label: `Всё равно перейти дальше: ${scope.label}` }] : []),
+  ];
+  return {
+    ...ch,
+    discuss: {
+      roles,
+      history,
+      limit: ctx.policy.limits.discussTurns,
+      autoMessage: o.exhausted && ctx.inject.take('discuss-dialog') ? DISCUSS_DIALOG_MESSAGE : undefined,
+      reply: (name, message, prev) => {
+        const turn = prev.length + 1;
+        const label = `dialog-${key.replace(/[^\p{L}\p{N}]+/gu, '-')}-${turn}`;
+        const prompt = decisionDiscussPrompt(base(ctx), {
+          gate,
+          role: name,
+          title: ch.title,
+          context: ch.context ?? [],
+          options,
+          recommended: ch.options.find((x) => x.key === ch.recommended)?.label ?? String(ch.recommended),
+          rationale: ch.rationale,
+          files,
+          history: prev,
+          message,
+        });
+        return replyTurn(ctx, name, label, prompt, { kind: 'discuss-decision', gate }, parseDecisionReply, `dialog:${gate}`, turn);
+      },
+      onTurn: () => {
+        s.dialogs[key] = history;
+        ctx.store.save();
+      },
+    },
+  };
+}
+
+/**
+ * Одна реплика роли в сессии только на чтение. Своя область: переход дальше в диалоге простоя
+ * реплики — ответа нет, меню показывается снова, петля, в которой открыт диалог, не проходится.
+ */
+async function replyTurn<T extends object>(
+  ctx: Ctx,
+  name: string,
+  label: string,
+  prompt: string,
+  meta: TaskMeta,
+  parse: (text: string) => T | { error: string },
+  loop: string,
+  turn: number,
+  intervene: Intervene = interventionHandler(ctx, label),
+): Promise<T | { error: string }> {
+  const r = role(ctx, name);
+  writeContext(ctx.contextsDir, label, prompt);
+  return ctx.scopes.passable(
+    { loop: 'reply', label: 'вернуться к меню без ответа роли' },
+    async () => {
+      const res = await runRole(ctx.rt, { role: r, prompt, label, cwd: ctx.wt, readOnly: true, meta, intervene });
+      account(ctx, r, res);
+      checkMcp(ctx, name, true, res);
+      afterIntervention(label, name, res, intervene);
+      const out = res.ok ? parse(res.text) : { error: res.error ?? 'неизвестная ошибка' };
+      ctx.store.loop(loop, turn, 'error' in out ? 'ERROR' : 'REPLY', 'error' in out ? String(out.error) : undefined);
+      return out;
+    },
+    (reason) => ({ error: `реплика оставлена без ответа: ${reason}` }),
+  );
+}
+
+/** Решение после обсуждения: число реплик — в решение, переписка — автору следующего раунда. */
+function talkComment(ch: Choice): string | undefined {
+  const n = ch.discuss?.history.length ?? 0;
+  return n ? `обсуждение: ${replies(n)}` : undefined;
+}
+
+function talkNote(ch: Choice): string | undefined {
+  const h = ch.discuss?.history ?? [];
+  return h.length ? `Человек обсудил решение с ролями петли, учти это при исправлении.\n${formatDiscussion(h)}` : undefined;
+}
+
+/**
+ * Блокер роли: диалог вместо остановки. «Остановить run» (рекомендуется) — Blocked с причиной,
+ * переход дальше — PassLoop текущей петли. Контекст человека (и переписка обсуждения) уходит в
+ * уточнения intent: его видят все роли; вызывающий повторяет шаг.
+ */
+async function onBlocker(
+  ctx: Ctx,
+  b: { gate: string; title: string; reason: string; roles: string[]; files: string[]; context?: string[]; retry?: string; ask?: string },
+): Promise<{ text: string; note?: string }> {
+  let ch: Choice | undefined;
+  await blocker(
+    ctx.human,
+    { title: b.title, reason: b.reason, context: b.context, retry: b.retry, decorate: (x) => (ch = talk(ctx, b.gate, b.roles, b.files, x)) as typeof x },
+    { scopes: ctx.scopes, inject: (p) => ctx.inject.take(p) },
+  );
+  const s = st(ctx);
+  s.decisions.push({ at: now(), gate: b.gate, decision: 'context', comment: ch && talkComment(ch) });
+  const text = await ctx.human.text(b.ask ?? 'Недостающий контекст', 'используй intent и код репозитория как единственный источник');
+  const note = ch && talkNote(ch);
+  s.intent.clarifications.push({ question: `${b.gate}: ${b.reason}`, answer: text, ...(ch?.discuss?.history.length ? { discussion: ch.discuss.history } : {}) });
+  ctx.store.save();
+  return { text, note };
+}
+
 /** Серия повторов закончилась ошибкой: человек решает, повторить ещё серию или остановить run. */
 async function infraExhausted(ctx: Ctx, what: string, error: string, series: number): Promise<void> {
-  const k = await ctx.human.select({
+  const k = await ask(ctx, {
     title: `${what}: ${ctx.policy.limits.infraRetries + 1} попыток подряд закончились ошибкой`,
     context: [`последняя ошибка: ${oneLine(error, 300)}`, `подробности: ${ctx.store.ledgerPath} (ev: stderr)`],
     options: [
@@ -130,23 +282,35 @@ async function infraExhausted(ctx: Ctx, what: string, error: string, series: num
  * Решение о вмешательстве в работающую сессию шага. Счётчик простоев один на все попытки и серии
  * шага: так --auto-approve идёт по цепочке «ждать → повторить → стоп», а не ждёт вечно.
  */
-function interventionHandler(ctx: Ctx, label: string): NonNullable<RoleCall['intervene']> {
+/** Обработчик вмешательства; passed — переход дальше, который исполнит afterIntervention после прерывания сессии. */
+type Intervene = NonNullable<RoleCall['intervene']> & { passed?: PassLoop };
+
+function interventionHandler(ctx: Ctx, label: string): Intervene {
   let stalls = 0;
-  return async (ev, signal) => {
+  const h: Intervene = async (ev, signal) => {
     if (ev.kind === 'stall') stalls++;
     const opened = Date.now();
     const rec = recommendIntervention(ev, stalls);
     const hints = [...new Set(ev.denials.map((d) => d.hint).filter(Boolean))].map((h) => `что делать: ${h}`);
-    const k = await ctx.human.selectOrCancel(
-      {
-        title: ev.kind === 'stall' ? `${label}: роль ${ev.role} молчит ${clock(ev.idleMs)}` : `${label}: роль ${ev.role} упирается в ACL`,
-        context: [diagnose(ev), ...hints, `подробности: ${ctx.store.ledgerPath}`],
-        options: INTERVENTION_OPTIONS,
-        recommended: rec.choice,
-        rationale: rec.rationale,
-      },
-      signal,
-    );
+    let k: InterventionChoice | undefined;
+    try {
+      k = await askHuman(
+        ctx.human,
+        {
+          title: ev.kind === 'stall' ? `${label}: роль ${ev.role} молчит ${clock(ev.idleMs)}` : `${label}: роль ${ev.role} упирается в ACL`,
+          context: [diagnose(ev), ...hints, `подробности: ${ctx.store.ledgerPath}`],
+          options: INTERVENTION_OPTIONS,
+          recommended: rec.choice,
+          rationale: rec.rationale,
+        },
+        { scopes: ctx.scopes, inject: (p) => ctx.inject.take(p), signal },
+      );
+    } catch (e) {
+      // Сторож ждёт решение, а не исключение: переход дальше исполняется после прерывания сессии.
+      if (!(e instanceof PassLoop)) throw e;
+      h.passed = e;
+      return 'proceed';
+    }
     if (k !== undefined) return k;
     log.info(
       ev.kind === 'stall'
@@ -155,11 +319,16 @@ function interventionHandler(ctx: Ctx, label: string): NonNullable<RoleCall['int
     );
     return 'woke';
   };
+  return h;
 }
 
-/** Сессию прервали по решению о вмешательстве: стоп — BLOCKED, после серии ACL — подсказка в промпт повтора. */
-function afterIntervention(label: string, name: string, res: RoleResult): string {
+/**
+ * Сессию прервали по решению о вмешательстве: стоп — BLOCKED, переход дальше — PassLoop петли,
+ * после серии ACL — подсказка в промпт повтора.
+ */
+function afterIntervention(label: string, name: string, res: RoleResult, intervene: Intervene): string {
   if (res.intervention?.decision === 'stop') throw new Blocked(`${label}: роль ${name}: ${res.error}`);
+  if (res.intervention?.decision === 'proceed') throw intervene.passed ?? new Error(`${label}: переход дальше без петли`);
   return res.intervention?.kind === 'acl-streak' ? '\n\n' + aclRetryAddendum(res.intervention.denials) : '';
 }
 
@@ -200,7 +369,7 @@ async function callRole(
       account(ctx, r, res);
       checkMcp(ctx, name, opts.readOnly, res);
       if (res.ok) return res;
-      addendum = afterIntervention(opts.label, name, res) || addendum;
+      addendum = afterIntervention(opts.label, name, res, intervene) || addendum;
       lastError = res.error ?? 'неизвестная ошибка';
       log.warn(`${name}: ошибка шага (${lastError}) — попытка ${attempt}/${tries}`);
     }
@@ -218,7 +387,6 @@ const DISCUSS_INJECT_MESSAGE = 'Чем варианты отличаются д�
  */
 function discussFor(ctx: Ctx, q: { id: string; from: string; artifact?: string; options?: QuestionOption[] }, persist?: Question): Discuss {
   const name = q.from;
-  const r = role(ctx, name);
   const n = q.artifact ? ctx.graph.find((x) => x.id === q.artifact) : undefined;
   const files = n ? filesOf(ctx, n) : [];
   const intervene = interventionHandler(ctx, `discuss-${q.id}`);
@@ -232,22 +400,8 @@ function discussFor(ctx: Ctx, q: { id: string; from: string; artifact?: string; 
       const turn = history.length + 1;
       const label = `discuss-${q.id}-${turn}`;
       const prompt = discussPrompt(base(ctx), { id: q.id, question: v.question, why: v.why, options: v.options, recommended: v.recommended, rationale: v.rationale, files, history, message });
-      writeContext(ctx.contextsDir, label, prompt);
-      const res = await runRole(ctx.rt, {
-        role: r,
-        prompt,
-        label,
-        cwd: ctx.wt,
-        readOnly: true,
-        meta: { kind: 'discuss', discuss: { id: q.id, options: v.options, recommended: v.recommended } },
-        intervene,
-      });
-      account(ctx, r, res);
-      checkMcp(ctx, name, true, res);
-      afterIntervention(label, name, res);
-      const out = res.ok ? parseDiscussReply(res.text) : { error: res.error ?? 'неизвестная ошибка' };
-      ctx.store.loop(`discuss:${q.id}`, turn, 'error' in out ? 'ERROR' : 'REPLY', 'error' in out ? out.error : undefined);
-      return out;
+      const meta: TaskMeta = { kind: 'discuss', discuss: { id: q.id, options: v.options, recommended: v.recommended } };
+      return replyTurn(ctx, name, label, prompt, meta, parseDiscussReply, `discuss:${q.id}`, turn, intervene);
     },
     onTurn: (t, v) => {
       if (!persist) return;
@@ -294,7 +448,7 @@ async function callReviewer(
       account(ctx, r, res);
       checkMcp(ctx, name, false, res);
       if (!res.ok) {
-        addendum = afterIntervention(label, name, res) || addendum;
+        addendum = afterIntervention(label, name, res, intervene) || addendum;
         lastError = res.error ?? 'неизвестная ошибка';
         log.warn(`${name}: ошибка шага (${lastError}) — попытка ${attempt}/${tries}`);
         continue;
@@ -352,7 +506,7 @@ function applyResponses(ctx: Ctx, loop: string, text: string): Record<string, un
 }
 
 /** Жизненный цикл находок по ревью: неповторённые закрываются, повторённые снова open. */
-function applyReview(ctx: Ctx, loop: string, round: number, review: Review, d: Decision): void {
+async function applyReview(ctx: Ctx, loop: string, round: number, review: Review, d: Decision): Promise<void> {
   const prev = openFindings(ctx, loop);
   const raised = new Set(review.findings.map((f) => f.id));
   for (const p of prev) if (!raised.has(p.id) && p.source === review.role) p.status = 'closed';
@@ -361,7 +515,18 @@ function applyReview(ctx: Ctx, loop: string, round: number, review: Review, d: D
     const blocking = d.blocking.includes(f);
     // Спор о безопасности или утверждённом поведении LLM не прощает.
     if (existing?.status === 'disputed' && blocking && (f.category === 'security' || f.category === 'behavior')) {
-      throw new Blocked(`${loop}: спор по находке ${f.id} (${f.category}) — нужно решение человека: ${f.problem}`);
+      const author = loop.startsWith('artifact:') || loop === 'holistic' ? 'spec-author' : 'implementer';
+      // Находка остаётся open: автор получает её следующим раундом, а решение человека — в уточнениях.
+      await onBlocker(ctx, {
+        gate: `dispute:${loop}:${f.id}`,
+        title: `${loop}: спор по находке ${f.id} (${f.category})`,
+        reason: `${loop}: спор по находке ${f.id} (${f.category}) — нужно решение человека: ${f.problem}`,
+        context: [`ответ автора: ${oneLine(existing.response?.evidence ?? '—', 200)}`, `ревьюер повторил: ${oneLine(f.evidence, 200)}`],
+        roles: [...new Set([review.role, author])],
+        files: [],
+        retry: 'Решить спор указанием и продолжить',
+        ask: `Решение спора по ${f.id}`,
+      });
     }
     const status = blocking || (f.needsHuman ?? false) ? 'open' : 'logged';
     if (existing) Object.assign(existing, f, { round, status });
@@ -372,6 +537,12 @@ function applyReview(ctx: Ctx, loop: string, round: number, review: Review, d: D
 
 function stored(ctx: Ctx, loop: string, fs: ReviewFinding[]): Finding[] {
   return fs.map((f) => st(ctx).findings.find((x) => x.step === loop && x.id === f.id && x.status === 'open')!).filter(Boolean);
+}
+
+/** Fault injection blocked:<петля>: ревьюер не может проверить — BLOCKED с недостающим контекстом. */
+function injectBlocked(ctx: Ctx, loop: string, review: Review): Review {
+  if (!ctx.inject.take(`blocked:${loop}`)) return review;
+  return { ...review, status: 'BLOCKED', missingContext: [`fault injection blocked:${loop}`] };
 }
 
 function injectRevise(review: Review, location: string, round: number, id = 'INJ-001'): Review {
@@ -458,9 +629,14 @@ function snapshotOf(ctx: Ctx, n: ArtifactNode): string {
 }
 
 async function validateArtifact(ctx: Ctx, n: ArtifactNode, loop: string, round: number): Promise<Finding[]> {
-  const out: Finding[] = [];
+  return (await validationProblems(ctx, n)).map((p) => synthetic(ctx, loop, round, 'validator', { ...p, evidence: 'детерминированная валидация контроллера' }));
+}
+
+/** Проблемы детерминированной валидации артефакта — без находок в state (для проверки перехода дальше). */
+async function validationProblems(ctx: Ctx, n: ArtifactNode): Promise<{ problem: string; location: string }[]> {
+  const out: { problem: string; location: string }[] = [];
   const files = artifactFiles(changeDirAbs(ctx), n.outputPath);
-  const vf = (problem: string, location: string) => synthetic(ctx, loop, round, 'validator', { problem, location, evidence: 'детерминированная валидация контроллера' });
+  const vf = (problem: string, location: string) => ({ problem, location });
   if (!files.length) out.push(vf(`не создан ни один файл ${n.outputPath}`, `${changeDir(ctx)}/${n.outputPath}`));
   const status = (await ctx.os.artifacts(st(ctx).change)).find((a) => a.id === n.id);
   if (files.length && status?.status !== 'done') out.push(vf(`openspec status: артефакт в статусе ${status?.status}`, `${changeDir(ctx)}/${n.outputPath}`));
@@ -584,8 +760,12 @@ async function artifactExhausted(ctx: Ctx, n: ArtifactNode, round: number, toFix
       : stuck(history)
         ? (['hint', 'одни и те же находки два раунда подряд — автор не сходится без твоего ориентира'] as const)
         : (['more', 'находки меняются от раунда к раунду — автор сходится'] as const);
-  for (;;) {
-    const k = await ctx.human.select({
+  const ch = talk(
+    ctx,
+    `exhausted:${n.id}`,
+    ['spec-reviewer', 'spec-author'],
+    filesOf(ctx, n),
+    {
       title: `Артефакт «${n.id}»: ${round} автоматических раунда без PASS`,
       context: toFix.map((f) => `${f.id} [${f.severity}] ${oneLine(f.problem, 110)}${f.response ? ` — автор: ${f.response.resolution}` : ''}`),
       options: [
@@ -598,14 +778,20 @@ async function artifactExhausted(ctx: Ctx, n: ArtifactNode, round: number, toFix
       ],
       recommended,
       rationale,
-    });
+    },
+    { exhausted: true },
+  );
+  for (;;) {
+    const k = await ask(ctx, ch);
     if (k === 'show') {
       showArtifact(ctx, n);
       continue;
     }
-    st(ctx).decisions.push({ at: now(), gate: `exhausted:${n.id}`, decision: k });
+    st(ctx).decisions.push({ at: now(), gate: `exhausted:${n.id}`, decision: k, comment: talkComment(ch) });
     ctx.store.save();
-    if (k === 'more') return { action: 'continue', toFix, reviewOnly: false };
+    const note = talkNote(ch);
+    const talked = note ? [humanFinding(ctx, n, note)] : [];
+    if (k === 'more') return { action: 'continue', toFix: [...toFix, ...talked], reviewOnly: false };
     if (k === 'stop') throw new Blocked(`артефакт ${n.id}: остановлено человеком после ${round} раундов`);
     if (k === 'self') {
       if (await ctx.human.waitForEdit(filesOf(ctx, n).map((f) => join(ctx.wt, f)))) return { action: 'continue', toFix: [], reviewOnly: true };
@@ -613,7 +799,7 @@ async function artifactExhausted(ctx: Ctx, n: ArtifactNode, round: number, toFix
     }
     if (k === 'hint') {
       const text = await ctx.human.text(`Указание для spec-author по «${n.id}»`, 'Сосредоточься на находках ревьюера; если находка неверна — ответь disputed с доказательством');
-      return { action: 'continue', toFix: [...toFix, humanFinding(ctx, n, `Указание человека: ${text}`)], reviewOnly: false };
+      return { action: 'continue', toFix: [...toFix, humanFinding(ctx, n, `Указание человека: ${text}`), ...talked], reviewOnly: false };
     }
     const reason = await ctx.human.text('Причина waiver', 'принято человеком: замечание не блокирует артефакт');
     waive(ctx, reviewerFs, reason, snapshotOf(ctx, n));
@@ -626,10 +812,31 @@ async function artifactExhausted(ctx: Ctx, n: ArtifactNode, round: number, toFix
  * автоматически до artifactRounds раундов, дальше решаешь ты. После PASS — твоё ревью.
  */
 async function artifactLoop(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { reviewFirst?: boolean } = {}): Promise<void> {
+  const next = ctx.graph[ctx.graph.indexOf(n) + 1];
+  const scope: PassScope = {
+    loop: `artifact:${n.id}`,
+    label: `принять «${n.id}» как есть → ${next ? `«${next.id}»` : 'сквозное ревью'}`,
+    // Без чистой валидации OpenSpec не пройдут freeze и archive — такой артефакт дальше не пускаем.
+    check: async () => {
+      const p = await validationProblems(ctx, n);
+      return p.length ? `ошибки валидации OpenSpec (${p.length}): без openspec validate --strict не пройдут freeze и archive` : undefined;
+    },
+  };
+  await passLoop(ctx, scope, () => artifactRounds(ctx, n, seed, opts), (reason) => {
+    const snap = snapshotOf(ctx, n);
+    closeLoop(ctx, scope, reason, snap);
+    Object.assign(st(ctx).spec.artifacts[n.id]!, { status: 'accepted', snapshot: snap, passedBy: 'human' });
+    ctx.store.save();
+    log.info(c.yellow(`«${n.id}» принят как есть решением человека · snapshot ${short(snap)}`));
+  });
+}
+
+async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { reviewFirst?: boolean }): Promise<void> {
   const s = st(ctx);
   const loop = `artifact:${n.id}`;
   const a = (s.spec.artifacts[n.id] ??= { status: 'pending', rounds: 0 });
   a.status = 'pending';
+  delete a.passedBy;
   ctx.store.save();
   const max = ctx.policy.limits.artifactRounds;
   let budget = max;
@@ -722,9 +929,10 @@ async function artifactLoop(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { 
       const loc = `${changeDir(ctx)}/${files[0] ?? n.outputPath}:1`;
       if (ctx.inject.repeat(`artifact-stuck:${n.id}`, max)) review = injectRevise(review, loc, round, 'INJ-STUCK');
       else if (ctx.inject.take(`artifact-revise:${n.id}`)) review = injectRevise(review, loc, round);
+      review = injectBlocked(ctx, loop, review);
 
       const d = honorWaivers(ctx, loop, snap, decide(review, 'spec'));
-      applyReview(ctx, loop, round, review, d);
+      await applyReview(ctx, loop, round, review, d);
       collectQuestions(
         ctx,
         'spec-reviewer',
@@ -744,7 +952,7 @@ async function artifactLoop(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { 
       if (d.verdict === 'BLOCKED') {
         log.verdict('BLOCKED', d.reason, 'решаешь ты');
         log.loopClose('BLOCKED');
-        const k = await ctx.human.select({
+        const ch = talk(ctx, `blocked:${n.id}`, ['spec-reviewer', 'spec-author'], filesOf(ctx, n), {
           title: `spec-reviewer не может проверить «${n.id}»`,
           context: [d.reason],
           options: [
@@ -755,13 +963,16 @@ async function artifactLoop(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { 
           recommended: 'context',
           rationale: 'ревьюеру не хватает контекста — дать его может только человек',
         });
+        const k = await ask(ctx, ch);
+        s.decisions.push({ at: now(), gate: `blocked:${n.id}`, decision: k, comment: talkComment(ch) });
         if (k === 'stop') throw new Blocked(`артефакт ${n.id}: ${d.reason}`);
         if (k === 'self') {
           if (await ctx.human.waitForEdit(filesOf(ctx, n).map((f) => join(ctx.wt, f)))) reviewOnly = true;
         } else {
           const text = await ctx.human.text('Недостающий контекст', 'используй intent и код репозитория как единственный источник');
           s.intent.clarifications.push({ question: `контекст для ${n.id}: ${d.reason}`, answer: text });
-          toFix = [humanFinding(ctx, n, `Контекст от человека: ${text}`)];
+          const note = talkNote(ch);
+          toFix = [humanFinding(ctx, n, `Контекст от человека: ${text}`), ...(note ? [humanFinding(ctx, n, note)] : [])];
         }
         budget = round + max;
         continue;
@@ -830,6 +1041,16 @@ function artifactOfLocation(ctx: Ctx, location: string): string | undefined {
 
 /** Сквозное ревью: свежий spec-reviewer по всему пакету; после лимита раундов решаешь ты. */
 async function holisticLoop(ctx: Ctx): Promise<void> {
+  const scope: PassScope = { loop: 'holistic', label: 'снять находки сквозного ревью → согласование спеки' };
+  await passLoop(ctx, scope, () => holisticRounds(ctx), (reason) => {
+    const snap = currentDigest(ctx);
+    closeLoop(ctx, scope, reason, snap);
+    Object.assign(st(ctx).spec, { holisticPassed: true, holisticDigest: snap });
+    ctx.store.save();
+  });
+}
+
+async function holisticRounds(ctx: Ctx): Promise<void> {
   const s = st(ctx);
   s.spec.holisticPassed = false;
   const max = ctx.policy.limits.holisticRounds;
@@ -855,14 +1076,23 @@ async function holisticLoop(ctx: Ctx): Promise<void> {
       review = injectRevise(review, `${changeDir(ctx)}/design.md:1`, round);
       review.findings.at(-1)!.artifact = 'design';
     }
+    review = injectBlocked(ctx, 'holistic', review);
     const d = honorWaivers(ctx, 'holistic', snap, decide(review, 'spec'));
-    applyReview(ctx, 'holistic', round, review, d);
+    await applyReview(ctx, 'holistic', round, review, d);
     collectQuestions(ctx, 'spec-reviewer', 'proposal', d.human.map((f) => ({ question: f.problem, why: f.evidence, options: [{ label: f.requiredChange ?? 'Как предлагает ревьюер' }, { label: 'Оставить как есть' }], recommended: 0, rationale: 'решение, которое предложил ревьюер', artifact: f.artifact ?? artifactOfLocation(ctx, f.location) })));
     ctx.store.loop('holistic', round, d.verdict, d.reason);
     if (d.verdict === 'BLOCKED') {
-      log.verdict('BLOCKED', d.reason, 'остановка run');
+      log.verdict('BLOCKED', d.reason, 'решаешь ты');
       log.loopClose('BLOCKED');
-      throw new Blocked(`сквозное ревью: ${d.reason}`);
+      await onBlocker(ctx, {
+        gate: 'blocked:holistic',
+        title: 'Сквозное ревью: spec-reviewer не может проверить пакет',
+        reason: `сквозное ревью: ${d.reason}`,
+        roles: ['spec-reviewer', 'spec-author'],
+        files: ctx.graph.flatMap((n) => filesOf(ctx, n)),
+      });
+      budget = Math.max(budget, round + 1);
+      continue;
     }
     if (d.verdict === 'PASS') {
       s.spec.holisticPassed = true;
@@ -882,7 +1112,8 @@ async function holisticLoop(ctx: Ctx): Promise<void> {
     log.verdict('REVISE', countBySeverity(review.findings), `исправить: ${[...groups.keys()].join(', ')}; downstream — повторное ревью`);
     log.loopClose('REVISE → петли артефактов');
     if (round >= budget) {
-      const k = await ctx.human.select({
+      const files = ctx.graph.flatMap((n) => filesOf(ctx, n));
+      const ch = talk(ctx, 'exhausted:holistic', ['spec-reviewer', 'spec-author'], files, {
         title: `Сквозное ревью: ${round} раунда без PASS`,
         context: blocking.map((f) => `${f.id} [${f.severity}] → ${f.artifact ?? artifactOfLocation(ctx, f.location) ?? '?'}: ${oneLine(f.problem, 110)}`),
         options: [
@@ -897,8 +1128,9 @@ async function holisticLoop(ctx: Ctx): Promise<void> {
             : stuck(history)
               ? 'те же находки повторяются после исправлений — вероятно, спорные; реши сам'
               : 'находки меняются — пакет сходится',
-      });
-      s.decisions.push({ at: now(), gate: 'exhausted:holistic', decision: k });
+      }, { exhausted: true });
+      const k = await ask(ctx, ch);
+      s.decisions.push({ at: now(), gate: 'exhausted:holistic', decision: k, comment: talkComment(ch) });
       if (k === 'stop') throw new Blocked(`сквозное ревью: остановлено человеком после ${round} раундов`);
       if (k === 'waive') {
         waive(ctx, blocking, await ctx.human.text('Причина waiver', 'принято человеком: не блокирует реализацию'), snap);
@@ -907,6 +1139,8 @@ async function holisticLoop(ctx: Ctx): Promise<void> {
         ctx.store.save();
         return;
       }
+      const note = talkNote(ch);
+      if (note) for (const [id, fs] of groups) fs.push(humanFinding(ctx, node(ctx, id), note));
       budget = round + 1;
     }
     // Находки остаются open: следующий раунд сквозного ревью закроет их или повторит.
@@ -922,6 +1156,11 @@ async function stageClarify(ctx: Ctx): Promise<void> {
     return;
   }
   log.phase('ФАЗА СПЕКИ · уточнение intent');
+  const scope: PassScope = { loop: 'clarify', label: 'пропустить уточнения intent → фаза спеки' };
+  await passLoop(ctx, scope, () => clarifyQuestions(ctx), (reason) => closeLoop(ctx, scope, reason, ''));
+}
+
+async function clarifyQuestions(ctx: Ctx): Promise<void> {
   ctx.store.setStep('clarify');
   const res = await callRole(ctx, 'spec-author', clarifyPrompt(base(ctx)), { kind: 'clarify' }, { label: 'clarify', readOnly: true });
   const j = extractJson(res.text) as { questions?: QuestionItem[] } | undefined;
@@ -1067,11 +1306,17 @@ function specFiles(ctx: Ctx): string[] {
 }
 
 /** Изменённые файлы против ACL роли: защита второй линии поверх canUseTool. */
-async function checkBoundary(ctx: Ctx, roleName: string): Promise<void> {
-  const rp = ctx.policy.roles[roleName]!;
+/** Незакоммиченные правки worktree — в пределах ACL роли (или хотя бы одной из ролей). */
+async function checkBoundary(ctx: Ctx, roleName: string | string[]): Promise<void> {
+  const names = [roleName].flat();
   const sub = (g: string) => expandGlob(g, st(ctx).change, ctx.policy);
-  const bad = (await changedPaths(ctx.wt)).filter((p) => !matchesAny(p, rp.write.map(sub)) || matchesAny(p, (rp.denyWrite ?? []).map(sub)));
-  if (bad.length) throw new Blocked(`${roleName} изменил файлы вне своих полномочий: ${bad.join(', ')}`);
+  const allowed = (p: string) =>
+    names.some((n) => {
+      const rp = ctx.policy.roles[n]!;
+      return matchesAny(p, rp.write.map(sub)) && !matchesAny(p, (rp.denyWrite ?? []).map(sub));
+    });
+  const bad = (await changedPaths(ctx.wt)).filter((p) => !allowed(p));
+  if (bad.length) throw new Blocked(`${names.join(' / ')} изменил файлы вне своих полномочий: ${bad.join(', ')}`);
 }
 
 function recordGates(ctx: Ctx, gates: GateResult[]): void {
@@ -1107,7 +1352,23 @@ async function implementWithGates(
   let session = res.sessionId;
   const j = applyResponses(ctx, a.loop, res.text);
   consume(ctx, a.toFix);
-  if (j?.['status'] === 'NEEDS_SPEC_CHANGE') throw new Blocked(`implementer: спеку нужно изменить — ${String(j['specIssue'] ?? 'без описания')}`);
+  if (j?.['status'] === 'NEEDS_SPEC_CHANGE') {
+    const r = await onBlocker(ctx, {
+      gate: `spec-change:${a.label}`,
+      title: `${a.loop}: implementer просит изменить спеку`,
+      reason: `implementer: спеку нужно изменить — ${String(j['specIssue'] ?? 'без описания')}`,
+      roles: ['implementer', 'code-reviewer'],
+      files: specFiles(ctx),
+      retry: 'Дать указание implementer и повторить шаг',
+      ask: 'Указание для implementer',
+    });
+    // Тот же раунд той же сессией: implementer получает указание человека как находку.
+    const toFix = [
+      synthetic(ctx, a.loop, a.round, 'human', { problem: `Указание человека: ${r.text}`, location: a.loop, evidence: 'решение человека' }),
+      ...(r.note ? [synthetic(ctx, a.loop, a.round, 'human', { problem: r.note, location: a.loop, evidence: 'обсуждение решения' })] : []),
+    ];
+    return implementWithGates(ctx, { ...a, toFix, session: res.sessionId });
+  }
 
   const attempts = ctx.policy.limits.gateAttempts;
   let gates: GateResult[] = [];
@@ -1156,7 +1417,8 @@ async function applyExhausted(
   toFix: Finding[],
   history: string[][],
   gateFailed: boolean,
-): Promise<{ kind: 'more' | 'fresh'; hint?: string }> {
+  files: string[],
+): Promise<{ kind: 'more' | 'fresh'; hint?: string; note?: string }> {
   const repeated = exhaustedBefore(ctx, `exhausted:${what}`);
   const [recommended, rationale] = repeated >= 2
     ? (['stop', `лимит исчерпан уже ${repeated + 1}-й раз — смена условий не помогает, нужен разбор человеком`] as const)
@@ -1165,7 +1427,7 @@ async function applyExhausted(
     : stuck(history)
       ? (['hint', 'одни и те же находки два раунда подряд — implementer не сходится без твоего ориентира'] as const)
       : (['more', 'находки меняются от раунда к раунду — implementer сходится'] as const);
-  const k = await ctx.human.select({
+  const ch = talk(ctx, `exhausted:${what}`, ['code-reviewer', 'implementer'], files, {
     title: `${what}: ${round} автоматических раунда без PASS`,
     context: toFix.map((f) => `${f.id} [${f.severity}] ${oneLine(f.problem, 110)}${f.response ? ` — implementer: ${f.response.resolution}` : ''}`),
     options: [
@@ -1177,17 +1439,32 @@ async function applyExhausted(
     ],
     recommended,
     rationale,
-  });
-  st(ctx).decisions.push({ at: now(), gate: `exhausted:${what}`, decision: k });
+  }, { exhausted: true });
+  const k = await ask(ctx, ch);
+  st(ctx).decisions.push({ at: now(), gate: `exhausted:${what}`, decision: k, comment: talkComment(ch) });
   ctx.store.save();
+  const note = talkNote(ch);
   if (k === 'stop') throw new Blocked(`${what}: остановлено человеком после ${round} раундов`);
   if (k === 'spec') throw new Blocked(`${what}: нужна правка замороженной спеки — исправь артефакты и согласуй заново (новый run)`);
-  if (k === 'hint') return { kind: 'more', hint: await ctx.human.text('Указание для implementer', 'Сначала исправь блокирующие находки ревьюера, ничего вне батча не трогай') };
-  return { kind: k };
+  if (k === 'hint') return { kind: 'more', hint: await ctx.human.text('Указание для implementer', 'Сначала исправь блокирующие находки ревьюера, ничего вне батча не трогай'), note };
+  return { kind: k, note };
 }
 
 /** Петля task batch: реализация → гейты → коммит → ревью кода; после лимита решаешь ты. */
 async function batchLoop(ctx: Ctx, b: BatchState): Promise<void> {
+  const all = st(ctx).apply.batches;
+  const next = all.slice(all.indexOf(b) + 1).find((x) => x.status !== 'done');
+  const scope: PassScope = { loop: `batch:${b.id}`, label: `считать батч ${b.id} выполненным → ${next ? `батч ${next.id}` : 'acceptance'}` };
+  await passLoop(ctx, scope, () => batchRounds(ctx, b), async (reason) => {
+    // implementer мог быть прерван посреди записи: его правки — в пределах ACL и в коммите батча.
+    await checkBoundary(ctx, 'implementer');
+    b.head = await commitAll(ctx.wt, `agentflow(${st(ctx).change}): batch ${b.id} пройден решением человека`);
+    Object.assign(b, { status: 'done', passedBy: 'human' });
+    closeLoop(ctx, scope, reason, b.head!);
+  });
+}
+
+async function batchRounds(ctx: Ctx, b: BatchState): Promise<void> {
   const loop = `batch:${b.id}`;
   const max = ctx.policy.limits.batchRounds;
   const batch: TaskBatch = { id: b.id, title: b.title, tasks: b.tasks };
@@ -1199,6 +1476,7 @@ async function batchLoop(ctx: Ctx, b: BatchState): Promise<void> {
   let prevHead = b.base;
   let budget = max;
   let fresh = false;
+  let lastDiff: string | undefined;
   for (let round = 1; ; round++) {
     b.rounds++;
     ctx.store.save();
@@ -1234,6 +1512,7 @@ async function batchLoop(ctx: Ctx, b: BatchState): Promise<void> {
       const diffText = await diff(ctx.wt, b.base, headSha);
       const diffPath = join(ctx.contextsDir, `${label}.diff`);
       writeFileSync(diffPath, diffText || '(пустой diff)\n');
+      lastDiff = diffPath;
       let fixDiffPath: string | undefined;
       if (round > 1 && prevHead !== headSha) {
         fixDiffPath = join(ctx.contextsDir, `${label}-fix.diff`);
@@ -1269,15 +1548,30 @@ async function batchLoop(ctx: Ctx, b: BatchState): Promise<void> {
       if ((await head(ctx.wt)) !== headSha || (await changedPaths(ctx.wt)).length) throw new Blocked(`batch ${b.id}: код изменился во время ревью — вердикт недействителен`);
       if (ctx.inject.repeat(`batch-stuck:${b.id}`, max)) review = injectRevise(review, `${diffPath}:1`, round, 'INJ-STUCK');
       else if (ctx.inject.take(`batch-revise:${b.id}`)) review = injectRevise(review, `${diffPath}:1`, round);
+      review = injectBlocked(ctx, loop, review);
 
       const d = decide(review, 'apply');
-      applyReview(ctx, loop, round, review, d);
+      await applyReview(ctx, loop, round, review, d);
       ctx.store.loop(loop, round, d.verdict, d.reason);
       const counts = countBySeverity(review.findings);
       if (d.verdict === 'BLOCKED') {
-        log.verdict('BLOCKED', d.reason, 'остановка run');
+        log.verdict('BLOCKED', d.reason, 'решаешь ты');
         log.loopClose('BLOCKED');
-        throw new Blocked(`batch ${b.id}: ${d.reason}`);
+        const r = await onBlocker(ctx, {
+          gate: `blocked:batch ${b.id}`,
+          title: `batch ${b.id}: code-reviewer не может принять батч`,
+          reason: `batch ${b.id}: ${d.reason}`,
+          roles: ['code-reviewer', 'implementer'],
+          files: [diffPath],
+        });
+        // Следующий раунд: implementer с контекстом человека, затем гейты и ревью.
+        toFix = [
+          synthetic(ctx, loop, round, 'human', { problem: `Контекст от человека: ${r.text}`, location: 'batch', evidence: 'решение человека' }),
+          ...(r.note ? [synthetic(ctx, loop, round, 'human', { problem: r.note, location: 'batch', evidence: 'обсуждение решения' })] : []),
+        ];
+        prevHead = headSha;
+        budget = Math.max(budget, round + 1);
+        continue;
       }
       if (d.verdict === 'PASS') {
         b.status = 'done';
@@ -1297,10 +1591,11 @@ async function batchLoop(ctx: Ctx, b: BatchState): Promise<void> {
       prevHead = headSha;
     }
     if (round < budget) continue;
-    const ex = await applyExhausted(ctx, `batch ${b.id}`, round, toFix, history, gateFailed);
+    const ex = await applyExhausted(ctx, `batch ${b.id}`, round, toFix, history, gateFailed, lastDiff ? [lastDiff] : []);
     budget = round + 1;
     if (ex.kind === 'fresh') fresh = true;
     if (ex.hint) toFix = [...toFix, synthetic(ctx, loop, round, 'human', { problem: `Указание человека: ${ex.hint}`, location: 'batch', evidence: 'решение человека' })];
+    if (ex.note) toFix = [...toFix, synthetic(ctx, loop, round, 'human', { problem: ex.note, location: 'batch', evidence: 'обсуждение решения' })];
   }
 }
 
@@ -1320,7 +1615,8 @@ async function stageApply(ctx: Ctx): Promise<void> {
   }
   log.info(`батчей: ${s.apply.batches.length} — ${s.apply.batches.map((b) => `${b.id}. ${b.title}${b.status === 'done' ? ' (уже выполнен)' : ''}`).join('; ')}`);
   for (const b of s.apply.batches) if (b.status !== 'done') await batchLoop(ctx, b);
-  log.info(c.green('все батчи PASS → acceptance'));
+  const byHuman = s.apply.batches.filter((b) => b.passedBy === 'human').map((b) => b.id);
+  log.info(byHuman.length ? c.yellow(`все батчи закрыты, решением человека: ${byHuman.join(', ')} → acceptance`) : c.green('все батчи PASS → acceptance'));
 }
 
 // ───────────────────────────── acceptance и финал ─────────────────────────────
@@ -1340,8 +1636,8 @@ async function runAcceptance(ctx: Ctx, extra: Finding[], label: string): Promise
   const testPlan = tp ? filesOf(ctx, tp).join(', ') : undefined;
   const acc = ctx.policy.acceptance;
   let prompt = acceptancePrompt(base(ctx), { reqs, specFiles: specFiles(ctx), testPlan, snapshotId: snap, rubric, dir: acc.dir, framework: acc.framework, shell: ctx.policy.roles['acceptance-tester']?.shell ?? [] });
-  if (extra.length) prompt += `\n\n## Находки финального ревью к твоим тестам\n${extra.map((f) => `- ${f.id} ${f.location}: ${f.problem}`).join('\n')}\nИсправь тесты, не ослабляя ожидаемое поведение.`;
-  const review = await callReviewer(
+  if (extra.length) prompt += `\n\n## Находки к твоим тестам (финальное ревью или решение человека)\n${extra.map((f) => `- ${f.id} ${f.location}: ${f.problem}`).join('\n')}\nИсправь тесты, не ослабляя ожидаемое поведение.`;
+  let review = await callReviewer(
     ctx,
     'acceptance-tester',
     prompt,
@@ -1353,26 +1649,59 @@ async function runAcceptance(ctx: Ctx, extra: Finding[], label: string): Promise
   const commit = await commitAll(ctx.wt, `agentflow(${st(ctx).change}): acceptance-тесты`);
   const evidence = join(ctx.wt, ctx.policy.acceptance.dir, 'evidence');
   if (existsSync(evidence)) cpSync(evidence, join(ctx.runDir, 'evidence'), { recursive: true });
+  review = injectBlocked(ctx, 'acceptance', review);
   const d = decide(review, 'apply');
-  applyReview(ctx, 'acceptance', 1, review, d);
+  await applyReview(ctx, 'acceptance', 1, review, d);
   ctx.store.loop('acceptance', 1, d.verdict, d.reason);
   writeFileSync(join(ctx.contextsDir, 'acceptance-report.json'), JSON.stringify(review, null, 2));
   st(ctx).acceptance = { status: d.verdict, snapshot: snap, report: review };
   ctx.store.save();
   const passed = review.checks.filter((x) => x.result === 'PASS').length;
-  log.verdict(d.verdict, `сценариев PASS ${passed}/${review.checks.length} · коммит ${commit.slice(0, 10)}`, d.verdict === 'BLOCKED' ? 'остановка run' : 'полные гейты и финальное ревью');
-  if (d.verdict === 'BLOCKED') throw new Blocked(`acceptance: ${d.reason}`);
-  return d;
+  log.verdict(d.verdict, `сценариев PASS ${passed}/${review.checks.length} · коммит ${commit.slice(0, 10)}`, d.verdict === 'BLOCKED' ? 'решаешь ты' : 'полные гейты и финальное ревью');
+  if (d.verdict !== 'BLOCKED') return d;
+  const r = await onBlocker(ctx, {
+    gate: `blocked:${label}`,
+    title: 'Acceptance: acceptance-tester не может проверить change',
+    reason: `acceptance: ${d.reason}`,
+    roles: ['acceptance-tester'],
+    files: [join(ctx.contextsDir, 'acceptance-report.json'), ctx.policy.acceptance.dir],
+  });
+  // acceptance-tester снова, с контекстом человека как находкой к тестам.
+  const human = [synthetic(ctx, 'acceptance', 1, 'human', { problem: `Контекст от человека: ${r.text}${r.note ? `\n${r.note}` : ''}`, location: ctx.policy.acceptance.dir, evidence: 'решение человека' })];
+  return runAcceptance(ctx, [...extra, ...human], `${label}-ctx`);
 }
 
 async function stageAcceptance(ctx: Ctx): Promise<void> {
   log.phase('ACCEPTANCE · acceptance-tester по замороженной спеке');
-  await runAcceptance(ctx, [], 'acceptance');
+  const scope: PassScope = { loop: 'acceptance', label: 'считать acceptance пройденным → финальное ревью' };
+  await passLoop(
+    ctx,
+    scope,
+    async () => void (await runAcceptance(ctx, [], 'acceptance')),
+    async (reason) => {
+      const s = st(ctx);
+      await checkBoundary(ctx, 'acceptance-tester');
+      await commitAll(ctx.wt, `agentflow(${s.change}): acceptance пройден решением человека`);
+      s.acceptance = { status: 'PASSED_BY_HUMAN', snapshot: s.spec.freeze!.digest, report: s.acceptance?.report ?? null };
+      closeLoop(ctx, scope, reason, s.spec.freeze!.digest);
+    },
+  );
 }
 
 /** Финальное ревью: полные гейты → ревью с трассировкой; ≤ finalFixRounds раундов исправлений. */
 async function stageFinal(ctx: Ctx): Promise<void> {
   log.phase('ФИНАЛ · полные гейты и финальное ревью трассировки');
+  const scope: PassScope = { loop: 'final', label: 'Принять без финального ревью → отчёт приёмки' };
+  await passLoop(ctx, scope, () => finalRounds(ctx), async (reason) => {
+    const s = st(ctx);
+    await checkBoundary(ctx, ['implementer', 'acceptance-tester']);
+    const sha = await commitAll(ctx.wt, `agentflow(${s.change}): финальное ревью пройдено решением человека`);
+    s.final = { status: 'PASSED_BY_HUMAN', snapshot: sha, rounds: s.loops.filter((l) => l.loop === 'final').length, traceability: [] };
+    closeLoop(ctx, scope, reason, sha);
+  });
+}
+
+async function finalRounds(ctx: Ctx): Promise<void> {
   const s = st(ctx);
   const maxFix = ctx.policy.limits.finalFixRounds;
   const loop = 'final';
@@ -1418,28 +1747,42 @@ async function stageFinal(ctx: Ctx): Promise<void> {
       `final-r${round}-review`,
     );
     if (ctx.inject.take('final-revise')) review = injectRevise(review, `${diffPath}:1`, round);
+    review = injectBlocked(ctx, loop, review);
     const d = decide(review, 'apply');
-    applyReview(ctx, loop, round, review, d);
+    await applyReview(ctx, loop, round, review, d);
     ctx.store.loop(loop, round, d.verdict, d.reason);
+    let blocking: Finding[];
     if (d.verdict === 'BLOCKED') {
-      log.verdict('BLOCKED', d.reason, 'остановка run');
-      log.loopClose('BLOCKED');
-      throw new Blocked(`финальное ревью: ${d.reason}`);
-    }
-    if (d.verdict === 'PASS') {
+      log.verdict('BLOCKED', d.reason, 'решаешь ты');
+      const r = await onBlocker(ctx, {
+        gate: 'blocked:final',
+        title: 'Финальное ревью: code-reviewer не может принять change',
+        reason: `финальное ревью: ${d.reason}`,
+        roles: ['code-reviewer', 'implementer'],
+        files: [diffPath],
+      });
+      // Раунд исправлений по находке человека, затем полные гейты и ревью.
+      blocking = [
+        synthetic(ctx, loop, round, 'human', { problem: `Контекст от человека: ${r.text}`, location: 'final', evidence: 'решение человека' }),
+        ...(r.note ? [synthetic(ctx, loop, round, 'human', { problem: r.note, location: 'final', evidence: 'обсуждение решения' })] : []),
+      ];
+      budget = Math.max(budget, round + 1);
+    } else if (d.verdict === 'PASS') {
       s.final = { status: 'PASS', snapshot: snap, rounds: round, traceability: review.traceability ?? [] };
       ctx.store.save();
       log.verdict('PASS', countBySeverity(review.findings), 'отчёт приёмки');
       log.loopClose('финальное ревью пройдено');
       return;
+    } else {
+      blocking = stored(ctx, loop, d.blocking);
+      history.push(blocking.map((f) => f.id));
     }
-    const blocking = stored(ctx, loop, d.blocking);
-    history.push(blocking.map((f) => f.id));
-    if (round >= budget) {
+    if (d.verdict !== 'BLOCKED' && round >= budget) {
       log.verdict('REVISE', countBySeverity(review.findings), 'автоматические раунды исправлений кончились');
-      const ex = await applyExhausted(ctx, 'финальное ревью', round, blocking, history, !gates.every((g) => g.ok));
+      const ex = await applyExhausted(ctx, 'финальное ревью', round, blocking, history, !gates.every((g) => g.ok), [diffPath]);
       budget = round + 1;
       hint = ex.hint;
+      if (ex.note) blocking.push(synthetic(ctx, loop, round, 'human', { problem: ex.note, location: 'final', evidence: 'обсуждение решения' }));
     }
     if (hint) blocking.push(synthetic(ctx, loop, round, 'human', { problem: `Указание человека: ${hint}`, location: 'final', evidence: 'решение человека' }));
     hint = undefined;
@@ -1482,12 +1825,18 @@ async function stageHumanAcceptance(ctx: Ctx): Promise<void> {
   const passed = acc?.checks?.filter((x) => x.result === 'PASS').length ?? 0;
   const total = acc?.checks?.length ?? 0;
   const mc = manualCheck(ctx);
+  const byHuman = (loop: string) => s.proceeded.find((p) => p.loop === loop);
+  const fin = byHuman('final');
+  const finalLine = fin ? `финальное ревью пройдено решением человека: ${fin.reason}` : `финальное ревью ${s.final?.status ?? '—'}`;
+  const accBy = byHuman('acceptance');
+  const accLine = accBy ? `acceptance пройден решением человека: ${accBy.reason}` : `${passed}/${total} acceptance-сценариев прошли`;
   const k = await ctx.human.select({
     title: 'Принять change?',
     context: [
       `отчёт: ${join(ctx.runDir, 'ACCEPTANCE.md')}`,
       `код для ручного теста: ${ctx.wt} (ветка ${s.branch})`,
-      `финальное ревью ${s.final?.status ?? '—'} · acceptance ${passed}/${total} сценариев PASS`,
+      `${finalLine} · ${accBy ? accLine : `acceptance ${passed}/${total} сценариев PASS`}`,
+      ...(s.proceeded.length ? [`пройдено решением человека: ${s.proceeded.map((p) => p.loop).join(', ')} — см. ACCEPTANCE.md`] : []),
       ...(mc ? [mc.replace(/\n+/g, ' · ')] : []),
     ],
     options: [
@@ -1495,7 +1844,7 @@ async function stageHumanAcceptance(ctx: Ctx): Promise<void> {
       { key: 'reject', label: 'Отклонить', description: 'run завершается со статусом rejected, причина — в отчёт' },
     ],
     recommended: 'accept',
-    rationale: `финальное ревью PASS, ${passed}/${total} acceptance-сценариев прошли — осталась твоя ручная проверка`,
+    rationale: `${fin ? finalLine : 'финальное ревью PASS'}, ${accLine} — осталась твоя ручная проверка`,
   });
   const comment = k === 'reject' ? await ctx.human.text('Причина отказа', 'не прошла ручная проверка') : undefined;
   s.decisions.push({ at: now(), gate: 'acceptance', decision: k === 'accept' ? 'accepted' : 'rejected', comment });
@@ -1601,6 +1950,7 @@ function makeCtx(root: string, runDir: string, store: RunStore, policy: Policy, 
     rt,
     human: new Human(s.options.autoApprove),
     inject: new Injector(store),
+    scopes: new Scopes(),
     graph: [],
     tracked: new Set(),
   };
@@ -1763,6 +2113,8 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
     models: {},
     usage: {},
     decisions: [],
+    proceeded: [],
+    dialogs: {},
     injected: [],
   };
   store.save();

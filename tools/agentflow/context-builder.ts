@@ -203,7 +203,63 @@ const DISCUSS_ANSWER_CAP = 1500;
 /** Переписка обсуждения вопроса для промптов следующих ролей и находки человека. */
 export function formatDiscussion(turns: DiscussTurn[], indent = '', cap = DISCUSS_ANSWER_CAP): string {
   const cut = (t: string) => (t.length > cap ? t.slice(0, cap) + ' …' : t);
-  return [`${indent}Обсуждение (${turns.length}):`, ...turns.map((t) => `${indent}- Человек: ${t.message}\n${indent}  Роль: ${cut(t.answer)}`)].join('\n');
+  return [`${indent}Обсуждение (${turns.length}):`, ...turns.map((t) => `${indent}- Человек: ${t.message}\n${indent}  ${t.role ?? 'Роль'}: ${cut(t.answer)}`)].join('\n');
+}
+
+export interface DecisionDiscussInput {
+  /** Гейт решения: exhausted:batch 2, blocked:final. */
+  gate: string;
+  role: string;
+  title: string;
+  /** Строки над меню: находки, причина вердикта. */
+  context: string[];
+  options: { label: string; description?: string; disabled?: string }[];
+  recommended: string;
+  rationale: string;
+  /** Файлы петли: артефакт, diff батча или финала, отчёт acceptance (относительно worktree или абсолютные). */
+  files: string[];
+  history: DiscussTurn[];
+  message: string;
+}
+
+/** Реплика обсуждения решения человека: роль объясняет, но не выбирает и ничего не меняет. */
+export function decisionDiscussPrompt(ctx: BaseCtx, d: DecisionDiscussInput): string {
+  return [
+    header(`обсуждение решения ${d.gate}`, ctx),
+    '',
+    `Человек решает, что делать с петлёй конвейера, и хочет обсудить это с тобой (${d.role}), прежде чем выбрать.`,
+    'Этот шаг только на чтение: файлов не создавай и не меняй. Читать код, спеки, артефакты и diff можно.',
+    '',
+    intentBlock(ctx),
+    '',
+    `## Решение: ${d.title}`,
+    '',
+    d.context.length ? d.context.map((l) => `- ${l}`).join('\n') : '(без контекста)',
+    '',
+    '### Варианты',
+    d.options.map((o) => `- ${o.label}${o.description ? ` — ${o.description}` : ''}${o.disabled ? ` (недоступен: ${o.disabled})` : ''}${o.label === d.recommended ? ' (рекомендует контроллер)' : ''}`).join('\n'),
+    `\nПочему контроллер рекомендует «${d.recommended}»: ${d.rationale}`,
+    d.files.length ? `\n## Файлы петли (прочитай сами)\n${d.files.map((f) => `- ${f}`).join('\n')}` : '',
+    '',
+    '## Обсуждение до сих пор',
+    d.history.length ? d.history.map((t, i) => `### Реплика ${i + 1}\nЧеловек: ${t.message}\n\n${t.role === d.role ? 'Ты' : (t.role ?? 'Роль')}: ${t.answer}`).join('\n\n') : '(это первая реплика)',
+    '',
+    '## Новая реплика человека',
+    '',
+    d.message,
+    '',
+    '## Как отвечать',
+    'Ответь по существу: насколько серьёзны находки, что даст каждый вариант, ссылки на файлы (путь:строка), если помогают.',
+    'Не выбирай за человека и не меняй варианты. Ответ — текстом или одним JSON-блоком `{"answer":"ответ человеку"}`.',
+  ]
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
+/** Ответ реплики обсуждения решения: только текст, варианты решения роль не меняет. */
+export function parseDecisionReply(text: string): { answer: string } | { error: string } {
+  const r = parseDiscussReply(text);
+  return 'error' in r ? r : { answer: r.answer };
 }
 
 export interface DiscussInput {

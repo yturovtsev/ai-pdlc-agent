@@ -279,6 +279,11 @@ async function mockSession(rt: RoleRuntime, call: RoleCall, session: string, tra
       });
       break;
     }
+    case 'discuss-decision': {
+      const message = call.prompt.split('## Новая реплика человека')[1]?.split('## Как отвечать')[0]?.trim() ?? '';
+      text = json({ answer: `mock ${role.name}: на реплику «${message}» — находки из контекста решения блокируют петлю; выбор за тобой.` });
+      break;
+    }
     case 'author': {
       for (const [file, content] of Object.entries(ARTIFACTS[meta.artifact ?? ''] ?? {})) write(`${meta.changeDir}/${file}`, content);
       const responses = (call.prompt.match(/^- ([A-Z]+-\d+) \[/gm) ?? []).map((m) => ({ id: m.slice(2, -2), resolution: 'fixed', evidence: 'mock: перечитано по рубрике' }));

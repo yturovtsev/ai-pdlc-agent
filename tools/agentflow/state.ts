@@ -35,11 +35,13 @@ export interface QuestionOption {
   description?: string;
 }
 
-/** Реплика обсуждения вопроса: текст человека и ответ роли. */
+/** Реплика обсуждения вопроса или решения: текст человека и ответ роли. */
 export interface DiscussTurn {
   at: string;
   message: string;
   answer: string;
+  /** Кто ответил — в обсуждении решения собеседников бывает двое. */
+  role?: string;
   /** Роль заменила варианты или рекомендацию в этой реплике. */
   optionsChanged?: boolean;
 }
@@ -87,6 +89,8 @@ export interface ArtifactState {
   rounds: number;
   snapshot?: string;
   authorSession?: string;
+  /** Принят решением человека «Всё равно перейти дальше», без PASS ревьюера. */
+  passedBy?: 'human';
 }
 
 export interface BatchState {
@@ -98,6 +102,18 @@ export interface BatchState {
   rounds: number;
   base?: string;
   head?: string;
+  /** Закрыт решением человека «Всё равно перейти дальше»: задачи не отмечаются. */
+  passedBy?: 'human';
+}
+
+/** Петля, пройденная решением человека «Всё равно перейти дальше». */
+export interface Proceeded {
+  at: string;
+  loop: string;
+  label: string;
+  reason: string;
+  /** Id находок, снятых вместе с переходом. */
+  findings: string[];
 }
 
 export type Stage =
@@ -163,6 +179,10 @@ export interface RunState {
   models: Record<string, { requested: string; effort?: string; actual: string[] }>;
   usage: Record<string, { calls: number; turns: number; inputTokens: number; outputTokens: number; seconds: number }>;
   decisions: { at: string; gate: string; decision: string; comment?: string }[];
+  /** Переходы дальше решением человека. */
+  proceeded: Proceeded[];
+  /** Переписка обсуждения диалогов решений: ключ — гейт и номер показа («exhausted:batch 2#1»). */
+  dialogs: Record<string, DiscussTurn[]>;
   injected: string[];
   /** Счётчики повторяющихся точек fault injection (…-stuck). */
   injectCounts?: Record<string, number>;
@@ -184,6 +204,9 @@ export class RunStore {
 
   load(): RunState {
     this.state = JSON.parse(readFileSync(this.statePath, 'utf8')) as RunState;
+    // state.json прогонов до перехода дальше и обсуждения решений.
+    this.state.proceeded ??= [];
+    this.state.dialogs ??= {};
     return this.state;
   }
 

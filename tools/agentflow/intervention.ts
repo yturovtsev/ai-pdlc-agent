@@ -5,8 +5,8 @@ import type { TrackedDenial, TrackerStep } from './session-tracker.ts';
 import { clock } from './status-panel.ts';
 
 export type InterventionKind = 'stall' | 'acl-streak';
-/** woke — диалог закрыт без выбора: сессия ожила сама. */
-export type InterventionDecision = 'wait' | 'retry' | 'stop' | 'woke';
+/** woke — диалог закрыт без выбора: сессия ожила сама; proceed — «Всё равно перейти дальше» (петлю проходит контроллер). */
+export type InterventionDecision = 'wait' | 'retry' | 'stop' | 'proceed' | 'woke';
 export type InterventionChoice = Exclude<InterventionDecision, 'woke'>;
 
 export interface Intervention {
@@ -20,7 +20,7 @@ export interface Intervention {
 
 export interface InterventionOutcome {
   kind: InterventionKind;
-  decision: 'retry' | 'stop';
+  decision: 'retry' | 'stop' | 'proceed';
   denials: TrackedDenial[];
   message: string;
 }
@@ -66,6 +66,7 @@ export function recommendIntervention(ev: Intervention, nth: number): { choice: 
   return { choice: 'stop', rationale: `простой №${nth} в этом шаге: повтор тоже завис, причина устойчивая (CLI, модель, гейт) — её нужно устранить` };
 }
 
+/** Переход дальше сюда не входит: его добавляет диалог по текущей петле, рекомендацией он не бывает. */
 export const INTERVENTION_OPTIONS: { key: InterventionChoice; label: string; description: string }[] = [
   { key: 'wait', label: 'Ждать дальше', description: 'сессия продолжает работать, сторож отсчитывает порог заново' },
   { key: 'retry', label: 'Прервать сессию и повторить шаг', description: 'та же задача новой сессией роли (попытка серии повторов)' },

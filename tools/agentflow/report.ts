@@ -43,9 +43,19 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
     '| --- | --- | --- |',
     ...loopSummary(s).map((r) => `| ${r.loop} | ${r.rounds} | ${r.path} |`),
     '',
+    '## Пройдено решением человека',
+    '',
+    (s.proceeded ?? []).length
+      ? s.proceeded.map((p) => `- ${p.at} · ${p.loop}: ${p.label} — причина: ${p.reason}${p.findings.length ? ` · сняты находки: ${p.findings.join(', ')}` : ''}`).join('\n')
+      : '(нет)',
+    '',
     '## Трассировка требований (финальное ревью)',
     '',
-    trace.length ? '| Требование | Сценарий | Код | Тесты | Evidence | Итог |\n| --- | --- | --- | --- | --- | --- |' : '(финальное ревью не пройдено)',
+    trace.length
+      ? '| Требование | Сценарий | Код | Тесты | Evidence | Итог |\n| --- | --- | --- | --- | --- | --- |'
+      : s.final?.status === 'PASSED_BY_HUMAN'
+        ? '(финальное ревью пройдено решением человека — трассировки нет)'
+        : '(финальное ревью не пройдено)',
     ...trace.map((t) => `| ${t.requirementId} | ${t.scenarioId ?? ''} | ${(t.code ?? []).join(', ')} | ${(t.tests ?? []).join(', ')} | ${t.evidence ?? ''} | ${t.result} |`),
     '',
     '## Acceptance-сценарии',
