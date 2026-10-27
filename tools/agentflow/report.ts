@@ -3,7 +3,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { c } from './log.ts';
 import type { RunState } from './state.ts';
-import { skippedSteps } from './run-settings.ts';
+import { skippedSteps, specOnly } from './run-settings.ts';
 import { short } from './util.ts';
 
 export function loopSummary(s: RunState): { loop: string; rounds: number; path: string }[] {
@@ -41,6 +41,7 @@ function modeSection(s: RunState): string[] {
 
 export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: string): string {
   const path = join(runDir, 'ACCEPTANCE.md');
+  const specRun = specOnly(s.options?.skip ?? []);
   const trace = (s.final?.traceability ?? []) as { requirementId: string; scenarioId?: string; code?: string[]; tests?: string[]; evidence?: string; result: string }[];
   const acc = s.acceptance?.report as { checks?: { id: string; result: string; note?: string }[] } | undefined;
   const logged = s.findings.filter((f) => f.status === 'logged');
@@ -77,13 +78,15 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
     '',
     '## Трассировка требований (финальное ревью)',
     '',
-    trace.length
-      ? '| Требование | Сценарий | Код | Тесты | Evidence | Итог |\n| --- | --- | --- | --- | --- | --- |'
-      : s.final?.status === 'PASSED_BY_HUMAN'
-        ? '(финальное ревью пройдено решением человека — трассировки нет)'
-        : s.final?.status === 'GATES_ONLY'
-          ? '(ревью кода выключено в настройках run — финал по полным гейтам, трассировки нет)'
-          : '(финальное ревью не пройдено)',
+    specRun
+      ? '(implementer выключен — run только со спекой, кода и трассировки нет)'
+      : trace.length
+        ? '| Требование | Сценарий | Код | Тесты | Evidence | Итог |\n| --- | --- | --- | --- | --- | --- |'
+        : s.final?.status === 'PASSED_BY_HUMAN'
+          ? '(финальное ревью пройдено решением человека — трассировки нет)'
+          : s.final?.status === 'GATES_ONLY'
+            ? '(ревью кода выключено в настройках run — финал по полным гейтам, трассировки нет)'
+            : '(финальное ревью не пройдено)',
     ...trace.map((t) => `| ${t.requirementId} | ${t.scenarioId ?? ''} | ${(t.code ?? []).join(', ')} | ${(t.tests ?? []).join(', ')} | ${t.evidence ?? ''} | ${t.result} |`),
     '',
     '## Acceptance-сценарии',
@@ -117,7 +120,7 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
     '',
     '## Ручная проверка',
     '',
-    manualCheck || `cd ${s.worktree} && npm --prefix ${s.repoRoot} run lint`,
+    manualCheck || (specRun ? `прочитай спеку: ${s.worktree}/openspec/changes/${s.change}; код — agentflow run --change ${s.change} после merge ветки` : `cd ${s.worktree} && npm --prefix ${s.repoRoot} run lint`),
     '',
     '## Дальше (вне конвейера)',
     '',

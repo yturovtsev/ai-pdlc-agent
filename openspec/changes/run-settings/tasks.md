@@ -24,3 +24,9 @@
 ## 5. Документация
 
 - [x] 5.1 README: диалог настроек при `run`, флаг `--skip-roles`, что пропускается при каждой выключенной роли, inject выключенной роли не действует. AGENTS.md: `run-settings.ts` в карте, решение «выключить можно только ревьюеров и тестера». Проверка: флаги в README совпадают с USAGE, `npm run lint`.
+
+## 6. Run только со спекой и флаги в меню
+
+- [x] 6.1 `run-settings.ts`: обязателен только spec-author, `normalizeSkip` (без implementer — и роли кода), `specOnly`, пункты «Автопилот до приёмки», «Панель статуса», «Мышь» с подсказками, `validateMenu`. `human.ts`: `checklist` с `validate`, подсказка пункта. Проверка: unit-тесты — разбор `implementer`, ошибка на `spec-author`, пункты меню и `AGENTFLOW_NO_PANEL`, два автопилота, `validate` уходит в `checkbox`.
+- [x] 6.2 `controller.ts` по design (решение 8): пропуск apply, acceptance, final; диалог freeze; приёмка спеки и парковка; archive без `openspec archive`; галочки панели и мыши. `report.ts`: трассировка и ручная проверка run только со спекой. Проверка: в копии kit `--mock --auto-approve --skip-roles implementer` — код 0, change не в архиве; после merge `run --change add-slugify --mock --auto-approve` — код 0; `--auto-until-review --skip-roles implementer` — `awaiting-review`; меню в псевдотерминале не подтверждается с двумя автопилотами; `--inject all` — код 0.
+- [x] 6.3 README и AGENTS.md: состав меню, run только со спекой.

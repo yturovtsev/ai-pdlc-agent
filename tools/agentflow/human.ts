@@ -76,7 +76,7 @@ export interface PromptIO {
     context?: { signal?: AbortSignal },
   ): Promise<string>;
   input(config: { message: string }): Promise<string>;
-  checkbox(config: { message: string; pageSize?: number; choices: CheckItem[] }): Promise<string[]>;
+  checkbox(config: { message: string; pageSize?: number; choices: CheckItem[]; validate?: (choices: readonly { value: string }[]) => true | string }): Promise<string[]>;
   tty(): boolean;
 }
 
@@ -86,6 +86,8 @@ export interface CheckItem {
   name: string;
   checked: boolean;
   disabled?: string;
+  /** Подсказка под меню для подсвеченного пункта. */
+  description?: string;
 }
 
 const INQUIRER: PromptIO = {
@@ -261,11 +263,13 @@ export class Human {
   }
 
   /** Меню с галочками (пробел — отметить, Enter — подтвердить); автопилот берёт исходные галочки. */
-  async checklist(title: string, items: CheckItem[]): Promise<string[]> {
+  /** `validate` — проверка выбора: текст ошибки не даёт подтвердить меню. */
+  async checklist(title: string, items: CheckItem[], validate?: (values: readonly string[]) => true | string): Promise<string[]> {
     const initial = items.filter((i) => i.checked).map((i) => i.value);
     if (this.auto) return initial;
     this.ensureTty(title);
-    const picked = await paused(() => this.io.checkbox({ message: title, pageSize: Math.max(items.length, 7), choices: items }));
+    const check = validate && ((choices: readonly { value: string }[]) => validate(choices.map((ch) => ch.value)));
+    const picked = await paused(() => this.io.checkbox({ message: title, pageSize: Math.max(items.length, 7), choices: items, ...(check ? { validate: check } : {}) }));
     // Недоступные отмеченные пункты терминал может не вернуть: они остаются, как были.
     return [...new Set([...picked, ...items.filter((i) => i.disabled && i.checked).map((i) => i.value)])];
   }
