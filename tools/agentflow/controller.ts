@@ -41,7 +41,7 @@ import { askHuman, blocker, PassLoop, Scopes, type PassScope } from './dialogs.t
 import { Human, replies, type Choice, type Discuss } from './human.ts';
 import { INJECT_HELP, Injector, parseInject } from './inject.ts';
 import { aclRetryAddendum, diagnose, INTERVENTION_OPTIONS, recommendIntervention, type InterventionChoice } from './intervention.ts';
-import { c, log, setLogSink } from './log.ts';
+import { c, configureThinking, log, parseThinkingChars, setLogSink, THINKING_CHARS } from './log.ts';
 import { runMock } from './mock.ts';
 import { mouse, mouseEnabled } from './mouse.ts';
 import { OpenSpec, topoOrder, type ArtifactNode } from './openspec.ts';
@@ -2054,6 +2054,7 @@ function makeCtx(root: string, runDir: string, store: RunStore, policy: Policy, 
   const gatesDir = join(runDir, 'gates');
   for (const d of [contextsDir, reviewsDir, gatesDir, join(runDir, 'evidence')]) mkdirSync(d, { recursive: true });
   setLogSink((e) => store.append(e));
+  configureThinking({ dir: join(runDir, 'thinking') });
   const rt: RoleRuntime = {
     policy,
     change: s.change,
@@ -2481,8 +2482,10 @@ const USAGE = `agentflow — конвейер spec-driven разработки �
                          (в TTY без --auto-approve, --auto-until-review и --skip-roles — меню настроек с галочками:
                          роли, уточнение intent, оба автопилота, панель, мышь)
       --no-panel         без панели статуса внизу терминала (или AGENTFLOW_NO_PANEL=1)
-      --no-mouse         без режима мыши: клик по «▸ размышляет» не раскрывает текст (или AGENTFLOW_NO_MOUSE=1)
-  agentflow resume <run-id> [--no-panel] [--no-mouse]
+      --no-mouse         без режима мыши: клик по размышлению не раскрывает текст (или AGENTFLOW_NO_MOUSE=1)
+      --thinking-chars <N>  сколько символов размышления видно сразу, дальше — «Развернуть»
+                         (по умолчанию ${THINKING_CHARS}, 0 — только строка «размышляет»; или AGENTFLOW_THINKING_CHARS)
+  agentflow resume <run-id> [--no-panel] [--no-mouse] [--thinking-chars <N>]
   agentflow status [<run-id>]
   agentflow agents [<run-id>]              список субагентов: роль, сессия, модель из ответа API
   agentflow smoke                          smoke-тесты корпоративного CLI в этом репозитории
@@ -2501,6 +2504,7 @@ async function main(): Promise<void> {
       'skip-roles': { type: 'string' },
       'no-panel': { type: 'boolean', default: false },
       'no-mouse': { type: 'boolean', default: false },
+      'thinking-chars': { type: 'string' },
       'agentflow-schema': { type: 'boolean', default: false },
       repo: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
@@ -2514,6 +2518,7 @@ async function main(): Promise<void> {
   ROOT = await resolveRepo(values.repo);
   NO_PANEL = values['no-panel'];
   NO_MOUSE = values['no-mouse'];
+  configureThinking({ chars: parseThinkingChars(values['thinking-chars'], process.env) });
   if (cmd === 'init') {
     await initRepo(values['agentflow-schema']);
   } else if (cmd === 'changes') {

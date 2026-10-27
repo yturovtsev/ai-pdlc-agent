@@ -1,5 +1,7 @@
 // Консольный рендер конвейера: фазы, петли с номером раунда, запуск субагентов,
 // их вызовы инструментов, решения ACL, гейты и вердикты. Всё дублируется в events.jsonl.
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { AclCategory, AclDecision } from './roles.ts';
 import { screen, textWidth, wrapText, type ThinkingView } from './screen.ts';
 import type { DenialGroup } from './session-tracker.ts';
@@ -42,23 +44,81 @@ export function setLogSink(fn: Sink): void {
 // параллельным выводом работающей сессии. events.jsonl пишется сразу.
 const HELD_MAX = 2000;
 let held = 0;
-let buffer: { s: string; view?: ThinkingView }[] = [];
+let buffer: (string | ThinkingView)[] = [];
 let dropped = 0;
 
 const indent = () => c.gray('│ '.repeat(depth));
 
-function line(text: string, view?: ThinkingView): void {
-  const s = indent() + text;
-  if (!held) return print(s, view);
-  if (buffer.length < HELD_MAX) buffer.push({ s, view });
+function line(text: string): void {
+  out(indent() + text);
+}
+
+function out(item: string | ThinkingView): void {
+  if (!held) return print(item);
+  if (buffer.length < HELD_MAX) buffer.push(item);
   else dropped++;
 }
 
-/** Строка размышления встаёт на экран в момент фактического вывода: после удержания — при release. */
-function print(s: string, view?: ThinkingView): void {
-  const mark = view && screen.mark();
-  console.log(s);
-  if (mark) screen.register(mark, view!);
+/**
+ * Блок размышления рисуется в момент фактического вывода (после удержания — при release): по
+ * ширине окна в этот момент, и только тогда экран узнаёт, где он стоит.
+ */
+function print(item: string | ThinkingView): void {
+  if (typeof item === 'string') return void console.log(item);
+  const lines = item.lines(false, screen.active() ? screen.width() : process.stdout.columns || 120);
+  const mark = screen.active() && item.expandable(screen.width()) ? screen.mark() : undefined;
+  console.log(lines.join('\n'));
+  if (mark) screen.register(mark, item, lines.length);
+}
+
+/** Сколько символов размышления видно сразу; по умолчанию — THINKING_CHARS. */
+export const THINKING_CHARS = 300;
+const thinkingCfg = { chars: THINKING_CHARS, dir: undefined as string | undefined, links: !!process.stdout.isTTY, seq: 0 };
+
+/**
+ * Настройки вывода размышлений: chars — сколько символов видно сразу, dir — куда класть полный текст
+ * (на него ведёт ссылка «Развернуть»: ⌘-клик открывает его и из истории терминала, куда клики не доходят),
+ * links — ссылки OSC 8 (только в терминале).
+ */
+export function configureThinking(o: { chars?: number; dir?: string | null; links?: boolean }): void {
+  if (o.chars !== undefined) thinkingCfg.chars = o.chars;
+  if (o.dir !== undefined) thinkingCfg.dir = o.dir ?? undefined;
+  if (o.links !== undefined) thinkingCfg.links = o.links;
+}
+
+/** --thinking-chars или AGENTFLOW_THINKING_CHARS: целое ≥ 0, иначе ошибка; без значения — THINKING_CHARS. */
+export function parseThinkingChars(flag: string | undefined, env: Record<string, string | undefined> = {}): number {
+  const raw = flag ?? env['AGENTFLOW_THINKING_CHARS'];
+  if (raw === undefined || raw === '') return THINKING_CHARS;
+  if (!/^\d+$/.test(raw.trim())) throw new Error(`--thinking-chars: «${raw}» — нужно целое число символов ≥ 0 (0 — только строка «размышляет»)`);
+  return Number(raw.trim());
+}
+
+/**
+ * Начало текста размышления: строки целиком, пока хватает chars; обрезанное кончается «…», внутри строки — по
+ * границе слова. Перенос тот же, что у полного текста: блок не прыгает при раскрытии.
+ */
+export function previewLines(body: string[], chars: number): { lines: string[]; cut: boolean } {
+  const lines: string[] = [];
+  let left = chars;
+  for (const l of body) {
+    const n = [...l].length;
+    if (n <= left) {
+      lines.push(l);
+      left -= n;
+      continue;
+    }
+    if (left > 0) {
+      const head = [...l].slice(0, left).join('');
+      const space = head.lastIndexOf(' ');
+      lines.push((space > head.length / 2 ? head.slice(0, space) : head).trimEnd() + '…');
+    } else if (lines.length) {
+      // Обрезано по границе строки: «…» всё равно видно. Колонка под него есть — текст уже окна на одну.
+      lines[lines.length - 1] = lines.at(-1)!.replace(/…?$/, '…');
+    }
+    return { lines, cut: true };
+  }
+  return { lines, cut: false };
 }
 
 /** Текст размышления для раскрытия: без управляющих символов, пустые строки схлопнуты, перенос по ширине. */
@@ -72,6 +132,34 @@ export function thinkingLines(text: string, width: number): string[] {
   }
   while (out.at(-1) === '') out.pop();
   return out;
+}
+
+/** Полный текст размышления в файл run: на него ведёт ссылка «Развернуть». */
+function thinkingFile(role: string, text: string): string | undefined {
+  const dir = thinkingCfg.dir;
+  if (!dir || !thinkingCfg.links) return undefined;
+  try {
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, `${String(++thinkingCfg.seq).padStart(4, '0')}-${role}.md`);
+    writeFileSync(path, `# ${role} · ${clockTime()}\n\n${text.trim()}\n`);
+    return path;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Слово-кнопка размышления; со ссылкой OSC 8 на файл — ⌘-клик открывает полный текст. */
+function button(label: string, file?: string): { label: string; s: string } {
+  const s = c.cyan(label);
+  return { label, s: file ? `\x1b]8;;file://${encodeURI(file)}\x07${s}\x1b]8;;\x07` : s };
+}
+
+/** Кнопка в конце последней строки, если влезает в ширину, иначе — отдельной строкой. */
+function withButton(lines: string[], p: string, w: number, b: { label: string; s: string } | undefined): string[] {
+  if (!b) return lines;
+  const last = lines.at(-1);
+  if (last !== undefined && textWidth(last) - textWidth(p) + 1 + b.label.length <= w) return [...lines.slice(0, -1), `${last} ${b.s}`];
+  return [...lines, p + b.s];
 }
 
 /** Строка о скрытой части раскрытого размышления. */
@@ -145,29 +233,41 @@ export const log = {
   },
 
   /**
-   * Размышление роли. В режиме мыши строка свёрнута (▸) и раскрывается кликом: текст рисует экран
-   * по этому описанию. Без режима мыши — прежняя строка с числом символов.
+   * Размышление роли: строка «размышляет (N симв.)» и начало текста (configureThinking.chars). Длинное
+   * кончается словом «Развернуть»: в режиме мыши клик раскрывает весь текст на месте, повторный —
+   * сворачивает обратно; ссылка на файл с текстом открывается ⌘-кликом и из истории терминала.
    */
   thinking(role: string, text: string): void {
     const chars = `размышляет (${text.length} симв.)`;
-    if (!screen.active() || !text.trim()) return log.role(role, c.gray(`… ${chars}`));
+    if (!text.trim()) return log.role(role, c.gray(`… ${chars}`));
     const pre = indent();
     const name = paintRole(role, `  ${role} │ `);
     const time = clockTime();
-    const header = (open: boolean) => name + c.gray(time) + ' ' + c.gray(`${open ? '▾' : '▸'} ${chars}`);
+    const clickable = screen.active();
+    const file = thinkingFile(role, text);
+    const header = (mark: string) => pre + name + c.gray(time) + ' ' + c.gray(`${mark} ${chars}`);
     // Текст стоит под временем строки; в узком окне — без префикса, лишь бы терминал не переносил строки.
     const lead = textWidth(pre + name) + time.length + 1;
     const pad = (columns: number) =>
       columns - lead - 1 >= 20 ? { p: pre + name + ' '.repeat(time.length + 1), w: columns - lead - 1 } : { p: '  ', w: columns - 3 };
-    line(header(false), {
-      header: (open) => pre + header(open),
-      body: (columns) => {
+    const cut = (columns: number) => previewLines(thinkingLines(text, pad(columns).w), thinkingCfg.chars).cut;
+    out({
+      expandable: (columns) => clickable && cut(columns),
+      lines(open, columns, max = Infinity) {
         const { p, w } = pad(columns);
-        return thinkingLines(text, w).map((l) => p + c.gray(l));
-      },
-      more: (hidden, columns) => {
-        const { p, w } = pad(columns);
-        return p + c.gray(fit(moreLines(hidden), w));
+        const body = thinkingLines(text, w);
+        const preview = previewLines(body, thinkingCfg.chars);
+        const paint = (ls: string[]) => ls.map((l) => p + c.gray(l));
+        if (!preview.cut) return [header('…'), ...paint(body)];
+        const expand = clickable || file ? button('Развернуть', file) : undefined;
+        if (!open) return [header(clickable ? '▸' : '…'), ...withButton(paint(preview.lines), p, w, expand)];
+        const fold = button('Свернуть');
+        const full = [header('▾'), ...withButton(paint(body), p, w, fold)];
+        if (full.length <= max) return full;
+        // Не влезает: сколько влезло и «… ещё N строк» со словом «Свернуть» в той же строке.
+        const shown = Math.max(0, max - 2);
+        const more = fit(moreLines(body.length - shown), w - fold.label.length - 1);
+        return [header('▾'), ...paint(body.slice(0, shown)), `${p}${c.gray(more)} ${fold.s}`];
       },
     });
   },
@@ -185,9 +285,9 @@ export const log = {
 
   release(): void {
     if (!held || --held) return;
-    const out = buffer;
+    const items = buffer;
     buffer = [];
-    for (const { s, view } of out) print(s, view);
+    for (const item of items) print(item);
     if (dropped) console.log(c.gray(`… ещё ${dropped} строк лога не показано — они в events.jsonl`));
     dropped = 0;
   },

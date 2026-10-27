@@ -1,4 +1,4 @@
-// Экран лога: где на экране стоят строки размышлений, раскрытие и сворачивание их по клику.
+// Экран лога: где на экране стоят блоки размышлений, раскрытие и сворачивание их по клику.
 // Содержимое экрана у терминала не прочитать, поэтому модель считает вертикальное движение
 // курсора по всему выводу в stdout и stderr, а абсолютную строку курсора спрашивает у терминала
 // в момент клика (DSR). Без start() всё — no-op, а write потоков не подменяется.
@@ -40,10 +40,10 @@ export function charWidth(cp: number): number {
   return within(cp, WIDE) || within(cp, WIDE_BMP) ? 2 : 1;
 }
 
-/** Видимая ширина строки без ANSI-последовательностей. */
+/** Видимая ширина строки без ANSI-последовательностей и ссылок OSC 8. */
 export function textWidth(s: string): number {
   let w = 0;
-  for (const ch of s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')) w += charWidth(ch.codePointAt(0)!);
+  for (const ch of s.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g, '')) w += charWidth(ch.codePointAt(0)!);
   return w;
 }
 
@@ -214,14 +214,16 @@ export class CursorModel {
   }
 }
 
-/** Как строку размышления рисует лог: log.ts знает префиксы и цвета, экран — где она стоит. */
+/** Как блок размышления рисует лог: log.ts знает префиксы, цвета и текст, экран — где блок стоит. */
 export interface ThinkingView {
-  /** Строка размышления целиком, как её печатает лог: свёрнутая (▸) или раскрытая (▾). */
-  header(open: boolean): string;
-  /** Строки текста под ширину окна: каждая уже columns, чтобы терминал не переносил её сам. */
-  body(columns: number): string[];
-  /** Последняя строка обрезанного текста: сколько строк не показано. */
-  more(hidden: number, columns: number): string;
+  /**
+   * Блок целиком: первая строка — «▸/▾ размышляет» (в узком окне терминал её переносит), остальные
+   * уже columns. Свёрнутый — начало текста со словом «Развернуть», раскрытый — весь текст со словом
+   * «Свернуть», не больше max строк (лишнее — строкой «… ещё N строк»).
+   */
+  lines(open: boolean, columns: number, max?: number): string[];
+  /** Есть что раскрывать: текст длиннее начала, режим мыши включён. */
+  expandable(columns: number): boolean;
 }
 
 export interface ScreenStream {
@@ -242,11 +244,13 @@ export interface Mark {
 
 interface Entry {
   view: ThinkingView;
-  /** moved перед выводом строки: расстояние от её верха до курсора — moved − base. */
+  /** moved перед выводом блока: расстояние от его верха до курсора — moved − base. */
   base: number;
+  /** Строк экрана, которые занимает первая строка блока («▸ размышляет»): её одну может переносить терминал. */
   headerRows: number;
-  /** Строк раскрытого текста под строкой. */
-  open?: number;
+  /** Строк экрана, которые блок занимает сейчас. */
+  rows: number;
+  open: boolean;
 }
 
 type Write = ScreenStream['write'];
@@ -300,14 +304,20 @@ class Screen {
     return { base: this.model.moved, epoch: this.model.epoch };
   }
 
-  /** Вызывать сразу после вывода строки: сколько строк экрана она заняла, видно по движению курсора. */
-  register(m: Mark, view: ThinkingView): void {
+  /** Вызывать сразу после вывода блока из count строк: сколько строк экрана он занял, видно по движению курсора. */
+  register(m: Mark, view: ThinkingView, count: number): void {
     if (!this.on || m.epoch !== this.model.epoch) return;
     this.sync();
     const rows = this.model.moved - m.base;
-    if (rows < 1) return;
-    this.entries.push({ view, base: m.base, headerRows: rows });
+    const headerRows = rows - (count - 1);
+    if (headerRows < 1) return;
+    this.entries.push({ view, base: m.base, headerRows, rows, open: false });
     this.prune();
+  }
+
+  /** Ширина окна лога: по ней log.ts переносит текст размышления. */
+  width(): number {
+    return this.columns();
   }
 
   /** Клик по строке экрана y (с 1): позиция курсора спрашивается у терминала, действие — по ответу. */
@@ -411,54 +421,71 @@ class Screen {
   /** Запись, у которой и нижняя строка дальше высоты экрана от курсора, уже не вернётся на экран. */
   private prune(): void {
     const rows = this.rows();
-    this.entries = this.entries.filter((e) => this.model.moved - e.base - e.headerRows - (e.open ?? 0) < rows).slice(-MAX_ENTRIES);
+    this.entries = this.entries.filter((e) => this.model.moved - e.base - e.rows < rows).slice(-MAX_ENTRIES);
   }
 
-  /** Что под строкой y, если курсор стоял в строке cursorRow при moved: строка размышления или её текст. */
+  /** Какой блок размышления под строкой y, если курсор стоял в строке cursorRow при moved. */
   private hit(y: number, cursorRow: number, moved: number): Target | undefined {
     if (y > this.bottom()) return undefined;
     for (let i = this.entries.length - 1; i >= 0; i--) {
       const e = this.entries[i]!;
       const top = cursorRow - (moved - e.base);
-      const end = top + e.headerRows - 1;
-      if (y >= top && y <= end) return { e, expand: !e.open };
-      if (e.open && y > end && y <= end + e.open) return { e, expand: false };
+      if (y >= top && y < top + e.rows) return { e, expand: !e.open };
     }
     return undefined;
   }
 
-  /**
-   * Текст встаёт под строкой, а строки над ней уходят вверх (в историю терминала): временная
-   * область 1…y и переводы строк в её нижней строке. Строки ниже y и панель стоят на месте.
-   */
-  private expand(e: Entry, top: number): void {
-    const y = top + e.headerRows - 1;
-    const space = top - 1;
-    if (space < 1) return;
-    const columns = this.columns();
-    const lines = e.view.body(columns);
-    if (!lines.length) return;
-    const shown = lines.length <= space ? lines : [...lines.slice(0, space - 1), e.view.more(lines.length - space + 1, columns)];
-    const k = shown.length;
-    let s = SAVE + `${ESC}[1;${y}r${ESC}[${y};1H` + '\n'.repeat(k);
-    shown.forEach((l, i) => (s += `${ESC}[${y - k + 1 + i};1H${ESC}[2K${l}`));
-    s += `${ESC}[${top - k};1H${e.view.header(true)}` + this.region() + RESTORE;
-    this.raw(s);
-    for (const x of this.entries) if (x.base <= e.base) x.base -= k;
-    e.open = k;
+  /** Строки блока с верхней строкой экрана top; строки выше экрана (в истории) не трогаются. */
+  private paint(e: Entry, lines: string[], top: number): string {
+    let s = '';
+    for (let r = 0; r < e.headerRows; r++) if (top + r >= 1) s += `${ESC}[${top + r};1H${ESC}[2K`;
+    if (top >= 1) s += `${ESC}[${top};1H${lines[0]}`;
+    lines.slice(1).forEach((l, i) => {
+      const row = top + e.headerRows + i;
+      if (row >= 1) s += `${ESC}[${row};1H${ESC}[2K${l}`;
+    });
+    return s;
   }
 
-  /** Видимые строки текста удаляются, лог под ними поднимается, курсор лога — следом за ним. */
+  /**
+   * Блок прирастает на K строк вверх: строки над ним уходят в историю терминала через временную
+   * область 1…y и переводы строк в её нижней строке, затем блок переписывается целиком. Строки ниже
+   * y и панель стоят на месте. Текст длиннее места над блоком обрезается строкой «… ещё N строк».
+   */
+  private expand(e: Entry, top: number): void {
+    const y = top + e.rows - 1;
+    const space = top - 1;
+    if (space < 1) return;
+    const lines = e.view.lines(true, this.columns(), e.rows + space - (e.headerRows - 1));
+    // Раскрытый блок не короче свёрнутого: иначе свернуть его обратно нечем.
+    while (lines.length + e.headerRows - 1 < e.rows) lines.push('');
+    const rows = lines.length + e.headerRows - 1;
+    const k = rows - e.rows;
+    const s = SAVE + `${ESC}[1;${y}r${ESC}[${y};1H` + '\n'.repeat(k) + this.paint(e, lines, y - rows + 1) + this.region() + RESTORE;
+    this.raw(s);
+    for (const x of this.entries) if (x.base <= e.base) x.base -= k;
+    e.rows = rows;
+    e.open = true;
+  }
+
+  /**
+   * Лишние строки блока удаляются (`ESC[nM`), лог под ними поднимается, курсор лога — следом;
+   * свёрнутый блок переписывается. Если верх блока ушёл в историю, блок забывается.
+   */
   private collapse(e: Entry, top: number): void {
-    const first = top + e.headerRows;
-    const from = Math.max(1, first);
-    const n = first + (e.open ?? 0) - from;
-    e.open = undefined;
+    const lines = e.view.lines(false, this.columns());
+    const rows = lines.length + e.headerRows - 1;
+    const from = Math.max(1, top + rows);
+    const n = Math.max(0, top + e.rows - from);
+    let s = SAVE;
+    if (n > 0) s += `${ESC}[${from};1H${ESC}[${n}M`;
+    s += this.paint(e, lines, top) + RESTORE;
+    if (n > 0) s += `${ESC}[${n}A`;
+    this.raw(s);
+    e.rows = rows;
+    e.open = false;
     if (top < 1) this.entries = this.entries.filter((x) => x !== e);
     if (n <= 0) return;
-    let s = SAVE + `${ESC}[${from};1H${ESC}[${n}M`;
-    if (top >= 1) s += `${ESC}[${top};1H${e.view.header(false)}`;
-    this.raw(s + RESTORE + `${ESC}[${n}A`);
     this.model.shift(-n);
     for (const x of this.entries) if (x.base > e.base) x.base -= n;
   }

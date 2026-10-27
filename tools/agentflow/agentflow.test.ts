@@ -20,7 +20,7 @@ import type { DiscussReply } from './context-builder.ts';
 import { RunStore, type DiscussTurn } from './state.ts';
 import { normalize } from './snapshot.ts';
 import { globToRegExp } from './util.ts';
-import { c, log, moreLines, thinkingLines } from './log.ts';
+import { c, configureThinking, log, moreLines, parseThinkingChars, previewLines, THINKING_CHARS, thinkingLines } from './log.ts';
 import { InputParser, mouse, mouseEnabled, WHEEL_PAUSE_MS } from './mouse.ts';
 import { charWidth, CursorModel, screen, textWidth, wrapText } from './screen.ts';
 import { SessionTracker, WAITING_MODEL } from './session-tracker.ts';
@@ -1199,15 +1199,64 @@ test('экран: расстояние до курсора по модели с�
   }
 });
 
-test('размышление без режима мыши: прежняя строка с числом символов', () => {
+/** Тест с другим числом символов начала размышления; после — снова по умолчанию. */
+function withChars<T>(n: number, fn: () => T): T {
+  configureThinking({ chars: n });
+  try {
+    return fn();
+  } finally {
+    configureThinking({ chars: THINKING_CHARS });
+  }
+}
+
+test('размышление без режима мыши: строка «размышляет» и начало текста, без кнопки и ссылки', () => {
   const printed: string[] = [];
-  console.log = (s: string) => void printed.push(String(s));
+  console.log = (s: string) => void printed.push(...String(s).split('\n'));
   try {
     log.thinking('implementer', 'abcde');
-    log.role('implementer', c.gray('… размышляет (5 симв.)'));
-    const t = (s: string) => s.replace(/\d\d:\d\d:\d\d/, 'T');
-    assert.equal(t(printed[0]!), t(printed[1]!));
+    log.thinking('implementer', T1240);
+    const plain = printed.map(stripAnsi);
+    assert.match(plain[0]!, /implementer │ \d\d:\d\d:\d\d … размышляет \(5 симв\.\)$/);
+    assert.match(plain[1]!, /│ +abcde$/);
+    assert.match(plain[2]!, /… размышляет \(1240 симв\.\)$/);
+    const preview = plain.slice(3).join(' ');
+    assert.ok(preview.length > 250 && tokens(preview, 'w').length < tokens(T1240, 'w').length, 'показано начало');
+    assert.ok(plain.at(-1)!.endsWith('…') && !preview.includes('Развернуть'), 'без режима мыши и ссылки кнопки нет');
   } finally {
+    console.log = consoleLog;
+  }
+});
+
+test('начало размышления: строки целиком, последняя — по слову с «…»; число символов из флага или env', () => {
+  const body = ['раз два три', 'четыре пять шесть', 'семь'];
+  assert.deepEqual(previewLines(body, 100), { lines: body, cut: false });
+  assert.deepEqual(previewLines(body, 11), { lines: ['раз два три…'], cut: true });
+  assert.deepEqual(previewLines(body, 23), { lines: ['раз два три', 'четыре пять…'], cut: true });
+  assert.deepEqual(previewLines(body, 14), { lines: ['раз два три', 'чет…'], cut: true });
+  assert.deepEqual(previewLines(body, 0), { lines: [], cut: true });
+  assert.equal(parseThinkingChars(undefined), THINKING_CHARS);
+  assert.equal(parseThinkingChars('500'), 500);
+  assert.equal(parseThinkingChars(undefined, { AGENTFLOW_THINKING_CHARS: '0' }), 0);
+  assert.equal(parseThinkingChars('100', { AGENTFLOW_THINKING_CHARS: '0' }), 100, 'флаг важнее env');
+  assert.throws(() => parseThinkingChars('-1'), /целое число символов/);
+  assert.throws(() => parseThinkingChars('много'), /целое число символов/);
+});
+
+test('размышление: «Развернуть» — ссылка OSC 8 на файл с полным текстом', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agentflow-thinking-'));
+  const printed: string[] = [];
+  console.log = (s: string) => void printed.push(String(s));
+  configureThinking({ dir, links: true });
+  try {
+    log.thinking('code-reviewer', T1240);
+    const link = printed.join('\n').match(/\x1b\]8;;file:\/\/([^\x07]+)\x07(.*?)\x1b\]8;;\x07/);
+    assert.ok(link, 'ссылка есть');
+    assert.equal(stripAnsi(link[2]!), 'Развернуть');
+    assert.equal(readFileSync(decodeURI(link[1]!), 'utf8').trim().split('\n').slice(2).join('\n'), T1240.trim());
+    assert.ok(decodeURI(link[1]!).startsWith(join(dir, '0')) && decodeURI(link[1]!).endsWith('-code-reviewer.md'));
+    assert.equal(textWidth(printed.join('').split('\n').at(-1)!), textWidth(stripAnsi(printed.join('').split('\n').at(-1)!).replace(/\x1b\][^\x07]*\x07/g, '')), 'ссылка не занимает колонок');
+  } finally {
+    configureThinking({ dir: null, links: false });
     console.log = consoleLog;
   }
 });
@@ -1228,7 +1277,7 @@ test('раскрытый текст: форма слова скрытых стр
   for (const l of wrapText('你好'.repeat(20), 10)) assert.ok(textWidth(l) <= 10);
 });
 
-test('экран: клик раскрывает размышление под строкой, лог ниже и панель на месте, история без потерь', () => {
+test('экран: начало размышления со словом «Развернуть»; клик раскрывает весь текст на месте, лог ниже и панель на месте', () => {
   const t = term();
   try {
     fill('A', 30);
@@ -1236,12 +1285,19 @@ test('экран: клик раскрывает размышление под с
     fill('B', 3);
     const before = t.lines();
     const y = t.row('▸ размышляет (1240 симв.)');
-    t.click('▸ размышляет (1240 симв.)');
+    const button = t.row('Развернуть');
+    assert.equal(t.row('B01'), button + 1, '«Развернуть» в конце начала текста');
+    const shown = tokens(before.slice(y, button).join(' '), 'w');
+    assert.ok(shown.length > 30 && shown.length < tokens(T1240, 'w').length);
+    assert.ok(textWidth(before.slice(y, button).join('').replace(/\s/g, '')) >= 250, 'видно около 300 символов');
+    t.click('Развернуть');
     const after = t.lines();
     const h = t.row('▾ размышляет (1240 симв.)');
-    assert.ok(h > 0 && h < y, `строка размышления ушла вверх: ${h} < ${y}`);
+    assert.ok(h > 0 && h < y, `блок прирос вверх: ${h} < ${y}`);
     assert.equal(t.row('▸ размышляет'), 0);
-    assert.deepEqual(tokens(after.slice(h, y).join(' '), 'w'), tokens(T1240, 'w'), 'текст по порядку и целиком');
+    assert.equal(t.row('Развернуть'), 0);
+    assert.equal(t.row('Свернуть'), t.row('B01') - 1, '«Свернуть» в конце текста');
+    assert.deepEqual(tokens(after.slice(h, t.row('B01') - 1).join(' '), 'w'), tokens(T1240, 'w'), 'текст по порядку и целиком');
     for (const b of ['B01', 'B02', 'B03']) assert.equal(t.row(b), before.findIndex((l) => l.includes(b)) + 1, b);
     assert.ok(after[27]!.includes('контроллер') && after[29]!.includes('run r1'), 'панель на месте');
     const all = [...t.vt.history, ...after].join('\n').match(/\bA\d\d\b/g);
@@ -1252,24 +1308,26 @@ test('экран: клик раскрывает размышление под с
   }
 });
 
-test('экран: повторный клик по строке или по тексту сворачивает, лог поднимается вплотную', () => {
+test('экран: повторный клик сворачивает к началу текста, лог поднимается вплотную', () => {
   const t = term();
   try {
     fill('A', 30);
     log.thinking('implementer', numbered('w', 80));
     fill('B', 3);
-    t.click('▸ размышляет');
+    const preview = (from: number) => tokens(t.lines().slice(from, t.row('B01') - 1).join(' '), 'w');
+    const first = preview(t.row('▸ размышляет'));
+    t.click('Развернуть');
     const h = t.row('▾ размышляет');
-    t.click('▾ размышляет');
+    t.click('Свернуть');
     assert.equal(t.row('▸ размышляет'), h);
-    assert.equal(t.row('B01'), h + 1);
-    assert.deepEqual(tokens(t.lines().join(' '), 'w'), []);
+    assert.equal(t.row('B01'), t.row('Развернуть') + 1);
+    assert.deepEqual(preview(h), first, 'снова начало текста');
     t.click('▸ размышляет');
     const h2 = t.row('▾ размышляет');
     assert.deepEqual(tokens(t.lines().join(' '), 'w'), tokens(numbered('w', 80), 'w'), 'текст раскрыт целиком');
-    screen.click(h2 + 3);
+    screen.click(h2 + 5);
     assert.equal(t.row('▸ размышляет'), h2, 'клик по строке текста');
-    assert.equal(t.row('B01'), h2 + 1);
+    assert.equal(t.row('B01'), t.row('Развернуть') + 1);
     log.info('C01');
     assert.equal(t.row('C01'), t.row('B03') + 1, 'следующая строка — сразу под последней');
     const all = [...t.vt.history, ...t.lines()].join('\n');
@@ -1279,15 +1337,16 @@ test('экран: повторный клик по строке или по те
   }
 });
 
-test('экран: клик мимо размышления ничего не меняет', () => {
+test('экран: клик мимо размышления ничего не меняет, короткое размышление не раскрывается', () => {
   const t = term();
   try {
     fill('A', 10);
     log.thinking('implementer', T1240);
+    log.thinking('code-reviewer', 'короткое размышление');
     fill('B', 3);
     const log27 = () => t.lines().slice(0, 27);
     const before = log27();
-    for (const y of [t.row('A05'), t.row('B03') + 3, 28, 29, 30]) screen.click(y);
+    for (const y of [t.row('A05'), t.row('B03') + 3, 28, 29, 30, t.row('короткое'), t.row('… размышляет (20 симв.)')]) screen.click(y);
     assert.deepEqual(log27(), before);
   } finally {
     t.done();
@@ -1295,63 +1354,65 @@ test('экран: клик мимо размышления ничего не м�
 });
 
 test('экран: лог продолжается под раскрытым, два размышления, клик по видимой части сворачивает', () => {
-  const t = term();
-  try {
-    fill('A', 30);
-    log.thinking('implementer', numbered('x', 40));
-    log.thinking('code-reviewer', numbered('y', 40));
-    fill('B', 2);
-    t.click('code-reviewer');
-    t.click('implementer');
-    const h = t.row('▾ размышляет (199 симв.)');
-    fill('D', 5);
-    assert.equal(t.row('▾ размышляет (199 симв.)'), h - 5, 'текст ушёл вверх вместе с логом');
-    assert.equal(t.row('D05'), t.vt.r);
-    assert.deepEqual(tokens(t.lines().join(' '), 'y'), tokens(numbered('y', 40), 'y'));
-    screen.click(h - 5 + 1);
-    assert.deepEqual(tokens(t.lines().join(' '), 'x'), [], 'первое свёрнуто');
-    assert.deepEqual(tokens(t.lines().join(' '), 'y'), tokens(numbered('y', 40), 'y'), 'второе не тронуто');
-    log.info('D06');
-    assert.equal(t.row('D06'), t.row('D05') + 1);
-  } finally {
-    t.done();
-  }
-});
-
-test('экран: длинное размышление — сколько влезает над строкой и «… ещё N строк»', () => {
-  for (const [n, hidden] of [
-    [40, '32 строки'],
-    [29, '21 строка'],
-    [33, '25 строк'],
-  ] as const) {
+  withChars(40, () => {
     const t = term();
     try {
-      fill('F', 40);
-      log.thinking('implementer', lined('L', n));
-      fill('E', 16);
-      assert.equal(t.row('▸ размышляет'), 10);
-      const before = t.lines();
-      screen.click(10);
-      const after = t.lines();
-      assert.equal(t.row('▾ размышляет'), 1);
-      for (let i = 1; i <= 8; i++) assert.ok(after[i]!.includes(`L0${i}`), after[i]);
-      assert.ok(after[9]!.includes(`… ещё ${hidden} — целиком в events.jsonl`), after[9]);
-      assert.deepEqual(after.slice(10, 26), before.slice(10, 26), 'лог ниже на месте');
+      fill('A', 30);
+      log.thinking('implementer', numbered('x', 40));
+      log.thinking('code-reviewer', numbered('y', 40));
+      fill('B', 2);
+      t.click('code-reviewer');
+      t.click('implementer');
+      const h = t.row('▾ размышляет (199 симв.)');
+      fill('D', 5);
+      assert.equal(t.row('▾ размышляет (199 симв.)'), h - 5, 'текст ушёл вверх вместе с логом');
+      assert.equal(t.row('D05'), t.vt.r);
+      assert.deepEqual(tokens(t.lines().join(' '), 'y'), tokens(numbered('y', 40), 'y'));
+      screen.click(h - 5 + 1);
+      assert.ok(tokens(t.lines().join(' '), 'x').length < 10, 'первое свёрнуто к началу');
+      assert.deepEqual(tokens(t.lines().join(' '), 'y'), tokens(numbered('y', 40), 'y'), 'второе не тронуто');
+      log.info('D06');
+      assert.equal(t.row('D06'), t.row('D05') + 1);
     } finally {
       t.done();
     }
-  }
+  });
 });
 
-test('экран: строка размышления в первой строке экрана не раскрывается', () => {
+test('экран: длинное размышление — сколько влезает над блоком и «… ещё N строк» со словом «Свернуть»', () => {
+  withChars(0, () => {
+    for (const n of [40, 29, 33]) {
+      const t = term();
+      try {
+        fill('F', 40);
+        log.thinking('implementer', lined('L', n));
+        fill('E', 16);
+        const top = t.row('▸ размышляет');
+        assert.equal(t.row('Развернуть'), top + 1, 'при 0 символов — только кнопка');
+        const before = t.lines();
+        t.click('Развернуть');
+        const after = t.lines();
+        assert.equal(t.row('▾ размышляет'), 1);
+        const shown = top - 1;
+        for (let i = 1; i <= shown; i++) assert.ok(after[i]!.includes(`L${String(i).padStart(2, '0')}`), after[i]);
+        assert.ok(after[top]!.includes(`… ещё ${moreLines(n - shown).slice(6, -24)}`) && after[top]!.includes('Свернуть'), after[top]);
+        assert.deepEqual(after.slice(top + 1, 26), before.slice(top + 1, 26), 'лог ниже на месте');
+      } finally {
+        t.done();
+      }
+    }
+  });
+});
+
+test('экран: блок размышления с первой строки экрана не раскрывается', () => {
   const t = term();
   try {
     fill('F', 40);
     log.thinking('implementer', T1240);
-    fill('E', 25);
+    for (let i = 0; t.row('▸ размышляет') > 1; i++) log.info(`E${i}`);
     assert.equal(t.row('▸ размышляет'), 1);
     const before = [...t.vt.history, ...t.lines()];
-    screen.click(1);
+    screen.click(2);
     assert.deepEqual([...t.vt.history, ...t.lines()], before);
   } finally {
     t.done();
@@ -1359,49 +1420,56 @@ test('экран: строка размышления в первой строк
 });
 
 test('экран: узкое окно — строки текста без переноса, строка размышления в две строки экрана', () => {
-  for (const columns of [50, 44]) {
-    const t = term({ columns });
-    try {
-      fill('A', 30);
-      log.thinking('implementer', 'суперкалифрагилистикэкспиалидоцкийпример 你好世界你好世界你好 💬💬💬 конец');
-      fill('B', 2);
-      const wraps = t.vt.wraps;
-      const b1 = t.row('B01');
-      t.click('▸ размышляет');
-      assert.ok(t.row('▾ размышляет') > 0);
-      for (const l of t.lines()) assert.ok(textWidth(l) <= columns, l);
-      assert.ok(t.vt.wraps - wraps <= 1, 'переносится только переписанная строка размышления');
-      assert.equal(t.row('B01'), b1);
-      assert.ok(t.lines().join('').includes('конец'));
-      t.click('▾ размышляет');
-      assert.equal(t.row('B01'), t.row('▸ размышляет') + (columns === 44 ? 2 : 1));
-    } finally {
-      t.done();
+  withChars(20, () => {
+    for (const columns of [50, 44]) {
+      const t = term({ columns });
+      try {
+        fill('A', 30);
+        log.thinking('implementer', 'суперкалифрагилистикэкспиалидоцкийпример 你好世界你好世界你好 💬💬💬 конец');
+        fill('B', 2);
+        const wraps = t.vt.wraps;
+        const b1 = t.row('B01');
+        const rows = b1 - t.row('▸ размышляет');
+        t.click('Развернуть');
+        assert.ok(t.row('▾ размышляет') > 0);
+        for (const l of t.lines()) assert.ok(textWidth(l) <= columns, l);
+        assert.ok(t.vt.wraps - wraps <= 1, 'переносится только переписанная строка размышления');
+        assert.equal(t.row('B01'), b1);
+        assert.ok(t.lines().join('').includes('конец'));
+        t.click('Свернуть');
+        assert.equal(t.row('B01') - t.row('▸ размышляет'), rows, 'свёрнутый блок той же высоты');
+        const next = t.lines()[t.row('▸ размышляет')]!;
+        assert.equal(/^\S*\.\)$/.test(next.trim()), columns === 44, `строка размышления в две строки экрана только в узком: «${next}»`);
+      } finally {
+        t.done();
+      }
     }
-  }
+  });
 });
 
 test('экран: раскрытое размышление ушло за верх — клик по видимому тексту убирает его', () => {
-  const t = term();
-  try {
-    fill('F', 40);
-    log.thinking('implementer', lined('K', 10));
-    t.click('▸ размышляет');
-    assert.equal(t.row('▾ размышляет'), 16);
-    fill('G', 20);
-    assert.equal(t.row('размышляет'), 0);
-    assert.equal(t.row('K05'), 1);
-    screen.click(3);
-    assert.ok(!t.lines().join(' ').match(/\bK\d\d\b/), 'видимый текст удалён');
-    assert.equal(t.row('G01'), 1);
-    log.info('Z01');
-    assert.equal(t.row('Z01'), t.row('G20') + 1);
-    const before = t.lines();
-    screen.click(1);
-    assert.deepEqual(t.lines(), before, 'запись забыта');
-  } finally {
-    t.done();
-  }
+  withChars(0, () => {
+    const t = term();
+    try {
+      fill('F', 40);
+      log.thinking('implementer', lined('K', 10));
+      t.click('Развернуть');
+      assert.equal(t.row('▾ размышляет'), 16);
+      fill('G', 20);
+      assert.equal(t.row('размышляет'), 0);
+      assert.equal(t.row('K05'), 1);
+      screen.click(3);
+      assert.ok(!t.lines().join(' ').match(/\bK\d\d\b|Свернуть/), 'видимый текст удалён');
+      assert.equal(t.row('G01'), 1);
+      log.info('Z01');
+      assert.equal(t.row('Z01'), t.row('G20') + 1);
+      const before = t.lines();
+      screen.click(1);
+      assert.deepEqual(t.lines(), before, 'запись забыта');
+    } finally {
+      t.done();
+    }
+  });
 });
 
 test('экран: без панели — вся высота; вывод между запросом позиции и ответом — запрос снова', () => {
@@ -1423,7 +1491,7 @@ test('экран: без панели — вся высота; вывод меж
     assert.equal(t.row('B02'), 30 - 1);
     t.out.defer = false;
     t.click('▾ размышляет');
-    assert.equal(t.row('B01'), t.row('▸ размышляет') + 1);
+    assert.equal(t.row('B01'), t.row('Развернуть') + 1);
   } finally {
     t.done();
   }
