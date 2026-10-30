@@ -6,7 +6,7 @@
 //   npm run agentflow -- resume <run-id>
 //   npm run agentflow -- status [<run-id>]
 //   npm run agentflow -- agents [<run-id>]
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { stringify } from 'yaml';
@@ -35,7 +35,7 @@ import {
 import { showAgents } from './agents.ts';
 import { KIT, resolveRepo } from './config.ts';
 import { runGates, gatesSummary, type GateResult } from './gates.ts';
-import { addWorktree, changedPaths, commitAll, diff, diffNoIndex, ensureRepo, head } from './git.ts';
+import { addWorktree, branchExists, changedPaths, commitAll, currentBranch, diff, diffNoIndex, ensureIgnored, ensureRepo, gitPath, head, switchNew } from './git.ts';
 import { autopilotOn, checkModeFlags, untilReviewPick } from './autopilot.ts';
 import { askHuman, blocker, PassLoop, Scopes, type PassScope } from './dialogs.ts';
 import { Human, replies, type Choice, type Discuss } from './human.ts';
@@ -53,6 +53,7 @@ import { screen } from './screen.ts';
 import { artifactFiles, artifactSnapshot, artifactText, codeSnapshot, specDigest } from './snapshot.ts';
 import { clock, panelEnabled, panel } from './status-panel.ts';
 import { fromMenu, parseSkipRoles, ROLES, settingsMenu, skippedSteps, specOnly, validateMenu, type RunSettings } from './run-settings.ts';
+import { foreignDirty, inMainTree, lockTree, mergeSteps, RUNS_DIR, TREE_LOCK, treeChanges } from './run-tree.ts';
 import { RunStore, STAGES, type BatchState, type DiscussTurn, type Finding, type Question, type QuestionOption, type RunState, type Stage } from './state.ts';
 import { Blocked, exec, extractJson, matchesAny, now, oneLine, Parked, sha256, short, stamp } from './util.ts';
 
@@ -65,9 +66,12 @@ let NO_MOUSE = false;
 
 interface Ctx {
   root: string;
+  /** Дерево, где run меняет код: основное дерево репозитория или worktree run. */
   wt: string;
   runDir: string;
   contextsDir: string;
+  /** Копия контракта ревью в contexts/: роли читают её, путь kit им недоступен. */
+  schemaPath: string;
   reviewsDir: string;
   gatesDir: string;
   store: RunStore;
@@ -87,7 +91,7 @@ interface Ctx {
 const st = (ctx: Ctx): RunState => ctx.store.state;
 const changeDir = (ctx: Ctx) => `openspec/changes/${st(ctx).change}`;
 const changeDirAbs = (ctx: Ctx) => join(ctx.wt, changeDir(ctx));
-const base = (ctx: Ctx): BaseCtx => ({ change: st(ctx).change, changeDir: changeDir(ctx), intent: st(ctx).intent.text, clarifications: st(ctx).intent.clarifications });
+const base = (ctx: Ctx): BaseCtx => ({ change: st(ctx).change, changeDir: changeDir(ctx), intent: st(ctx).intent.text, clarifications: st(ctx).intent.clarifications, schemaPath: ctx.schemaPath });
 const node = (ctx: Ctx, id: string) => ctx.graph.find((n) => n.id === id)!;
 /** Роль включена в настройках run: шаги выключенной пропускаются. */
 const on = (ctx: Ctx, role: string) => !st(ctx).options.skip.includes(role);
@@ -1358,7 +1362,7 @@ function specFiles(ctx: Ctx): string[] {
 }
 
 /** Изменённые файлы против ACL роли: защита второй линии поверх canUseTool. */
-/** Незакоммиченные правки worktree — в пределах ACL роли (или хотя бы одной из ролей). */
+/** Незакоммиченные правки дерева run — в пределах ACL роли (или хотя бы одной из ролей). */
 async function checkBoundary(ctx: Ctx, roleName: string | string[]): Promise<void> {
   const names = [roleName].flat();
   const sub = (g: string) => expandGlob(g, st(ctx).change, ctx.policy);
@@ -1367,7 +1371,7 @@ async function checkBoundary(ctx: Ctx, roleName: string | string[]): Promise<voi
       const rp = ctx.policy.roles[n]!;
       return matchesAny(p, rp.write.map(sub)) && !matchesAny(p, (rp.denyWrite ?? []).map(sub));
     });
-  const bad = (await changedPaths(ctx.wt)).filter((p) => !allowed(p));
+  const bad = treeChanges(await changedPaths(ctx.wt)).filter((p) => !allowed(p));
   if (bad.length) throw new Blocked(`${names.join(' / ')} изменил файлы вне своих полномочий: ${bad.join(', ')}`);
 }
 
@@ -1611,7 +1615,7 @@ async function batchRounds(ctx: Ctx, b: BatchState): Promise<void> {
         { role: 'code-reviewer', target: `batch-${b.id}`, snapshotId: snap, round, mandatoryChecks: rubric.mandatory, needAssessments: true },
         `${label}-review`,
       );
-      if ((await head(ctx.wt)) !== headSha || (await changedPaths(ctx.wt)).length) throw new Blocked(`batch ${b.id}: код изменился во время ревью — вердикт недействителен`);
+      if ((await head(ctx.wt)) !== headSha || treeChanges(await changedPaths(ctx.wt)).length) throw new Blocked(`batch ${b.id}: код изменился во время ревью — вердикт недействителен`);
       if (ctx.inject.repeat(`batch-stuck:${b.id}`, max)) review = injectRevise(review, `${diffPath}:1`, round, 'INJ-STUCK');
       else if (ctx.inject.take(`batch-revise:${b.id}`)) review = injectRevise(review, `${diffPath}:1`, round);
       review = injectBlocked(ctx, loop, review);
@@ -1981,7 +1985,7 @@ async function stageArchive(ctx: Ctx): Promise<void> {
     ctx.store.save();
     writeAcceptanceReport(ctx.runDir, s, '');
     log.info(c.green(`спека принята без archive · коммит freeze ${s.spec.freeze?.commit.slice(0, 10) ?? '—'} в ветке ${s.branch}`));
-    log.info(`код: git merge ${s.branch}, затем agentflow run --change ${s.change}`);
+    log.info(`код: ${mergeSteps(s).join(' && ')}, затем agentflow run --change ${s.change}`);
     return;
   }
   log.phase('ARCHIVE');
@@ -1993,7 +1997,7 @@ async function stageArchive(ctx: Ctx): Promise<void> {
   ctx.store.save();
   writeAcceptanceReport(ctx.runDir, st(ctx), manualCheck(ctx));
   log.info(c.green(`change принят и заархивирован · коммит ${commit.slice(0, 10)} в ветке ${st(ctx).branch}`));
-  log.info(`merge вне конвейера: git merge ${st(ctx).branch}`);
+  log.info(`merge вне конвейера: ${mergeSteps(st(ctx)).join(' && ')}`);
 }
 
 const STAGE_FN: Record<Stage, (ctx: Ctx) => Promise<void>> = {
@@ -2053,6 +2057,8 @@ function makeCtx(root: string, runDir: string, store: RunStore, policy: Policy, 
   const reviewsDir = join(runDir, 'reviews');
   const gatesDir = join(runDir, 'gates');
   for (const d of [contextsDir, reviewsDir, gatesDir, join(runDir, 'evidence')]) mkdirSync(d, { recursive: true });
+  const schemaPath = join(contextsDir, 'review.schema.json');
+  copyFileSync(join(KIT, '.agentflow/review.schema.json'), schemaPath);
   setLogSink((e) => store.append(e));
   configureThinking({ dir: join(runDir, 'thinking') });
   const rt: RoleRuntime = {
@@ -2068,6 +2074,7 @@ function makeCtx(root: string, runDir: string, store: RunStore, policy: Policy, 
     wt: s.worktree,
     runDir,
     contextsDir,
+    schemaPath,
     reviewsDir,
     gatesDir,
     store,
@@ -2194,7 +2201,7 @@ function intentFromChange(dir: string, change: string): string {
   return `Существующий change «${change}»: доведи его до приёмки по схеме репозитория.`;
 }
 
-async function startRun(args: { intent?: string; change?: string; autoApprove: boolean; untilReview: boolean; mock: boolean; clarify: boolean; inject: string[]; skipRoles?: string }): Promise<void> {
+async function startRun(args: { intent?: string; change?: string; autoApprove: boolean; untilReview: boolean; mock: boolean; clarify: boolean; worktree: boolean; inject: string[]; skipRoles?: string }): Promise<void> {
   const flagError = checkModeFlags(args.autoApprove, args.untilReview);
   if (flagError) throw new Error(flagError);
   const skip = parseSkipRoles(args.skipRoles);
@@ -2204,7 +2211,7 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
   const roles = loadRoles(ROOT);
   for (const w of mcpWarnings(policy, roles)) log.warn(w);
   for (const n of ROLES) if (!roles.has(n)) throw new Error(`нет файла роли ${n}.md ни в kit, ни в .agentflow/agents/`);
-  const dirty = (await changedPaths(ROOT)).filter((p) => !p.startsWith('.agentflow-runs/'));
+  const dirty = treeChanges(await changedPaths(ROOT));
 
   const intent = args.intent ? readIntent(args.intent) : undefined;
   const change = args.change ?? intent?.change;
@@ -2220,28 +2227,45 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
 
   const runStamp = stamp();
   const runId = `${runStamp}-${change}`;
-  const runDir = join(ROOT, '.agentflow-runs', runId);
-  mkdirSync(runDir, { recursive: true });
-  const wt = join(runDir, 'worktree');
-  const branchExists = (await exec('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${policy.git.branchPrefix}${change}`], { cwd: ROOT })).code === 0;
-  const branch = `${policy.git.branchPrefix}${change}${branchExists ? '-' + runStamp : ''}`;
-  await addWorktree(ROOT, wt, branch);
+  const runDir = join(ROOT, RUNS_DIR, runId);
+  const branch = `${policy.git.branchPrefix}${change}${(await branchExists(ROOT, `${policy.git.branchPrefix}${change}`)) ? '-' + runStamp : ''}`;
+  let wt = ROOT;
+  let startBranch: string | undefined;
+  let carry: string[] = [];
+  if (settings.worktree) {
+    mkdirSync(runDir, { recursive: true });
+    wt = join(runDir, 'worktree');
+    await addWorktree(ROOT, wt, branch);
+    // Незакоммиченное состояние OpenSpec основного дерева (сам change, config, схемы) переносится в worktree.
+    carry = dirty.filter((p) => p.startsWith('openspec/') && (!p.startsWith('openspec/changes/') || p.startsWith(`openspec/changes/${change}/`)));
+    for (const p of carry) {
+      const from = join(ROOT, p);
+      if (!existsSync(from)) continue;
+      mkdirSync(dirname(join(wt, p)), { recursive: true });
+      cpSync(from, join(wt, p));
+    }
+    // Схемы и config в .gitignore не попадают ни в HEAD, ни в git status — без них OpenSpec в worktree схему не найдёт.
+    for (const p of ['openspec/config.yaml', 'openspec/schemas']) {
+      if (existsSync(join(ROOT, p))) cpSync(join(ROOT, p), join(wt, p), { recursive: true, force: false });
+    }
+    const otherDirty = dirty.filter((p) => !carry.includes(p));
+    if (otherDirty.length) log.warn(`незакоммиченные изменения вне openspec/ не попадут в worktree: ${otherDirty.slice(0, 5).join(', ')}${otherDirty.length > 5 ? '…' : ''}`);
+  } else {
+    process.once('exit', lockTree(await gitPath(ROOT, TREE_LOCK), runId));
+    // Каталог run лежит в дереве: без игнора он попал бы в коммиты контроллера и в проверку границ ACL.
+    if (await ensureIgnored(ROOT, `${RUNS_DIR}/${runId}/state.json`, `/${RUNS_DIR}/`)) log.warn(`${RUNS_DIR}/ не в .gitignore — добавлен в .git/info/exclude (agentflow init добавит его в .gitignore)`);
+    const foreign = foreignDirty(dirty, change);
+    if (foreign.length) {
+      log.warn(
+        `незакоммиченные изменения вне change (${foreign.length}): ${foreign.slice(0, 5).join(', ')}${foreign.length > 5 ? '…' : ''} — ` +
+          'переходят на ветку run и попадут в первый коммит контроллера (freeze спеки)',
+      );
+    }
+    startBranch = await currentBranch(ROOT);
+    await switchNew(ROOT, branch);
+    mkdirSync(runDir, { recursive: true });
+  }
   const baseCommit = await head(wt);
-
-  // Незакоммиченное состояние OpenSpec основного дерева (сам change, config, схемы) переносится в worktree.
-  const carry = dirty.filter((p) => p.startsWith('openspec/') && (!p.startsWith('openspec/changes/') || p.startsWith(`openspec/changes/${change}/`)));
-  for (const p of carry) {
-    const from = join(ROOT, p);
-    if (!existsSync(from)) continue;
-    mkdirSync(dirname(join(wt, p)), { recursive: true });
-    cpSync(from, join(wt, p));
-  }
-  // Схемы и config в .gitignore не попадают ни в HEAD, ни в git status — без них OpenSpec в worktree схему не найдёт.
-  for (const p of ['openspec/config.yaml', 'openspec/schemas']) {
-    if (existsSync(join(ROOT, p))) cpSync(join(ROOT, p), join(wt, p), { recursive: true, force: false });
-  }
-  const otherDirty = dirty.filter((p) => !carry.includes(p));
-  if (otherDirty.length) log.warn(`незакоммиченные изменения вне openspec/ не попадут в worktree: ${otherDirty.slice(0, 5).join(', ')}${otherDirty.length > 5 ? '…' : ''}`);
 
   const store = new RunStore(runDir);
   const os = new OpenSpec(ROOT, wt);
@@ -2257,8 +2281,9 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
     repoRoot: ROOT,
     worktree: wt,
     branch,
+    ...(startBranch ? { startBranch } : {}),
     baseCommit,
-    options: { autoApprove: settings.autoApprove, mock: args.mock, clarify: settings.clarify, inject: args.inject, skip: settings.skip, ...(settings.untilReview ? { untilReview: true } : {}) },
+    options: { autoApprove: settings.autoApprove, mock: args.mock, clarify: settings.clarify, inject: args.inject, skip: settings.skip, ...(settings.untilReview ? { untilReview: true } : {}), ...(settings.worktree ? { worktree: true } : {}) },
     versions: { prompts: promptsRevision(ROOT), policy: policy.sha, sdk: sdkVersion(), openspec: await os.version(), openspecBin: os.bin },
     stagesDone: [],
     intent: { source: intent?.source ?? `openspec/changes/${change}`, text: intentText, clarifications: [] },
@@ -2282,7 +2307,7 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
   writeManifest(ctx);
   log.phase(`agentflow · run ${runId}`);
   log.info(`репозиторий ${c.bold(ROOT)} · change ${c.bold(change)}${existing ? ' (существующий)' : ' (новый)'} · ветка ${branch}`);
-  log.info(`worktree ${wt}${carry.length ? ` · перенесено незакоммиченное из openspec/: ${carry.length} файлов` : ''}`);
+  log.info(settings.worktree ? `worktree ${wt}${carry.length ? ` · перенесено незакоммиченное из openspec/: ${carry.length} файлов` : ''}` : `основное дерево ${wt}${startBranch ? ` · ветка run создана от ${startBranch}` : ''}`);
   log.info(`kit ${KIT} · policy: ${policy.sources.join(' + ')}`);
   log.info(`CLI: ${qwenExecutable(policy) ?? 'встроенный в SDK'} · SDK ${store.state.versions.sdk} · OpenSpec ${store.state.versions.openspec} (${os.bin})${args.mock ? c.yellow(' · MOCK-роли') : ''}`);
   for (const n of ROLES) {
@@ -2299,10 +2324,10 @@ async function startRun(args: { intent?: string; change?: string; autoApprove: b
 
 /**
  * Настройки run: флаги, а в интерактивном терминале без --auto-approve, --auto-until-review и --skip-roles — меню с
- * галочками. Ошибка флага и отказ от меню — до создания ветки и worktree.
+ * галочками. Ошибка флага и отказ от меню — до создания ветки (и worktree).
  */
-async function runSettings(args: { autoApprove: boolean; untilReview: boolean; clarify: boolean; skip: RunSettings['skip']; skipRoles?: string }): Promise<RunSettings> {
-  const flags: RunSettings = { skip: args.skip, clarify: args.clarify, autoApprove: args.autoApprove, untilReview: args.untilReview, panel: !NO_PANEL, mouse: !NO_MOUSE };
+async function runSettings(args: { autoApprove: boolean; untilReview: boolean; clarify: boolean; worktree: boolean; skip: RunSettings['skip']; skipRoles?: string }): Promise<RunSettings> {
+  const flags: RunSettings = { skip: args.skip, clarify: args.clarify, autoApprove: args.autoApprove, untilReview: args.untilReview, panel: !NO_PANEL, mouse: !NO_MOUSE, worktree: args.worktree };
   // Режим --auto-until-review — прогон без участия: меню ждало бы человека до старта.
   if (args.autoApprove || args.untilReview || args.skipRoles !== undefined || !process.stdin.isTTY || !process.stdout.isTTY) return flags;
   const picked = fromMenu(await new Human(false).checklist('Настройки run: пробел — отметить, Enter — запуск', settingsMenu(flags, process.env), validateMenu));
@@ -2312,7 +2337,7 @@ async function runSettings(args: { autoApprove: boolean; untilReview: boolean; c
 }
 
 async function resumeRun(runId: string): Promise<void> {
-  const runDir = join(ROOT, '.agentflow-runs', runId);
+  const runDir = join(ROOT, RUNS_DIR, runId);
   const store = new RunStore(runDir);
   if (!store.exists()) throw new Error(`нет run ${runId}`);
   store.load();
@@ -2324,6 +2349,14 @@ async function resumeRun(runId: string): Promise<void> {
     console.log(`run ${runId} ждёт ревью человека на приёмке: запусти agentflow resume ${runId} в интерактивном терминале`);
     process.exitCode = 2;
     return;
+  }
+  if (inMainTree(store.state)) {
+    // Run основного дерева продолжается только на своей ветке: иначе коммиты уйдут не туда.
+    const cur = await currentBranch(ROOT);
+    if (cur !== store.state.branch) {
+      throw new Error(`run ${runId} работает в основном дереве на ветке ${store.state.branch}, а выбрана ${cur ?? 'detached HEAD'}: git switch ${store.state.branch} и снова resume`);
+    }
+    process.once('exit', lockTree(await gitPath(ROOT, TREE_LOCK), runId));
   }
   const policy = loadPolicy(ROOT);
   const roles = loadRoles(ROOT);
@@ -2339,7 +2372,7 @@ async function resumeRun(runId: string): Promise<void> {
 }
 
 function showStatus(runId?: string): void {
-  const runsDir = join(ROOT, '.agentflow-runs');
+  const runsDir = join(ROOT, RUNS_DIR);
   const ids = existsSync(runsDir) ? readdirSync(runsDir).filter((d) => existsSync(join(runsDir, d, 'state.json'))).sort() : [];
   if (!runId) {
     if (!ids.length) console.log('запусков нет');
@@ -2404,7 +2437,7 @@ async function initRepo(withSchema: boolean): Promise<void> {
         '# Объекты сливаются, списки заменяются. Роли и рубрики переопределяются файлами',
         '# .agentflow/agents/<роль>.md и .agentflow/rubrics/<id артефакта>.md (иначе — из kit).',
         '',
-        '# Гейты: shell-команды проекта, выполняются в worktree. Роли вызывают их как agentflow-gate <op>.',
+        '# Гейты: shell-команды проекта, выполняются в дереве run. Роли вызывают их как agentflow-gate <op>.',
         'gates:',
         '  ops:',
         ...Object.entries(ops).map(([op, cmd]) => `    ${op}: ${JSON.stringify(cmd)}`),
@@ -2442,7 +2475,7 @@ async function initRepo(withSchema: boolean): Promise<void> {
 /** Changes репозитория по OpenSpec и их прогоны конвейера. */
 async function showChanges(): Promise<void> {
   const os = new OpenSpec(ROOT, ROOT);
-  const runsDir = join(ROOT, '.agentflow-runs');
+  const runsDir = join(ROOT, RUNS_DIR);
   const runs = existsSync(runsDir) ? readdirSync(runsDir).filter((d) => existsSync(join(runsDir, d, 'state.json'))) : [];
   const changes = await os.list();
   if (!changes.length) console.log('активных changes нет');
@@ -2476,11 +2509,14 @@ const USAGE = `agentflow — конвейер spec-driven разработки �
                            ${INJECT_HELP.join('\n                           ')}
       --mock             роли без моделей (только демо-проект kit)
       --no-clarify       пропустить шаг уточнения intent
+      --worktree         работать в своём worktree (.agentflow-runs/<run>/worktree), а не в основном дереве;
+                         по умолчанию run создаёт ветку agentflow/<change> в основном дереве, и правки видны
+                         сразу; в основном дереве run один, в worktree — сколько угодно
       --skip-roles <р,р>  выключить роли без диалога настроек: spec-reviewer, implementer, code-reviewer,
                          acceptance-tester; без implementer run только со спекой — завершается на freeze,
                          code-reviewer и acceptance-tester выключаются вместе с ним
                          (в TTY без --auto-approve, --auto-until-review и --skip-roles — меню настроек с галочками:
-                         роли, уточнение intent, оба автопилота, панель, мышь)
+                         роли, уточнение intent, оба автопилота, панель, мышь, worktree)
       --no-panel         без панели статуса внизу терминала (или AGENTFLOW_NO_PANEL=1)
       --no-mouse         без режима мыши: клик по размышлению не раскрывает текст (или AGENTFLOW_NO_MOUSE=1)
       --thinking-chars <N>  сколько символов размышления видно сразу, дальше — «Развернуть»
@@ -2501,6 +2537,7 @@ async function main(): Promise<void> {
       inject: { type: 'string' },
       mock: { type: 'boolean', default: false },
       'no-clarify': { type: 'boolean', default: false },
+      worktree: { type: 'boolean', default: false },
       'skip-roles': { type: 'string' },
       'no-panel': { type: 'boolean', default: false },
       'no-mouse': { type: 'boolean', default: false },
@@ -2524,14 +2561,14 @@ async function main(): Promise<void> {
   } else if (cmd === 'changes') {
     await showChanges();
   } else if (cmd === 'run') {
-    await startRun({ intent: arg, change: values.change, autoApprove: values['auto-approve'], untilReview: values['auto-until-review'], mock: values.mock, clarify: !values['no-clarify'], inject: parseInject(values.inject), skipRoles: values['skip-roles'] });
+    await startRun({ intent: arg, change: values.change, autoApprove: values['auto-approve'], untilReview: values['auto-until-review'], mock: values.mock, clarify: !values['no-clarify'], worktree: values.worktree, inject: parseInject(values.inject), skipRoles: values['skip-roles'] });
   } else if (cmd === 'resume') {
     if (!arg) throw new Error('укажи run-id (agentflow status)');
     await resumeRun(arg);
   } else if (cmd === 'status') {
     showStatus(arg);
   } else if (cmd === 'agents') {
-    const runsDir = join(ROOT, '.agentflow-runs');
+    const runsDir = join(ROOT, RUNS_DIR);
     const id = arg ?? readdirSync(runsDir).filter((d) => !d.startsWith('smoke-') && existsSync(join(runsDir, d, 'events.jsonl'))).sort().pop();
     if (!id) throw new Error('запусков нет');
     console.log(`run ${id}\n`);

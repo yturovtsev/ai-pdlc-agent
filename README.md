@@ -21,7 +21,7 @@ git и решения о прохождении принимает контро�
 ```bash
 cd agent-pdlc
 npm install                      # Node >= 22.13; @qwen-code/sdk 0.1.8, @fission-ai/openspec 1.14.0
-git init && git add -A && git commit -m "agentflow: init"   # контроллер работает в git worktree
+git init && git add -A && git commit -m "agentflow: init"   # контроллеру нужен git: ветка run, коммиты
 ```
 
 ## Запуск в других репозиториях
@@ -32,7 +32,7 @@ git init && git add -A && git commit -m "agentflow: init"   # контролле
 конкретного change), её артефакты, существующие changes, файл задач из `apply.tracks` схемы и
 версию `openspec` из `node_modules` репозитория, если она там установлена. Если этот CLI (или CLI kit)
 схему не видит, берётся `openspec` из PATH, который её видит, — так подхватываются встроенные схемы
-корпоративной сборки. Схемы из `openspec/schemas/` переносятся в worktree, даже если они в `.gitignore`;
+корпоративной сборки. Схемы из `openspec/schemas/` доступны и в worktree (`--worktree`), даже если они в `.gitignore`;
 если схему не видит ни один CLI, run останавливается до создания change со списком того, что видит каждый.
 
 ```bash
@@ -60,8 +60,8 @@ agentflow run intent.md          # новый change по intent (схема —
 | рубрики | `.agentflow/rubrics/<id артефакта>.md` репозитория, иначе kit; для артефакта без рубрики — `artifact.md` |
 | прогоны | `.agentflow-runs/` в репозитории (в git — только `ACCEPTANCE.md`) |
 
-**Существующий change.** Незакоммиченное состояние `openspec/` (сам change, config, схемы)
-переносится в worktree. Уже написанные артефакты сначала идут на ревью (spec-author их не
+**Существующий change.** Незакоммиченное состояние `openspec/` (сам change, config, схемы) в основном
+дереве переходит на ветку run, с `--worktree` — переносится в worktree. Уже написанные артефакты сначала идут на ревью (spec-author их не
 переписывает), недостающие пишет spec-author, уточнение intent пропускается. Задачи, отмеченные
 `[x]`, считаются выполненными; принятый батч отмечается в файле задач так же — как принято в OpenSpec.
 
@@ -158,7 +158,8 @@ npm run agentflow -- resume <run-id>                         # продолжи�
 - «Автопилот» (`--auto-approve`) и «Автопилот до приёмки» (`--auto-until-review`) — вместе не
   выбираются: меню не подтвердится, пока отмечены оба;
 - «Панель статуса» (`--no-panel`) и «Мышь» (`--no-mouse`) — только на этот запуск, `resume` берёт их
-  из своих флагов; при `AGENTFLOW_NO_PANEL=1` или `AGENTFLOW_NO_MOUSE=1` пункт недоступен.
+  из своих флагов; при `AGENTFLOW_NO_PANEL=1` или `AGENTFLOW_NO_MOUSE=1` пункт недоступен;
+- «Отдельный worktree» (`--worktree`) — см. «Где run меняет код».
 
 Выключенная роль — её шаг пропускается:
 
@@ -180,6 +181,29 @@ npm run agentflow -- resume <run-id>                         # продолжи�
 `ACCEPTANCE.md` — раздел «Настройки прогона». Точки `--inject` выключенной роли (`batch-revise`,
 `final-revise`, `blocked:final` без code-reviewer и т. п.) не срабатывают.
 
+### Где run меняет код
+
+По умолчанию — **в основном дереве** репозитория: run создаёт ветку `agentflow/<change>` от HEAD
+(`git switch -c`), и правки ролей сразу видны в твоём редакторе, а «Исправлю сам» — правка в
+привычном дереве. Коммиты контроллера (freeze, батчи, acceptance, archive) идут в эту ветку. Логи,
+контексты, ревью, гейты, размышления и `state.json` — в `.agentflow-runs/<run-id>/`, писать туда
+ролям запрещено.
+
+- **Один run на дерево.** Lock — `.git/agentflow.lock`. Второй run не стартует и называет занявший
+  дерево; lock упавшего процесса снимается сам.
+- **Незакоммиченные правки вне change** run не останавливают: лог их перечисляет, они переходят на
+  ветку run и попадут в коммит freeze. Пока run идёт, файлы вне change не правь: после apply это
+  нарушение границ ACL, run уйдёт в BLOCKED.
+- **`.agentflow-runs/` вне `.gitignore`** — run дописывает его в `.git/info/exclude` (`agentflow init`
+  кладёт строки в `.gitignore`).
+- **Resume** — только на ветке run: иначе он остановится и назовёт `git switch agentflow/<change>`.
+- **Merge** — после приёмки, вне конвейера: `git switch <исходная ветка> && git merge agentflow/<change>`
+  (команды — в конце лога и `ACCEPTANCE.md`).
+
+`--worktree` (или галочка в меню) — прежний режим: код и спека в `.agentflow-runs/<run-id>/worktree`,
+ветка основного дерева не меняется, run-ов может идти сколько угодно. Merge — `git merge` ветки и
+`git worktree remove`.
+
 ### Без участия до приёмки: `--auto-until-review`
 
 Прогон, который ты проверишь в конце (например, на ночь): конвейер сам пишет спеку и код и
@@ -194,7 +218,7 @@ npm run agentflow -- resume <run-id>                         # продолжи�
   исправлений; на третьем исчерпании рекомендация «Остановить» — run в BLOCKED. Minor и nit, как
   всегда, только в журнал.
 - **Парковка.** Дойдя до «Принять change?», run пишет `ACCEPTANCE.md`, получает статус
-  `awaiting-review` и завершается с кодом 0 — и в TTY, и без него. В конце лога — отчёт, worktree
+  `awaiting-review` и завершается с кодом 0 — и в TTY, и без него. В конце лога — отчёт, дерево
   с кодом для ручной проверки, ветка и `agentflow resume <run-id>`. Resume сразу открывает
   «Принять change?» (роли не запускаются); без TTY run остаётся в `awaiting-review`, код 2.
 - **Решения переходят к тебе** после парковки или остановки в BLOCKED: время и причина — в
@@ -423,18 +447,18 @@ AGENTS.md                    контекст для агента: карта, �
 .qwen/settings.json          общие запреты для интерактивного qwen
 .agentflow/policy.yaml       CLI, лимиты петель, ACL ролей, гейты, denyAll
 .agentflow/rubrics/*.md      рубрики артефактов и ревью; обязательные checks — в разделе «Обязательные проверки»
-.agentflow/review.schema.json  контракт ответа ревьюера
+.agentflow/review.schema.json  контракт ответа ревьюера (копия — в contexts/ каждого run)
 openspec/                    config.yaml (context/rules для артефактов), schemas/agentflow (spec-driven + test-plan),
                              specs/ — базовые спеки конвейера (7 capability), changes/
 tools/agentflow/             controller.ts roles.ts config.ts context-builder.ts review-validator.ts
-                             snapshot.ts gates.ts openspec.ts git.ts state.ts human.ts dialogs.ts inject.ts report.ts
+                             snapshot.ts gates.ts openspec.ts git.ts run-tree.ts state.ts human.ts dialogs.ts inject.ts report.ts
                              log.ts status-panel.ts session-tracker.ts intervention.ts
                              agents.ts mock.ts smoke.ts agentflow.test.ts
                              run.sh — гейты демо-проекта; bin/agentflow.mjs, bin/agentflow-gate
 src/ test/ e2e/              демо-библиотека, на которой решаются тестовые задачи
 tasks/                       тестовые intent: 01-slugify, 02-parse-duration, 03-incomplete
 .agentflow-runs/<run-id>/    manifest.yaml state.json events.jsonl contexts/ reviews/ gates/ evidence/
-                             ACCEPTANCE.md worktree/ (ветка agentflow/<change>)
+                             ACCEPTANCE.md; worktree/ — только с --worktree (ветка agentflow/<change>)
 ```
 
 `events.jsonl` — полный журнал: каждое сообщение каждой SDK-сессии, решения ACL (у отказов —
@@ -448,7 +472,7 @@ Merge ветки — вне конвейера, после твоей приём
 - Route моделей, `envKey` и `extra_body` не используются: модели берутся из `/model` корпоративного CLI,
   effort передаётся через `query({ effort })` (SDK 0.1.8), без доработки форка.
 - В демо-проекте kit — схема `openspec/schemas/agentflow` (`spec-driven` плюс `test-plan`); в других репозиториях — их собственная схема.
-- Запуск локальный: git worktree без контейнера, sandbox и сетевого allowlist. Fail-closed граница — ACL
+- Запуск локальный: ветка в основном дереве (или git worktree) без контейнера, sandbox и сетевого allowlist. Fail-closed граница — ACL
   контроллера в `canUseTool` плюс сверка изменённых путей после каждой роли.
 - Лимитов бюджета и времени нет (`roleTimeoutMinutes: 0`); расход пишется в `state.json` для информации.
   Зависшую сессию ловит сторож простоя (`limits.stallMinutes`) — решение за человеком, а не таймаут.

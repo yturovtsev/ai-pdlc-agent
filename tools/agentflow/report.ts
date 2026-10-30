@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { c } from './log.ts';
 import type { RunState } from './state.ts';
 import { skippedSteps, specOnly } from './run-settings.ts';
+import { inMainTree, mergeSteps } from './run-tree.ts';
 import { short } from './util.ts';
 
 export function loopSummary(s: RunState): { loop: string; rounds: number; path: string }[] {
@@ -54,7 +55,7 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
     `Статус конвейера: **${s.status === 'running' ? 'готово к приёмке' : s.status === 'awaiting-review' ? 'ждёт ревью человека' : s.status.toUpperCase()}**${s.stopReason ? ` — ${s.stopReason}` : ''}.`,
     '',
     `- run: \`${s.runId}\``,
-    `- ветка: \`${s.branch}\`, worktree: \`${s.worktree}\``,
+    inMainTree(s) ? `- ветка: \`${s.branch}\`${s.startBranch ? ` от \`${s.startBranch}\`` : ''}, основное дерево: \`${s.repoRoot}\`` : `- ветка: \`${s.branch}\`, worktree: \`${s.worktree}\``,
     `- база: \`${s.baseCommit.slice(0, 10)}\`, digest спеки: \`${s.spec.freeze ? short(s.spec.freeze.digest) : 'не заморожена'}\``,
     '',
     '## Настройки прогона',
@@ -125,8 +126,7 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
     '## Дальше (вне конвейера)',
     '',
     '```bash',
-    `git -C ${s.repoRoot} merge ${s.branch}`,
-    `git -C ${s.repoRoot} worktree remove ${s.worktree}`,
+    ...mergeSteps(s),
     '```',
     '',
   ].join('\n');

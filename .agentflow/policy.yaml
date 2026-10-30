@@ -51,7 +51,7 @@ limits:
 git:
   branchPrefix: agentflow/
 
-# Гейты. ops — операция → shell-команда проекта; выполняется в worktree целевого репозитория.
+# Гейты. ops — операция → shell-команда проекта; выполняется в дереве run (основное дерево или worktree).
 # Роли и контроллер вызывают их одинаково: agentflow-gate <операция>.
 # Значения ниже — для демо-проекта kit (eslint + node --test через run.sh). Другой репозиторий
 # переопределяет их в своём .agentflow/policy.yaml, например:
@@ -69,8 +69,8 @@ acceptance:
   dir: e2e
   framework: "node:test и node:assert/strict, файлы e2e/<capability>.test.js; импорт из ../src/index.js"
 
-# Чтение разрешено всем в пределах worktree. Запись и shell — только перечисленное.
-# write/denyWrite — glob относительно корня worktree; {change} — id текущего change,
+# Чтение разрешено всем в пределах дерева run. Запись и shell — только перечисленное; в .agentflow-runs/
+# не пишет никто. write/denyWrite — glob относительно корня дерева run; {change} — id текущего change,
 # {acceptance} — acceptance.dir. shell — операции gates.ops, которые роль может вызвать сама.
 # mcp — шаблоны имён MCP-инструментов mcp__<server>__<tool> (* допустим, например "mcp__jira__*").
 # Пусто — у роли нет MCP-инструментов вовсе; в шаге только на чтение их нет ни у кого.

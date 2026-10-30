@@ -19,6 +19,7 @@ import { c, log } from './log.ts';
 import { KIT } from './config.ts';
 import { gateEnv, qwenAuthType, qwenExecutable, type Policy } from './policy.ts';
 import { interventionError, type Intervention, type InterventionDecision, type InterventionKind, type InterventionOutcome } from './intervention.ts';
+import { RUNS_DIR } from './run-tree.ts';
 import { SessionTracker, toolArg } from './session-tracker.ts';
 import { matchesAny, oneLine, sha256 } from './util.ts';
 
@@ -212,7 +213,9 @@ export function decideAcl(rt: RoleRuntime, roleName: string, readOnly: boolean, 
     const abs = isAbsolute(raw) ? raw : resolve(rt.worktree, raw);
     const rel = relative(rt.worktree, abs).split(sep).join('/');
     if (!raw) return deny('(нет пути)', 'не указан путь', 'expected', `роль не указала путь — ${NO_ACTION}`, writeAllowed);
-    if (rel.startsWith('..') || isAbsolute(rel)) return deny(raw, 'вне worktree', 'expected', `роль ошиблась путём — ${NO_ACTION}`, `${writeAllowed} внутри worktree`);
+    if (rel.startsWith('..') || isAbsolute(rel)) return deny(raw, 'вне рабочего каталога', 'expected', `роль ошиблась путём — ${NO_ACTION}`, `${writeAllowed} внутри рабочего каталога`);
+    // В основном дереве каталог run лежит внутри репозитория: состояние, ревью и контексты — только контроллеру.
+    if (rel === RUNS_DIR || rel.startsWith(`${RUNS_DIR}/`)) return deny(rel, 'каталог прогонов пишет только контроллер', 'expected', `роль ошиблась путём — ${NO_ACTION}`, writeAllowed);
     if (readOnly) return deny(rel, 'шаг только на чтение', 'expected', `шаг уточнений только читает — ${NO_ACTION}`, readOnlyAllowed);
     if (!matchesAny(rel, rp.write.map(sub))) {
       return deny(rel, `роли ${roleName} запись сюда не разрешена`, 'permission', `если роли нужен этот путь — добавь glob для ${rel} в ${key}.write (.agentflow/policy.yaml)`, writeAllowed);

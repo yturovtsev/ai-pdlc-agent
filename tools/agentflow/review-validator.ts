@@ -1,4 +1,4 @@
-// Валидатор контракта ревью (.agentflow/review.schema.json) и правила принятия.
+// Валидатор контракта ревью (kit: .agentflow/review.schema.json) и правила принятия.
 // Ревью — это контракт, а не мнение: переход разрешает контроллер по этому коду.
 import { extractJson } from './util.ts';
 import type { Severity } from './state.ts';
@@ -182,7 +182,8 @@ export function countBySeverity(findings: { severity: Severity }[]): string {
 }
 
 /** Пример ответа для промпта ревьюера. */
-export function contractExample(exp: { role: string; target: string; snapshotId: string; round: number; code?: boolean; trace?: boolean }): string {
+/** schema — абсолютный путь к копии контракта в каталоге контекстов run: относительный путь kit роль не прочитает. */
+export function contractExample(exp: { role: string; target: string; snapshotId: string; round: number; code?: boolean; trace?: boolean; schema?: string }): string {
   const example = {
     status: 'REVISE',
     role: exp.role,
@@ -213,7 +214,7 @@ export function contractExample(exp: { role: string; target: string; snapshotId:
     missingContext: [],
   };
   return [
-    'Верни только JSON (можно в блоке ```json) ровно по контракту .agentflow/review.schema.json:',
+    `Верни только JSON (можно в блоке \`\`\`json) ровно по контракту${exp.schema ? ` (JSON Schema: ${exp.schema})` : ''}:`,
     '```json',
     JSON.stringify(example, null, 2),
     '```',

@@ -145,8 +145,10 @@ export function writeContext(contextsDir: string, label: string, prompt: string)
 
 export interface BaseCtx {
   change: string;
-  /** openspec/changes/<change> относительно worktree. */
+  /** openspec/changes/<change> относительно рабочего каталога. */
   changeDir: string;
+  /** Копия review.schema.json в каталоге контекстов run (абсолютный путь). */
+  schemaPath?: string;
   intent: string;
   clarifications: Clarification[];
 }
@@ -155,7 +157,7 @@ function header(step: string, ctx: BaseCtx): string {
   return [
     `# Задача контроллера agentflow · ${step}`,
     '',
-    `Change: ${ctx.change}. Рабочий каталог — git worktree этого change; все пути ниже относительно него.`,
+    `Change: ${ctx.change}. Рабочий каталог — дерево репозитория на ветке этого change; все пути ниже относительно него.`,
     'Решение о переходе принимает контроллер по твоему ответу и детерминированным проверкам.',
   ]
     .join('\n')
@@ -216,7 +218,7 @@ export interface DecisionDiscussInput {
   options: { label: string; description?: string; disabled?: string }[];
   recommended: string;
   rationale: string;
-  /** Файлы петли: артефакт, diff батча или финала, отчёт acceptance (относительно worktree или абсолютные). */
+  /** Файлы петли: артефакт, diff батча или финала, отчёт acceptance (относительно рабочего каталога или абсолютные). */
   files: string[];
   history: DiscussTurn[];
   message: string;
@@ -269,7 +271,7 @@ export interface DiscussInput {
   options: QuestionOption[];
   recommended: number;
   rationale?: string;
-  /** Файлы артефакта, к которому относится вопрос (относительно worktree). */
+  /** Файлы артефакта, к которому относится вопрос (относительно рабочего каталога). */
   files: string[];
   history: DiscussTurn[];
   message: string;
@@ -457,7 +459,7 @@ export function specReviewPrompt(
     '',
     '## Контракт ответа',
     '',
-    contractExample({ role: 'spec-reviewer', target: a.id, snapshotId: a.snapshotId, round: a.round }),
+    contractExample({ role: 'spec-reviewer', target: a.id, snapshotId: a.snapshotId, round: a.round, schema: ctx.schemaPath }),
   ]
     .join('\n')
     .replace(/\n{3,}/g, '\n\n');
@@ -490,7 +492,7 @@ export function holisticPrompt(
     formatFindings(a.prior),
     '',
     '## Контракт ответа',
-    contractExample({ role: 'spec-reviewer', target: 'change', snapshotId: a.snapshotId, round: a.round }),
+    contractExample({ role: 'spec-reviewer', target: 'change', snapshotId: a.snapshotId, round: a.round, schema: ctx.schemaPath }),
   ]
     .join('\n')
     .replace(/\n{3,}/g, '\n\n');
@@ -600,7 +602,7 @@ export function codeReviewPrompt(
     formatFindings(a.prior),
     '',
     '## Контракт ответа',
-    contractExample({ role: 'code-reviewer', target: `batch-${a.batch.id}`, snapshotId: a.snapshotId, round: a.round, code: true }),
+    contractExample({ role: 'code-reviewer', target: `batch-${a.batch.id}`, snapshotId: a.snapshotId, round: a.round, code: true, schema: ctx.schemaPath }),
   ]
     .join('\n')
     .replace(/\n{3,}/g, '\n\n');
@@ -632,7 +634,7 @@ export function acceptancePrompt(
     a.rubric.text,
     '',
     '## Контракт ответа',
-    contractExample({ role: 'acceptance-tester', target: 'acceptance', snapshotId: a.snapshotId, round: 1, trace: true }),
+    contractExample({ role: 'acceptance-tester', target: 'acceptance', snapshotId: a.snapshotId, round: 1, trace: true, schema: ctx.schemaPath }),
   ]
     .join('\n')
     .replace(/\n{3,}/g, '\n\n');
@@ -684,7 +686,7 @@ export function finalReviewPrompt(
     formatFindings(a.prior),
     '',
     '## Контракт ответа',
-    contractExample({ role: 'code-reviewer', target: 'final', snapshotId: a.snapshotId, round: a.round, code: true, trace: true }),
+    contractExample({ role: 'code-reviewer', target: 'final', snapshotId: a.snapshotId, round: a.round, code: true, trace: true, schema: ctx.schemaPath }),
   ]
     .join('\n')
     .replace(/\n{3,}/g, '\n\n');

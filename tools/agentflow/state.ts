@@ -152,12 +152,16 @@ export interface RunState {
   createdAt: string;
   updatedAt: string;
   repoRoot: string;
+  /** Дерево, где run меняет код: repoRoot (основное дерево) или свой worktree в каталоге run. */
   worktree: string;
   branch: string;
+  /** Ветка основного дерева до старта run — в неё делается merge. */
+  startBranch?: string;
   baseCommit: string;
   /** skip — роли, выключенные в настройках run: их шаги пропускаются. */
   /** untilReview — режим --auto-until-review: автопилот до приёмки, без waiver и перехода дальше. */
-  options: { autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[]; skip: string[]; untilReview?: boolean };
+  /** worktree — run в своём worktree (--worktree), а не в основном дереве. */
+  options: { autoApprove: boolean; mock: boolean; clarify: boolean; inject: string[]; skip: string[]; untilReview?: boolean; worktree?: boolean };
   /** Решения перешли от автопилота режима к человеку: парковка на приёмке или BLOCKED. */
   handover?: { at: string; reason: string };
   versions: { prompts: string; policy: string; sdk: string; openspec: string; openspecBin?: string };

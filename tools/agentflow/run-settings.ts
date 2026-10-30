@@ -1,4 +1,4 @@
-// Настройки прогона: какие роли работают, уточнение intent, автопилот, панель и мышь. Выключить нельзя
+// Настройки прогона: какие роли работают, уточнение intent, автопилот, панель, мышь и дерево run. Выключить нельзя
 // только spec-author — без него нет артефактов. Без implementer run только со спекой: он завершается
 // на freeze, а code-reviewer и acceptance-tester без кода не нужны и выключаются вместе с ним.
 
@@ -16,6 +16,8 @@ export interface RunSettings {
   untilReview: boolean;
   panel: boolean;
   mouse: boolean;
+  /** Run в своём worktree, а не в основном дереве репозитория. */
+  worktree: boolean;
 }
 
 /** Без implementer выключаются и роли, которым нужен код; порядок — как в конвейере. */
@@ -47,6 +49,7 @@ export const AUTO = 'auto-approve';
 export const UNTIL_REVIEW = 'auto-until-review';
 export const PANEL = 'panel';
 export const MOUSE = 'mouse';
+export const WORKTREE = 'worktree';
 
 export interface MenuItem {
   value: string;
@@ -65,7 +68,7 @@ const ROLE_HINT: Record<RoleName, string> = {
 };
 
 /**
- * Пункты меню: роли в порядке конвейера, затем уточнение intent, автопилоты, панель и мышь.
+ * Пункты меню: роли в порядке конвейера, затем уточнение intent, автопилоты, панель, мышь и worktree.
  * AGENTFLOW_NO_PANEL=1 и AGENTFLOW_NO_MOUSE=1 в `env` делают пункт недоступным: галочка ничего бы не включила.
  */
 export function settingsMenu(o: RunSettings, env: Record<string, string | undefined> = {}): MenuItem[] {
@@ -94,6 +97,12 @@ export function settingsMenu(o: RunSettings, env: Record<string, string | undefi
       description: 'флаг --no-mouse снимает галочку; без мыши работает выделение текста терминалом',
       ...envOff('AGENTFLOW_NO_MOUSE'),
     },
+    {
+      value: WORKTREE,
+      name: 'Отдельный worktree вместо основного дерева',
+      checked: o.worktree,
+      description: 'флаг --worktree: код и спека — в .agentflow-runs/<run>/worktree; нужен для нескольких run одновременно',
+    },
   ];
 }
 
@@ -114,6 +123,7 @@ export function fromMenu(selected: string[]): RunSettings {
     untilReview: selected.includes(UNTIL_REVIEW),
     panel: selected.includes(PANEL),
     mouse: selected.includes(MOUSE),
+    worktree: selected.includes(WORKTREE),
   };
 }
 

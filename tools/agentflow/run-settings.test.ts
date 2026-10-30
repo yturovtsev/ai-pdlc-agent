@@ -10,7 +10,7 @@ import type { RunState } from './state.ts';
 import { Human, type CheckItem, type PromptIO } from './human.ts';
 import { fromMenu, parseSkipRoles, settingsMenu, skippedSteps, specOnly, validateMenu, type RunSettings } from './run-settings.ts';
 
-const BASE: RunSettings = { skip: [], clarify: true, autoApprove: false, untilReview: false, panel: true, mouse: true };
+const BASE: RunSettings = { skip: [], clarify: true, autoApprove: false, untilReview: false, panel: true, mouse: true, worktree: false };
 
 test('--skip-roles: выключается всё, кроме spec-author; без implementer — и роли кода', () => {
   assert.deepEqual(parseSkipRoles('code-reviewer, acceptance-tester,code-reviewer'), ['code-reviewer', 'acceptance-tester']);
@@ -24,11 +24,12 @@ test('--skip-roles: выключается всё, кроме spec-author; бе�
 
 test('меню настроек: обязательный только spec-author, флаги задают начальные галочки', () => {
   const m = settingsMenu({ ...BASE, skip: ['code-reviewer'], clarify: false, autoApprove: true, mouse: false });
-  assert.deepEqual(m.map((x) => x.value), ['spec-author', 'spec-reviewer', 'implementer', 'code-reviewer', 'acceptance-tester', 'clarify', 'auto-approve', 'auto-until-review', 'panel', 'mouse']);
+  assert.deepEqual(m.map((x) => x.value), ['spec-author', 'spec-reviewer', 'implementer', 'code-reviewer', 'acceptance-tester', 'clarify', 'auto-approve', 'auto-until-review', 'panel', 'mouse', 'worktree']);
   assert.deepEqual(m.filter((x) => x.disabled).map((x) => [x.value, x.checked, x.disabled]), [['spec-author', true, 'обязательная роль']]);
-  assert.deepEqual(m.filter((x) => !x.checked).map((x) => x.value), ['code-reviewer', 'clarify', 'auto-until-review', 'mouse']);
+  assert.deepEqual(m.filter((x) => !x.checked).map((x) => x.value), ['code-reviewer', 'clarify', 'auto-until-review', 'mouse', 'worktree']);
   assert.ok(m.every((x) => x.description), 'у каждого пункта подсказка');
-  assert.deepEqual(fromMenu(['spec-reviewer', 'implementer', 'acceptance-tester', 'auto-approve', 'panel']), { skip: ['code-reviewer'], clarify: false, autoApprove: true, untilReview: false, panel: true, mouse: false });
+  assert.deepEqual(fromMenu(['spec-reviewer', 'implementer', 'acceptance-tester', 'auto-approve', 'panel']), { skip: ['code-reviewer'], clarify: false, autoApprove: true, untilReview: false, panel: true, mouse: false, worktree: false });
+  assert.equal(fromMenu(['worktree']).worktree, true);
   assert.deepEqual(skippedSteps(['spec-reviewer']), ['spec-reviewer: ревью артефактов, сквозное ревью']);
 });
 
@@ -62,7 +63,7 @@ test('меню с галочками: пункты с checked, disabled и valid
   const picked = await new Human(false, io).checklist('Настройки run', items, validateMenu);
   assert.equal(seen[0]!.find((i) => i.value === 'spec-author')!.disabled, 'обязательная роль');
   assert.match(String(check!([{ value: 'auto-approve' }, { value: 'auto-until-review' }])), /несовместимы/);
-  assert.deepEqual(fromMenu(picked), { skip: ['code-reviewer'], clarify: false, autoApprove: false, untilReview: false, panel: false, mouse: false });
+  assert.deepEqual(fromMenu(picked), { skip: ['code-reviewer'], clarify: false, autoApprove: false, untilReview: false, panel: false, mouse: false, worktree: false });
   assert.ok(picked.includes('spec-author'), 'недоступные отмеченные остаются');
   const auto = await new Human(true, { ...io, checkbox: async () => assert.fail('автопилот не открывает меню') }).checklist('t', items);
   assert.deepEqual(fromMenu(auto), BASE);

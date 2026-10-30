@@ -19,12 +19,13 @@ Kit конвейера spec-driven разработки на Qwen Code (корп
 | `context-builder.ts` | промпты ролей, индекс требований `REQ-*/SCN-*`, батчи из задач OpenSpec |
 | `review-validator.ts` | контракт ответа ревьюера и правила принятия (`decide`) |
 | `autopilot.ts` | режим `--auto-until-review`: включён ли автопилот (`handover` его выключает), ещё раунд вместо waiver, несовместимость с `--auto-approve` |
-| `run-settings.ts` | настройки run: роли (обязателен spec-author; без implementer — run только со спекой), `--skip-roles`, меню с галочками (роли, автопилоты, панель, мышь), пропускаемые шаги |
+| `run-settings.ts` | настройки run: роли (обязателен spec-author; без implementer — run только со спекой), `--skip-roles`, меню с галочками (роли, автопилоты, панель, мышь, worktree), пропускаемые шаги |
 | `dialogs.ts` | диалог с остановкой: хвост меню «Остановить run» и «Всё равно перейти дальше» (`askHuman`), области петель (`Scopes.passable`) и `PassLoop` |
 | `human.ts` | меню стрелками: рекомендация `★` + обоснование; `--auto-approve` выбирает рекомендацию; обсуждение вопроса и решения с ролью (`Discuss`, `DecisionDiscuss`); недоступный вариант (`disabled`); ввод через `PromptIO` — в тестах сценарий |
 | `status-panel.ts` | панель статуса внизу терминала в три строки (субагент и активные, текущий шаг и с какого времени, контекст); пополняется хуками `log.ts` |
 | `screen.ts`, `mouse.ts` | экран лога: где стоят блоки размышлений (модель движения курсора по всему выводу), раскрытие и сворачивание; режим мыши (raw-ввод, клик, колесо, DSR, Ctrl+C) |
 | `config.ts`, `policy.ts` | kit vs целевой репозиторий, слои настроек, `gateEnv` |
+| `run-tree.ts` | где run меняет код: основное дерево (по умолчанию) или `--worktree`; lock дерева, правки вне change, шаги merge |
 | `openspec.ts`, `git.ts`, `gates.ts`, `snapshot.ts`, `state.ts` | детерминированные узлы |
 | `mock.ts`, `inject.ts`, `smoke.ts`, `agents.ts`, `report.ts` | mock-роли, fault injection, smoke CLI, список сессий, ACCEPTANCE.md |
 | `bin/agentflow.mjs`, `bin/agentflow-gate` | глобальная команда (`npm link`); единственная shell-команда ролей |
@@ -42,8 +43,9 @@ npm run smoke                                                    # корпор�
 agentflow <run|resume|status|agents|changes|init|smoke>          # в любом репозитории после npm link
 ```
 
-Mock-прогон создаёт ветку и worktree и коммитит в них: гоняй его в копии kit с `git init` или на
-закоммиченном дереве. Mock-роли пишут только задачу slugify демо-проекта.
+Mock-прогон переключает основное дерево на ветку `agentflow/<change>` и коммитит в неё (с `--worktree` —
+в свой worktree): гоняй его в копии kit с `git init`, а не в самом kit. Mock-роли пишут только задачу
+slugify демо-проекта.
 
 ## Соглашения
 
@@ -131,6 +133,12 @@ Mock-прогон создаёт ветку и worktree и коммитит в �
 - В чужом репозитории OpenSpec берётся как есть (схема, changes, версия CLI); kit даёт только роли,
   рубрики и policy по умолчанию.
 - Прогресс задач — галочками в файле задач (digest их нормализует) и в `state.json`.
+- Run по умолчанию в основном дереве на ветке `agentflow/<change>`, worktree — флагом `--worktree`
+  (решение 30.10.2026): работу видно сразу в редакторе. Один run на дерево (lock в `.git`), чужие
+  незакоммиченные правки — только предупреждение, они уходят в коммит freeze. Режим — `state.worktree
+  === repoRoot`, старые run на worktree продолжают resume.
+- Контракт ревью роль читает из копии `contexts/review.schema.json`: в целевом репозитории
+  `.agentflow/review.schema.json` нет, а читать роли могут только дерево run и `contexts/`.
 
 ## Не сделано
 

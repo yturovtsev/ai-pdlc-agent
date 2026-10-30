@@ -127,6 +127,15 @@ test('ACL: implementer не пишет в спеку и e2e, вне worktree и 
   assert.equal(decideAcl(rt, 'implementer', false, 'run_shell_command', { command: 'npm run lint' }).ok, false);
 });
 
+test('ACL: каталог прогонов в основном дереве пишет только контроллер', () => {
+  for (const file_path of ['.agentflow-runs/r/state.json', '/w/.agentflow-runs/r/contexts/x.md', '.agentflow-runs']) {
+    const d = decideAcl(rt, 'implementer', false, 'write_file', { file_path });
+    assert.equal(d.ok, false, file_path);
+    assert.equal(d.reason, 'каталог прогонов пишет только контроллер');
+  }
+  assert.ok(decideAcl(rt, 'implementer', false, 'write_file', { file_path: '.agentflow-runs-notes.md' }).ok);
+});
+
 test('ACL: ревьюер не пишет, шаг readOnly не пишет никому', () => {
   assert.equal(decideAcl(rt, 'code-reviewer', false, 'write_file', { file_path: 'src/a.js' }).ok, false);
   assert.equal(decideAcl(rt, 'implementer', true, 'write_file', { file_path: 'src/a.js' }).ok, false);

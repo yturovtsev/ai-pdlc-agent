@@ -1,4 +1,6 @@
-// Git-операции делает контроллер, а не роли: ветка и worktree на change, коммиты, diff.
+// Git-операции делает контроллер, а не роли: ветка change (в основном дереве или worktree), коммиты, diff.
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { exec } from './util.ts';
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -20,6 +22,39 @@ export async function head(cwd: string): Promise<string> {
 
 export async function addWorktree(root: string, path: string, branch: string): Promise<void> {
   await git(root, ['worktree', 'add', '-b', branch, path, 'HEAD']);
+}
+
+/** Текущая ветка; undefined — detached HEAD. */
+export async function currentBranch(cwd: string): Promise<string | undefined> {
+  const r = await exec('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd });
+  return r.code === 0 ? r.stdout.trim() : undefined;
+}
+
+/** Новая ветка от HEAD в этом дереве: незакоммиченные правки переходят на неё вместе с деревом. */
+export async function switchNew(cwd: string, branch: string): Promise<void> {
+  await git(cwd, ['switch', '-q', '-c', branch]);
+}
+
+export async function branchExists(cwd: string, branch: string): Promise<boolean> {
+  return (await exec('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { cwd })).code === 0;
+}
+
+/** Путь внутри каталога git этого дерева (git rev-parse --git-path), абсолютный. */
+export async function gitPath(cwd: string, name: string): Promise<string> {
+  return resolve(cwd, (await git(cwd, ['rev-parse', '--git-path', name])).trim());
+}
+
+/**
+ * Путь игнорируется git; иначе дописать шаблон в .git/info/exclude — локально, без правки .gitignore.
+ * true — шаблон добавлен сейчас.
+ */
+export async function ensureIgnored(cwd: string, probe: string, pattern: string): Promise<boolean> {
+  if ((await exec('git', ['check-ignore', '-q', '--no-index', probe], { cwd })).code === 0) return false;
+  const abs = await gitPath(cwd, 'info/exclude');
+  mkdirSync(dirname(abs), { recursive: true });
+  const text = existsSync(abs) ? readFileSync(abs, 'utf8') : '';
+  appendFileSync(abs, `${text && !text.endsWith('\n') ? '\n' : ''}${pattern}\n`);
+  return true;
 }
 
 /** Изменённые и новые файлы относительно HEAD (с учётом .gitignore). */
