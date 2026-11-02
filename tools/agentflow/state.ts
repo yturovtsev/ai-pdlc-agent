@@ -65,6 +65,8 @@ export interface Question {
   from: string;
   answer?: string;
   discussion?: DiscussTurn[];
+  /** Автопилот ответил, когда раундов правки уже не было: ответ записан, в артефакт не внесён. */
+  unapplied?: boolean;
 }
 
 export interface LoopEntry {
@@ -89,8 +91,11 @@ export interface ArtifactState {
   rounds: number;
   snapshot?: string;
   authorSession?: string;
-  /** Принят решением человека «Всё равно перейти дальше», без PASS ревьюера. */
-  passedBy?: 'human';
+  /**
+   * Принят без PASS ревьюера: решением человека «Всё равно перейти дальше» или автопилотом,
+   * когда кончились раунды policy (последняя правка автора без повторного ревью).
+   */
+  passedBy?: 'human' | 'autopilot';
 }
 
 export interface BatchState {
@@ -106,7 +111,7 @@ export interface BatchState {
   passedBy?: 'human';
 }
 
-/** Петля, пройденная решением человека «Всё равно перейти дальше». */
+/** Петля, пройденная без PASS: решением человека «Всё равно перейти дальше» или автопилотом по лимиту раундов. */
 export interface Proceeded {
   at: string;
   loop: string;
@@ -114,6 +119,8 @@ export interface Proceeded {
   reason: string;
   /** Id находок, снятых вместе с переходом. */
   findings: string[];
+  /** Нет — решение человека. */
+  by?: 'autopilot';
 }
 
 export type Stage =

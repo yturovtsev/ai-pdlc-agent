@@ -2,7 +2,7 @@
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { c } from './log.ts';
-import type { RunState } from './state.ts';
+import type { Proceeded, RunState } from './state.ts';
 import { skippedSteps, specOnly } from './run-settings.ts';
 import { inMainTree, mergeSteps } from './run-tree.ts';
 import { short } from './util.ts';
@@ -31,13 +31,17 @@ function modeSection(s: RunState): string[] {
   return [
     '## Режим прогона',
     '',
-    '- режим: `--auto-until-review` — решения до приёмки принимает автопилот, waiver и переход дальше он не выбирает',
+    '- режим: `--auto-until-review` — решения до приёмки принимает автопилот, waiver и переход дальше он не выбирает; петли спеки проходят по лимиту раундов policy',
     `- решений автопилота: ${auto}`,
     `- решения переданы человеку: ${h ? `${h.at} — ${h.reason}` : 'нет, автопилот ещё ведёт run'}`,
     `- открытых находок critical и major: ${blocking.length}${blocking.length ? ` (${blocking.map((f) => f.id).join(', ')})` : ''}`,
-    `- waiver: ${s.findings.filter((f) => f.status === 'waived').length} · переходов дальше: ${(s.proceeded ?? []).length}`,
+    `- waiver: ${s.findings.filter((f) => f.status === 'waived').length} · переходов дальше: ${(s.proceeded ?? []).filter((p) => !p.by).length} · пройдено по лимиту раундов: ${(s.proceeded ?? []).filter((p) => p.by === 'autopilot').length}`,
     '',
   ];
+}
+
+function proceededLine(p: Proceeded): string {
+  return `- ${p.at} · ${p.loop}: ${p.label} — причина: ${p.reason}${p.findings.length ? ` · сняты находки: ${p.findings.join(', ')}` : ''}`;
 }
 
 export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: string): string {
@@ -49,6 +53,9 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
   const open = s.findings.filter((f) => f.status === 'open');
   const waived = s.findings.filter((f) => f.status === 'waived');
   const usage = Object.entries(s.usage);
+  const human = (s.proceeded ?? []).filter((p) => !p.by);
+  const byAutopilot = (s.proceeded ?? []).filter((p) => p.by === 'autopilot');
+  const unapplied = (s.spec?.questions ?? []).filter((q) => q.unapplied);
   const md = [
     `# Приёмка: ${s.change}`,
     '',
@@ -73,10 +80,14 @@ export function writeAcceptanceReport(runDir: string, s: RunState, manualCheck: 
     '',
     '## Пройдено решением человека',
     '',
-    (s.proceeded ?? []).length
-      ? s.proceeded.map((p) => `- ${p.at} · ${p.loop}: ${p.label} — причина: ${p.reason}${p.findings.length ? ` · сняты находки: ${p.findings.join(', ')}` : ''}`).join('\n')
-      : '(нет)',
+    human.length ? human.map(proceededLine).join('\n') : '(нет)',
     '',
+    ...(byAutopilot.length
+      ? ['## Пройдено автопилотом по лимиту раундов', '', 'Последняя правка автора принята без повторного ревью; находки ниже не проверены ревьюером.', '', ...byAutopilot.map(proceededLine), '']
+      : []),
+    ...(unapplied.length
+      ? ['## Ответы автопилота, не внесённые в спеку', '', 'Раундов правки не осталось: ответ записан, артефакт по нему не менялся.', '', ...unapplied.map((q) => `- ${q.id} · ${q.artifact}: ${q.question} → ${q.answer}`), '']
+      : []),
     '## Трассировка требований (финальное ревью)',
     '',
     specRun

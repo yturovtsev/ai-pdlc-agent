@@ -36,7 +36,7 @@ import { showAgents } from './agents.ts';
 import { KIT, resolveRepo } from './config.ts';
 import { runGates, gatesSummary, type GateResult } from './gates.ts';
 import { addWorktree, branchExists, changedPaths, commitAll, currentBranch, diff, diffNoIndex, ensureIgnored, ensureRepo, gitPath, head, switchNew } from './git.ts';
-import { autopilotOn, checkModeFlags, untilReviewPick } from './autopilot.ts';
+import { autopilotOn, autopilotStep, budgetPassReason, checkModeFlags, untilReviewPick } from './autopilot.ts';
 import { askHuman, blocker, PassLoop, Scopes, type PassScope } from './dialogs.ts';
 import { Human, replies, type Choice, type Discuss } from './human.ts';
 import { INJECT_HELP, Injector, parseInject } from './inject.ts';
@@ -143,18 +143,37 @@ function passLoop<T>(ctx: Ctx, scope: PassScope, fn: () => Promise<T>, onPass: (
   });
 }
 
-/** Петля пройдена решением человека: её незакрытые находки снимаются с причиной, переход — в state.json. */
-function closeLoop(ctx: Ctx, scope: PassScope, reason: string, snapshot: string): void {
+/**
+ * Петля пройдена без PASS — решением человека или автопилотом по лимиту раундов: её незакрытые
+ * находки снимаются с причиной, переход — в state.json.
+ */
+function closeLoop(ctx: Ctx, scope: PassScope, reason: string, snapshot: string, by?: 'autopilot'): void {
   const s = st(ctx);
   const open = openFindings(ctx, scope.loop);
   for (const f of open) {
     f.status = 'waived';
     f.waiver = { reason, at: now(), snapshot };
   }
-  s.proceeded.push({ at: now(), loop: scope.loop, label: scope.label, reason, findings: open.map((f) => f.id) });
-  s.decisions.push({ at: now(), gate: `proceed:${scope.loop}`, decision: 'proceed', comment: reason });
+  s.proceeded.push({ at: now(), loop: scope.loop, label: scope.label, reason, findings: open.map((f) => f.id), ...(by ? { by } : {}) });
+  s.decisions.push({ at: now(), gate: `proceed:${scope.loop}`, decision: by ? 'autopilot-budget' : 'proceed', comment: reason });
   ctx.store.save();
-  log.warn(`${scope.loop}: пройдено решением человека — ${scope.label}${open.length ? ` · сняты ${open.map((f) => f.id).join(', ')}` : ''} · причина: ${reason}`);
+  log.warn(`${scope.loop}: пройдено ${by ? 'автопилотом' : 'решением человека'} — ${scope.label}${open.length ? ` · сняты ${open.map((f) => f.id).join(', ')}` : ''} · причина: ${reason}`);
+}
+
+/**
+ * Автопилот: на вопросы, для которых раундов правки уже нет, ответ рекомендацией записывается, но автору
+ * не уходит. Иначе ответ рождает правку, правка — новые вопросы, и фаза спеки не кончается.
+ */
+async function answerUnapplied(ctx: Ctx, qs: Question[], why: string): Promise<void> {
+  if (!qs.length) return;
+  const s = st(ctx);
+  for (const q of qs) {
+    const { answer } = await ctx.human.question(q);
+    Object.assign(q, { answer, unapplied: true });
+    s.decisions.push({ at: now(), gate: 'autopilot:question', decision: answer, comment: `${q.question} — ${why}` });
+  }
+  ctx.store.save();
+  log.warn(`автопилот: вопросов ${qs.length} — ответ записан, в артефакт не внесён (${why}); список — в ACCEPTANCE.md`);
 }
 
 /** Режим --auto-until-review: автопилот берёт ещё раунд вместо рекомендованного waiver. */
@@ -856,7 +875,7 @@ async function artifactLoop(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { 
       return p.length ? `ошибки валидации OpenSpec (${p.length}): без openspec validate --strict не пройдут freeze и archive` : undefined;
     },
   };
-  await passLoop(ctx, scope, () => artifactRounds(ctx, n, seed, opts), (reason) => {
+  await passLoop(ctx, scope, () => artifactRounds(ctx, n, scope, seed, opts), (reason) => {
     const snap = snapshotOf(ctx, n);
     closeLoop(ctx, scope, reason, snap);
     Object.assign(st(ctx).spec.artifacts[n.id]!, { status: 'accepted', snapshot: snap, passedBy: 'human' });
@@ -865,9 +884,9 @@ async function artifactLoop(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { 
   });
 }
 
-async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: { reviewFirst?: boolean }): Promise<void> {
+async function artifactRounds(ctx: Ctx, n: ArtifactNode, scope: PassScope, seed: Finding[], opts: { reviewFirst?: boolean }): Promise<void> {
   const s = st(ctx);
-  const loop = `artifact:${n.id}`;
+  const loop = scope.loop;
   const a = (s.spec.artifacts[n.id] ??= { status: 'pending', rounds: 0 });
   a.status = 'pending';
   delete a.passedBy;
@@ -878,6 +897,15 @@ async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: 
   let session: string | undefined;
   let reviewOnly = !!opts.reviewFirst;
   const history: string[][] = [];
+  // Автопилот не продлевает раунды: после последнего ревью с находками — одна правка автора без ревью.
+  const auto = ctx.human.auto;
+  let final = false;
+  /** Раунд с находками на автопилоте: следующий — обычный или последняя правка. */
+  const autoNext = (round: number) => {
+    if (autopilotStep(round, budget) === 'round' || final) return;
+    final = true;
+    log.info(c.yellow(`автопилот: раунды ревью «${n.id}» исчерпаны (limits.artifactRounds = ${max}) — последняя правка spec-author без повторного ревью, затем ${scope.label.replace(/^принять «[^»]+» как есть → /, '')}`));
+  };
   /** Ревью человеком — после PASS ревьюера или без spec-reviewer; true — артефакт принят. */
   const toHuman = async (snap: string, round: number): Promise<boolean> => {
     const g = await artifactGate(ctx, n, snap, round);
@@ -890,7 +918,8 @@ async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: 
     }
     if (g.kind === 'self') reviewOnly = true;
     else toFix = g.findings;
-    budget = round + max;
+    if (auto) autoNext(round);
+    else budget = round + max;
     return false;
   };
   for (let round = 1; ; round++) {
@@ -931,7 +960,7 @@ async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: 
     ctx.store.setStep(`spec:${n.id}:validate`);
     const vf = await validateArtifact(ctx, n, loop, round);
     if (vf.length) {
-      log.verdict('REVISE', `валидатор: ${vf.length} ошибок`, round < budget ? `назад к spec-author, раунд ${round + 1}` : 'автоматические раунды кончились');
+      log.verdict('REVISE', `валидатор: ${vf.length} ошибок`, round < budget ? `назад к spec-author, раунд ${round + 1}` : auto && !final ? 'последняя правка spec-author без ревью (автопилот)' : 'автоматические раунды кончились');
       ctx.store.loop(loop, round, 'REVISE', 'validator');
       log.loopClose('REVISE (валидатор)');
       toFix = vf;
@@ -940,6 +969,18 @@ async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: 
       log.step('детерминированная валидация пройдена (файлы, openspec status/validate, формат)');
       const snap = snapshotOf(ctx, n);
       log.step(`snapshot артефакта ${short(snap)}`);
+      if (final) {
+        const reason = budgetPassReason('artifactRounds', max);
+        ctx.store.loop(loop, round, 'AUTOPILOT', reason);
+        log.verdict('AUTOPILOT', 'последняя правка без ревью', scope.label.replace(/^принять «[^»]+» как есть → /, ''));
+        log.loopClose(`«${n.id}» принят автопилотом по лимиту раундов`);
+        closeLoop(ctx, scope, reason, snap, 'autopilot');
+        Object.assign(a, { status: 'accepted', snapshot: snap, passedBy: 'autopilot' });
+        await answerUnapplied(ctx, s.spec.questions.filter((q) => !q.answer && q.artifact === n.id), reason);
+        ctx.store.save();
+        log.info(c.yellow(`«${n.id}» принят автопилотом без повторного ревью · snapshot ${short(snap)} · открытые находки — в ACCEPTANCE.md`));
+        return;
+      }
       if (!on(ctx, 'spec-reviewer')) {
         ctx.store.loop(loop, round, 'SKIPPED', 'spec-reviewer выключен');
         log.verdict('SKIPPED', 'spec-reviewer выключен в настройках run', 'твоё ревью артефакта');
@@ -1030,7 +1071,8 @@ async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: 
           const note = talkNote(ch);
           toFix = [humanFinding(ctx, n, `Контекст от человека: ${text}`), ...(note ? [humanFinding(ctx, n, note)] : [])];
         }
-        budget = round + max;
+        if (auto) autoNext(round);
+        else budget = round + max;
         continue;
       }
 
@@ -1041,13 +1083,18 @@ async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: 
         continue;
       }
 
-      log.verdict('REVISE', counts, round < budget ? `назад к spec-author, раунд ${round + 1}` : 'автоматические раунды кончились');
+      log.verdict('REVISE', counts, round < budget ? `назад к spec-author, раунд ${round + 1}` : auto ? 'последняя правка spec-author без ревью (автопилот)' : 'автоматические раунды кончились');
       log.loopClose('REVISE');
       toFix = stored(ctx, loop, d.blocking);
       history.push(toFix.map((f) => f.id));
     }
 
     if (round < budget) continue;
+    // Последняя правка автопилота не прошла валидацию OpenSpec: такой артефакт дальше не пускаем — диалог исчерпания.
+    if (auto && !final) {
+      autoNext(round);
+      continue;
+    }
     const ex = await artifactExhausted(ctx, n, round, toFix, history);
     budget = round + 1;
     if (ex.action === 'continue') {
@@ -1066,7 +1113,8 @@ async function artifactRounds(ctx: Ctx, n: ArtifactNode, seed: Finding[], opts: 
     }
     if (g.kind === 'self') reviewOnly = true;
     else toFix = g.findings;
-    budget = round + max;
+    if (auto) autoNext(round);
+    else budget = round + max;
   }
 }
 
@@ -1094,7 +1142,7 @@ async function holisticLoop(ctx: Ctx): Promise<void> {
     return;
   }
   const scope: PassScope = { loop: 'holistic', label: 'снять находки сквозного ревью → согласование спеки' };
-  await passLoop(ctx, scope, () => holisticRounds(ctx), (reason) => {
+  await passLoop(ctx, scope, () => holisticRounds(ctx, scope), (reason) => {
     const snap = currentDigest(ctx);
     closeLoop(ctx, scope, reason, snap);
     Object.assign(st(ctx).spec, { holisticPassed: true, holisticDigest: snap });
@@ -1102,7 +1150,7 @@ async function holisticLoop(ctx: Ctx): Promise<void> {
   });
 }
 
-async function holisticRounds(ctx: Ctx): Promise<void> {
+async function holisticRounds(ctx: Ctx, scope: PassScope): Promise<void> {
   const s = st(ctx);
   s.spec.holisticPassed = false;
   const max = ctx.policy.limits.holisticRounds;
@@ -1163,6 +1211,20 @@ async function holisticRounds(ctx: Ctx): Promise<void> {
     }
     log.verdict('REVISE', countBySeverity(review.findings), `исправить: ${[...groups.keys()].join(', ')}; downstream — повторное ревью`);
     log.loopClose('REVISE → петли артефактов');
+    // Автопилот не продлевает раунды: последние правки по находкам — в петлях артефактов, без нового сквозного ревью.
+    if (ctx.human.auto && autopilotStep(round, budget) === 'final') {
+      log.info(c.yellow(`автопилот: раунды сквозного ревью исчерпаны (limits.holisticRounds = ${max}) — последние правки артефактов, затем согласование спеки без нового сквозного ревью`));
+      await reaccept(ctx, groups);
+      const digest = currentDigest(ctx);
+      const reason = budgetPassReason('holisticRounds', max);
+      ctx.store.loop('holistic', round, 'AUTOPILOT', reason);
+      closeLoop(ctx, scope, reason, digest, 'autopilot');
+      Object.assign(s.spec, { holisticPassed: true, holisticDigest: digest });
+      await answerUnapplied(ctx, s.spec.questions.filter((q) => !q.answer), reason);
+      ctx.store.save();
+      log.info(c.yellow(`сквозное ревью пройдено автопилотом без повторного ревью · digest ${short(digest)} · открытые находки — в ACCEPTANCE.md`));
+      return;
+    }
     if (round >= budget) {
       const files = ctx.graph.flatMap((n) => filesOf(ctx, n));
       const recommended = exhaustedBefore(ctx, 'exhausted:holistic') >= 2 ? 'stop' : stuck(history) ? 'waive' : 'more';
@@ -1262,6 +1324,11 @@ async function stageApproval(ctx: Ctx): Promise<void> {
   for (;;) {
     log.phase('СОГЛАСОВАНИЕ И FREEZE СПЕКИ');
     const pending = s.spec.questions.filter((q) => !q.answer);
+    // Автопилот вносит ответы согласования один раз: новые вопросы после этих правок — без правки.
+    if (pending.length && ctx.human.auto && s.decisions.some((d) => d.gate === 'approval:question')) {
+      await answerUnapplied(ctx, pending, 'автопилот: ответы на вопросы согласования уже вносились');
+      continue;
+    }
     if (pending.length) {
       const groups = new Map<string, Finding[]>();
       for (const q of pending) {
@@ -1921,7 +1988,8 @@ async function stageHumanAcceptance(ctx: Ctx): Promise<void> {
       `отчёт: ${join(ctx.runDir, 'ACCEPTANCE.md')}`,
       `код для ручного теста: ${ctx.wt} (ветка ${s.branch})`,
       `${finalLine} · ${accBy || s.acceptance?.status === 'SKIPPED' ? accLine : `acceptance ${passed}/${total} сценариев PASS`}`,
-      ...(s.proceeded.length ? [`пройдено решением человека: ${s.proceeded.map((p) => p.loop).join(', ')} — см. ACCEPTANCE.md`] : []),
+      ...(s.proceeded.some((p) => !p.by) ? [`пройдено решением человека: ${s.proceeded.filter((p) => !p.by).map((p) => p.loop).join(', ')} — см. ACCEPTANCE.md`] : []),
+      ...(s.proceeded.some((p) => p.by) ? [`пройдено автопилотом по лимиту раундов: ${s.proceeded.filter((p) => p.by).map((p) => p.loop).join(', ')} — см. ACCEPTANCE.md`] : []),
       ...(mc ? [mc.replace(/\n+/g, ' · ')] : []),
     ],
     options: [

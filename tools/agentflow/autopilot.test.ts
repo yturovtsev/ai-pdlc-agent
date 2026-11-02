@@ -1,11 +1,11 @@
 // Unit-тесты режима --auto-until-review: включён ли автопилот, выбор вместо waiver, флаги,
-// автопилот режима в диалогах и отметка в логе.
+// автопилот режима в диалогах и отметка в логе; лимит раундов спеки на любом автопилоте.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { autopilotOn, checkModeFlags, untilReviewPick } from './autopilot.ts';
+import { autopilotOn, autopilotStep, budgetPassReason, checkModeFlags, untilReviewPick } from './autopilot.ts';
 import { askHuman, Scopes, type PassScope } from './dialogs.ts';
 import { Human, type Choice } from './human.ts';
 import { stripAnsi } from './status-panel.ts';
@@ -155,4 +155,47 @@ test('отчёт приёмки: открытая major в режиме назв
   const plain = reportOf({ options: { autoApprove: true, mock: true, clarify: true, inject: [], skip: [] } });
   assert.ok(!plain.includes('Режим прогона'));
   assert.match(plain, /автопилот: да/);
+});
+
+test('autopilotStep: лимит раундов policy жёсткий — после последнего ревью одна правка без ревью', () => {
+  assert.equal(autopilotStep(1, 1), 'final', 'artifactRounds = 1: ревью, правка автора, дальше');
+  assert.equal(autopilotStep(1, 3), 'round');
+  assert.equal(autopilotStep(2, 3), 'round');
+  assert.equal(autopilotStep(3, 3), 'final');
+  assert.equal(autopilotStep(4, 3), 'final', 'раунд сверх лимита (диалог исчерпания после неудачной правки) — тоже без ревью');
+});
+
+test('budgetPassReason называет ключ policy и его значение', () => {
+  assert.equal(budgetPassReason('artifactRounds', 1), 'автопилот: раунды ревью исчерпаны (limits.artifactRounds = 1) — последняя правка spec-author без повторного ревью');
+  assert.match(budgetPassReason('holisticRounds', 2), /limits\.holisticRounds = 2\) — последние правки артефактов без повторного ревью/);
+});
+
+test('отчёт приёмки: петли, пройденные автопилотом по лимиту, — отдельным разделом, не «решением человека»', () => {
+  const reason = budgetPassReason('artifactRounds', 1);
+  const md = reportOf({
+    options: { autoApprove: false, mock: true, clarify: true, inject: [], skip: [], untilReview: true },
+    proceeded: [
+      { at: 't1', loop: 'artifact:specs', label: 'принять «specs» как есть → «design»', reason, findings: ['SR-3'], by: 'autopilot' },
+      { at: 't2', loop: 'final', label: 'Принять без финального ревью → отчёт приёмки', reason: 'проверю руками', findings: [] },
+    ],
+  });
+  assert.match(md, /## Пройдено решением человека\n\n- t2 · final: Принять без финального ревью → отчёт приёмки — причина: проверю руками\n\n/);
+  assert.match(md, /## Пройдено автопилотом по лимиту раундов\n\nПоследняя правка автора принята без повторного ревью; находки ниже не проверены ревьюером\.\n\n- t1 · artifact:specs: принять «specs» как есть → «design» — причина: автопилот: раунды ревью исчерпаны \(limits\.artifactRounds = 1\)/);
+  assert.match(md, /сняты находки: SR-3/);
+  assert.match(md, /петли спеки проходят по лимиту раундов policy/);
+  assert.match(md, /- waiver: 0 · переходов дальше: 1 · пройдено по лимиту раундов: 1/);
+  assert.ok(!reportOf({}).includes('Пройдено автопилотом'), 'без проходов автопилота раздела нет');
+});
+
+test('отчёт приёмки: ответы автопилота без раунда правки названы отдельно', () => {
+  const md = reportOf({
+    spec: {
+      questions: [
+        { id: 'Q-1', question: 'Что вернуть для пустой строки?', artifact: 'specs', from: 'spec-author', answer: 'Пустую строку', unapplied: true },
+        { id: 'Q-2', question: 'Разделитель?', artifact: 'specs', from: 'spec-author', answer: 'дефис' },
+      ],
+    } as unknown as RunState['spec'],
+  });
+  assert.match(md, /## Ответы автопилота, не внесённые в спеку\n\nРаундов правки не осталось: ответ записан, артефакт по нему не менялся\.\n\n- Q-1 · specs: Что вернуть для пустой строки\? → Пустую строку\n\n/);
+  assert.ok(!md.includes('Q-2'), 'внесённый ответ в раздел не попадает');
 });
