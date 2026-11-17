@@ -1,7 +1,5 @@
-// Панель статуса внизу терминала: текущий субагент, его модель, effort и время, текущий шаг
-// сессии и с какого времени он идёт, этап и петля. Закрепляется областью прокрутки (DECSTBM):
-// лог, включая console.log мимо log.ts, прокручивается над тремя нижними строками.
-// Состояние пополняют хуки log.ts; без start() всё — no-op.
+// Состояние панели пополняют хуки log.ts. В управляемом окне frame() отдаёт три строки
+// общему рендереру; в потоковом режиме панель сама резервирует строки через DECSTBM.
 import { c, clockTime, paintRole } from './log.ts';
 
 export interface PanelAgent {
@@ -160,6 +158,7 @@ class Panel {
   private state: PanelState | undefined;
   private out: PanelOut | undefined;
   private active = false;
+  private managed: (() => void) | undefined;
   private paused = false;
   private timer: ReturnType<typeof setInterval> | undefined;
   private readonly onResize = () => this.resize();
@@ -167,18 +166,21 @@ class Panel {
   private readonly onSigint = () => this.exitBySignal(130);
   private readonly onSigterm = () => this.exitBySignal(143);
 
-  start(init: { runId: string; change: string; roles: number; launches: number; phase?: string; stallMs?: number; enabled: boolean }, out: PanelOut = process.stdout): void {
+  start(init: { runId: string; change: string; roles: number; launches: number; phase?: string; stallMs?: number; enabled: boolean; managed?: () => void }, out: PanelOut = process.stdout): void {
     if (!init.enabled || this.active) return;
     this.out = out;
+    this.managed = init.managed;
     const at = Date.now();
     this.state = { runId: init.runId, change: init.change, roles: init.roles, launches: init.launches, phase: init.phase ?? '', activity: 'старт', activitySince: at, sessions: 0, stallMs: init.stallMs ?? 0, startedAt: at };
     this.active = true;
     this.paused = false;
-    out.on('resize', this.onResize);
-    process.on('exit', this.onExit);
-    process.once('SIGINT', this.onSigint);
-    process.once('SIGTERM', this.onSigterm);
-    this.reserve();
+    if (!this.managed) out.on('resize', this.onResize);
+    if (!this.managed) {
+      process.on('exit', this.onExit);
+      process.once('SIGINT', this.onSigint);
+      process.once('SIGTERM', this.onSigterm);
+    }
+    if (!this.managed) this.reserve();
     this.tick();
   }
 
@@ -187,6 +189,11 @@ class Panel {
     if (typeof patch === 'function') patch(this.state);
     else Object.assign(this.state, patch);
     this.draw();
+  }
+
+  frame(): string[] {
+    if (!this.active || this.paused || !this.state || !this.out || !panelEnabled({ isTTY: this.out.isTTY, rows: this.out.rows, cols: this.out.columns })) return [];
+    return renderPanel(this.state, this.out.columns ?? 80, Date.now());
   }
 
   /** Нижняя строка области лога, пока панель на экране; иначе undefined — лог во всю высоту. */
@@ -199,13 +206,13 @@ class Panel {
     if (!this.active || this.paused) return;
     this.paused = true;
     this.halt();
-    this.release();
+    if (!this.managed) this.release();
   }
 
   resume(): void {
     if (!this.active || !this.paused) return;
     this.paused = false;
-    this.reserve();
+    if (!this.managed) this.reserve();
     this.tick();
   }
 
@@ -214,14 +221,15 @@ class Panel {
     if (!this.active) return;
     this.active = false;
     this.halt();
-    if (!this.paused) this.release();
+    if (!this.paused && !this.managed) this.release();
     this.paused = false;
-    this.out?.write(`${ESC}[?25h`);
+    if (!this.managed) this.out?.write(`${ESC}[?25h`);
     this.out?.off('resize', this.onResize);
     process.off('exit', this.onExit);
     process.off('SIGINT', this.onSigint);
     process.off('SIGTERM', this.onSigterm);
     this.state = undefined;
+    this.managed = undefined;
   }
 
   private exitBySignal(code: number): void {
@@ -264,6 +272,7 @@ class Panel {
 
   private draw(): void {
     if (!this.active || this.paused || !this.state || !this.out) return;
+    if (this.managed) { this.managed(); return; }
     const rows = this.rows();
     const lines = renderPanel(this.state, this.out.columns ?? 80, Date.now());
     let s = SAVE;

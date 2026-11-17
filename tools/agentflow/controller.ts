@@ -43,15 +43,14 @@ import { INJECT_HELP, Injector, parseInject } from './inject.ts';
 import { aclRetryAddendum, diagnose, INTERVENTION_OPTIONS, recommendIntervention, type InterventionChoice } from './intervention.ts';
 import { c, configureThinking, log, parseThinkingChars, setLogSink, THINKING_CHARS } from './log.ts';
 import { runMock } from './mock.ts';
-import { mouse, mouseEnabled } from './mouse.ts';
 import { OpenSpec, topoOrder, type ArtifactNode } from './openspec.ts';
 import { loadPolicy, qwenExecutable, type Policy } from './policy.ts';
 import { printLoopSummary, writeAcceptanceReport } from './report.ts';
 import { decide, countBySeverity, validateReview, type Decision, type Expectation, type Review, type ReviewFinding } from './review-validator.ts';
 import { expandGlob, loadRoles, mcpViolations, mcpWarnings, roleFiles, runRole, stallMs, type RoleCall, type RoleDef, type RoleResult, type RoleRuntime, type TaskMeta } from './roles.ts';
-import { screen } from './screen.ts';
 import { artifactFiles, artifactSnapshot, artifactText, codeSnapshot, specDigest } from './snapshot.ts';
-import { clock, panelEnabled, panel } from './status-panel.ts';
+import { clock } from './status-panel.ts';
+import { startTerminalSession } from './terminal-session.ts';
 import { fromMenu, parseSkipRoles, ROLES, settingsMenu, skippedSteps, specOnly, validateMenu, type RunSettings } from './run-settings.ts';
 import { foreignDirty, inMainTree, lockTree, mergeSteps, RUNS_DIR, TREE_LOCK, treeChanges } from './run-tree.ts';
 import { RunStore, STAGES, type BatchState, type DiscussTurn, type Finding, type Question, type QuestionOption, type RunState, type Stage } from './state.ts';
@@ -726,8 +725,8 @@ function humanFinding(ctx: Ctx, n: ArtifactNode, problem: string, requiredChange
 function showArtifact(ctx: Ctx, n: ArtifactNode): void {
   for (const f of filesOf(ctx, n)) {
     const lines = readFileSync(join(ctx.wt, f), 'utf8').split('\n');
-    console.log(c.bold(`\n─── ${f} (${lines.length} строк) ───`));
-    console.log(lines.slice(0, 150).join('\n') + (lines.length > 150 ? c.gray(`\n… ещё ${lines.length - 150} строк`) : ''));
+    log.write(c.bold(`\n─── ${f} (${lines.length} строк) ───`));
+    log.write(lines.slice(0, 150).join('\n') + (lines.length > 150 ? c.gray(`\n… ещё ${lines.length - 150} строк`) : ''));
   }
 }
 
@@ -2174,29 +2173,25 @@ async function pipeline(ctx: Ctx): Promise<void> {
         'сторож простоя может сработать раньше, чем CLI дождётся ответа модели',
     );
   }
-  panel.start({
-    runId: s.runId,
-    change: s.change,
-    roles: ROLES.length - s.options.skip.length,
-    launches: Object.values(s.usage).reduce((n, u) => n + u.calls, 0),
-    phase: `этап ${s.stage}`,
-    stallMs: stallMs(ctx.rt),
-    enabled: panelEnabled({ isTTY: out.isTTY, rows: out.rows, cols: out.columns, noPanel: NO_PANEL, env: process.env }),
+  const terminal = startTerminalSession({
+    store: ctx.store, out, input: process.stdin, noMouse: NO_MOUSE, noPanel: NO_PANEL,
+    panel: {
+      runId: s.runId, change: s.change, roles: ROLES.length - s.options.skip.length,
+      launches: Object.values(s.usage).reduce((n, u) => n + u.calls, 0),
+      phase: `этап ${s.stage}`, stallMs: stallMs(ctx.rt),
+    },
   });
-  const clicks = mouseEnabled({ stdinTTY: process.stdin.isTTY, stdoutTTY: out.isTTY, noMouse: NO_MOUSE, env: process.env });
-  screen.start({ enabled: clicks, out, err: process.stderr, logBottom: () => panel.logBottom() });
-  mouse.start({ enabled: clicks, input: process.stdin, out, handlers: { click: (_x, y) => screen.click(y), cursor: (row) => screen.cursor(row) } });
-  if (s.options.skip.length) log.warn(`выключены роли: ${s.options.skip.join(', ')} · пропускаются: ${skippedSteps(s.options.skip).join('; ')}`);
-  if (s.options.untilReview) {
-    log.info(
-      s.handover
-        ? c.yellow(`режим --auto-until-review: решения принимает человек с ${s.handover.at} (${s.handover.reason})`)
-        : c.yellow(`режим --auto-until-review: решения до приёмки — автопилот без waiver и перехода дальше, run паркуется на «${specRun(ctx) ? 'Принять спеку?' : 'Принять change?'}»`),
-    );
-  }
-  log.info(`схема OpenSpec: ${status.schemaName} · артефакты: ${ctx.graph.map((n) => n.id).join(' → ')} · apply требует: ${status.applyRequires.join(', ') || '—'}`);
-  ctx.store.save();
   try {
+    if (s.options.skip.length) log.warn(`выключены роли: ${s.options.skip.join(', ')} · пропускаются: ${skippedSteps(s.options.skip).join('; ')}`);
+    if (s.options.untilReview) {
+      log.info(
+        s.handover
+          ? c.yellow(`режим --auto-until-review: решения принимает человек с ${s.handover.at} (${s.handover.reason})`)
+          : c.yellow(`режим --auto-until-review: решения до приёмки — автопилот без waiver и перехода дальше, run паркуется на «${specRun(ctx) ? 'Принять спеку?' : 'Принять change?'}»`),
+      );
+    }
+    log.info(`схема OpenSpec: ${status.schemaName} · артефакты: ${ctx.graph.map((n) => n.id).join(' → ')} · apply требует: ${status.applyRequires.join(', ') || '—'}`);
+    ctx.store.save();
     for (const stage of STAGES) {
       if (s.stagesDone.includes(stage)) continue;
       s.stage = stage;
@@ -2207,11 +2202,12 @@ async function pipeline(ctx: Ctx): Promise<void> {
       ctx.store.save();
       if (ctx.inject.take(`kill-after:${stage}`)) {
         log.error(`контроллер убит после этапа ${stage}; продолжи: agentflow resume ${s.runId}`);
+        terminal.close();
         process.exit(137);
       }
     }
     printLoopSummary(s);
-    console.log('\n' + c.green(c.bold(specRun(ctx) ? `✔ run ${s.runId}: спека change ${s.change} принята` : `✔ run ${s.runId}: change ${s.change} принят`)));
+    log.write('\n' + c.green(c.bold(specRun(ctx) ? `✔ run ${s.runId}: спека change ${s.change} принята` : `✔ run ${s.runId}: change ${s.change} принят`)));
   } catch (e) {
     if (e instanceof Parked) {
       s.status = 'awaiting-review';
@@ -2220,10 +2216,10 @@ async function pipeline(ctx: Ctx): Promise<void> {
       const report = writeAcceptanceReport(ctx.runDir, s, manualCheck(ctx));
       writeManifest(ctx);
       printLoopSummary(s);
-      console.log('\n' + c.yellow(c.bold(`⏸ run ${s.runId}: ${specRun(ctx) ? 'спека' : 'change'} ${s.change} ждёт твоего ревью`)));
-      console.log(`отчёт: ${report}`);
-      console.log(specRun(ctx) ? `спека: ${changeDirAbs(ctx)} (ветка ${s.branch})` : `код для ручного теста: ${s.worktree} (ветка ${s.branch})`);
-      console.log(`принять или отклонить: agentflow resume ${s.runId}`);
+      log.write('\n' + c.yellow(c.bold(`⏸ run ${s.runId}: ${specRun(ctx) ? 'спека' : 'change'} ${s.change} ждёт твоего ревью`)));
+      log.write(`отчёт: ${report}`);
+      log.write(specRun(ctx) ? `спека: ${changeDirAbs(ctx)} (ветка ${s.branch})` : `код для ручного теста: ${s.worktree} (ветка ${s.branch})`);
+      log.write(`принять или отклонить: agentflow resume ${s.runId}`);
       return;
     }
     if (!(e instanceof Blocked)) {
@@ -2241,12 +2237,10 @@ async function pipeline(ctx: Ctx): Promise<void> {
     writeAcceptanceReport(ctx.runDir, s, manualCheck(ctx));
     writeManifest(ctx);
     printLoopSummary(s);
-    console.log(`\nпричина записана в ${ctx.store.statePath}; продолжить после исправления: agentflow resume ${s.runId}`);
+    log.write(`\nпричина записана в ${ctx.store.statePath}; продолжить после исправления: agentflow resume ${s.runId}`);
     process.exitCode = 2;
   } finally {
-    mouse.stop();
-    screen.stop();
-    panel.stop();
+    terminal.close();
   }
 }
 
@@ -2410,11 +2404,11 @@ async function resumeRun(runId: string): Promise<void> {
   if (!store.exists()) throw new Error(`нет run ${runId}`);
   store.load();
   if (store.state.status === 'accepted') {
-    console.log(`run ${runId} уже принят`);
+    log.write(`run ${runId} уже принят`);
     return;
   }
   if (store.state.status === 'awaiting-review' && !process.stdin.isTTY) {
-    console.log(`run ${runId} ждёт ревью человека на приёмке: запусти agentflow resume ${runId} в интерактивном терминале`);
+    log.write(`run ${runId} ждёт ревью человека на приёмке: запусти agentflow resume ${runId} в интерактивном терминале`);
     process.exitCode = 2;
     return;
   }
@@ -2443,16 +2437,16 @@ function showStatus(runId?: string): void {
   const runsDir = join(ROOT, RUNS_DIR);
   const ids = existsSync(runsDir) ? readdirSync(runsDir).filter((d) => existsSync(join(runsDir, d, 'state.json'))).sort() : [];
   if (!runId) {
-    if (!ids.length) console.log('запусков нет');
+    if (!ids.length) log.write('запусков нет');
     for (const id of ids) {
       const s = JSON.parse(readFileSync(join(runsDir, id, 'state.json'), 'utf8')) as RunState;
-      console.log(`${id}  ${s.status.padEnd(15)} этап ${s.stage}${s.stopReason ? ` — ${s.stopReason.split('\n')[0]}` : ''}`);
+      log.write(`${id}  ${s.status.padEnd(15)} этап ${s.stage}${s.stopReason ? ` — ${s.stopReason.split('\n')[0]}` : ''}`);
     }
     return;
   }
   const s = JSON.parse(readFileSync(join(runsDir, runId, 'state.json'), 'utf8')) as RunState;
-  console.log(`${s.runId}: ${s.status} · этап ${s.stage} · шаг ${s.step}${s.stopReason ? `\nпричина: ${s.stopReason}` : ''}`);
-  console.log(`findings: open ${s.findings.filter((f) => f.status === 'open').length}, closed ${s.findings.filter((f) => f.status === 'closed').length}, logged ${s.findings.filter((f) => f.status === 'logged').length}`);
+  log.write(`${s.runId}: ${s.status} · этап ${s.stage} · шаг ${s.step}${s.stopReason ? `\nпричина: ${s.stopReason}` : ''}`);
+  log.write(`findings: open ${s.findings.filter((f) => f.status === 'open').length}, closed ${s.findings.filter((f) => f.status === 'closed').length}, logged ${s.findings.filter((f) => f.status === 'logged').length}`);
   printLoopSummary(s);
 }
 
@@ -2537,7 +2531,7 @@ async function initRepo(withSchema: boolean): Promise<void> {
   const add = lines.filter((l) => !cur.split('\n').includes(l));
   if (add.length) writeFileSync(gi, cur + (cur && !cur.endsWith('\n') ? '\n' : '') + '# agentflow: каталоги запусков, в git только отчёт приёмки\n' + add.join('\n') + '\n');
   log.step(add.length ? '.gitignore: добавлены .agentflow-runs' : '.gitignore уже содержит .agentflow-runs');
-  console.log(`\nДальше:\n  1. проверь gates.ops и acceptance в ${policyPath}\n  2. git add .agentflow .gitignore openspec && git commit -m "agentflow: init"\n  3. agentflow smoke  ·  agentflow run <intent.md>  ·  agentflow run --change <существующий-change>`);
+  log.write(`\nДальше:\n  1. проверь gates.ops и acceptance в ${policyPath}\n  2. git add .agentflow .gitignore openspec && git commit -m "agentflow: init"\n  3. agentflow smoke  ·  agentflow run <intent.md>  ·  agentflow run --change <существующий-change>`);
 }
 
 /** Changes репозитория по OpenSpec и их прогоны конвейера. */
@@ -2546,12 +2540,12 @@ async function showChanges(): Promise<void> {
   const runsDir = join(ROOT, RUNS_DIR);
   const runs = existsSync(runsDir) ? readdirSync(runsDir).filter((d) => existsSync(join(runsDir, d, 'state.json'))) : [];
   const changes = await os.list();
-  if (!changes.length) console.log('активных changes нет');
+  if (!changes.length) log.write('активных changes нет');
   for (const ch of changes) {
     const schema = (await os.status(ch.name).catch(() => undefined))?.schemaName ?? '?';
     const own = runs.filter((r) => r.endsWith(`-${ch.name}`)).sort();
     const last = own.length ? (JSON.parse(readFileSync(join(runsDir, own.at(-1)!, 'state.json'), 'utf8')) as RunState) : undefined;
-    console.log(
+    log.write(
       `${ch.name.padEnd(28)} схема ${schema.padEnd(14)} задачи ${ch.completedTasks}/${ch.totalTasks}  ` +
         (last ? `последний run ${last.runId}: ${last.status}, этап ${last.stage}` : 'прогонов не было — agentflow run --change ' + ch.name),
     );
@@ -2617,7 +2611,7 @@ async function main(): Promise<void> {
   });
   const [cmd, arg] = positionals;
   if (values.help || !cmd) {
-    console.log(USAGE);
+    log.write(USAGE);
     return;
   }
   ROOT = await resolveRepo(values.repo);
@@ -2639,10 +2633,10 @@ async function main(): Promise<void> {
     const runsDir = join(ROOT, RUNS_DIR);
     const id = arg ?? readdirSync(runsDir).filter((d) => !d.startsWith('smoke-') && existsSync(join(runsDir, d, 'events.jsonl'))).sort().pop();
     if (!id) throw new Error('запусков нет');
-    console.log(`run ${id}\n`);
+    log.write(`run ${id}\n`);
     showAgents(join(runsDir, id));
   } else {
-    console.log(USAGE);
+    log.write(USAGE);
     process.exitCode = 1;
   }
 }

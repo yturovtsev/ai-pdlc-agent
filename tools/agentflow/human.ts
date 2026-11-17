@@ -6,6 +6,7 @@ import { c, log } from './log.ts';
 import { mouse } from './mouse.ts';
 import type { DiscussTurn, QuestionOption } from './state.ts';
 import { panel } from './status-panel.ts';
+import { terminalDialog } from './terminal-session.ts';
 import { Blocked, now, pluralRu } from './util.ts';
 
 export interface Option<K extends string = string> {
@@ -51,15 +52,12 @@ export interface DecisionDiscuss {
  * после ответа. Лог удержан: работающая сессия (диалог вмешательства) не рвёт меню, её строки выйдут после.
  */
 async function paused<T>(fn: () => Promise<T>): Promise<T> {
-  mouse.pause();
-  panel.pause();
-  log.hold();
-  try {
-    return await fn();
-  } finally {
-    log.release();
-    panel.resume();
-    mouse.resume();
+  const dialog = terminalDialog();
+  if (!dialog) { log.hold(); mouse.pause(); panel.pause(); }
+  try { return await fn(); }
+  finally {
+    if (dialog) dialog.resume();
+    else { panel.resume(); mouse.resume(); log.release(); }
   }
 }
 
@@ -214,7 +212,7 @@ export class Human {
     const all = [...ch.options, ...(ch.tail ?? [])];
     const rec = all.find((o) => o.key === ch.recommended) ?? all[0]!;
     if (rec.disabled) throw new Error(`рекомендован недоступный вариант «${rec.label}»`);
-    console.log('');
+    log.write('');
     log.human(c.bold(ch.title));
     for (const line of ch.context ?? []) log.info(c.gray('  ' + line));
     log.info(c.green(`  ★ рекомендуется: ${rec.label}`) + c.gray(` — ${ch.rationale}`));
@@ -233,7 +231,7 @@ export class Human {
     const ordered = [rec, ...all.filter((o) => o !== rec)];
     const answer = await paused(async () => {
       try {
-        return (await this.io.select(
+        const picked = (await this.io.select(
           {
             message: ch.title,
             default: rec.key,
@@ -249,6 +247,8 @@ export class Human {
           },
           { signal },
         )) as K;
+        log.info(c.gray(`  выбрано: ${all.find((o) => o.key === picked)?.label}`));
+        return picked;
       } catch (e) {
         if (signal?.aborted && e instanceof Error && e.name === 'AbortPromptError') return undefined;
         throw e;
@@ -258,7 +258,6 @@ export class Human {
       log.info(c.gray('  диалог закрыт без выбора'));
       return undefined;
     }
-    log.info(c.gray(`  выбрано: ${all.find((o) => o.key === answer)?.label}`));
     return answer;
   }
 
@@ -280,7 +279,9 @@ export class Human {
       return autoAnswer;
     }
     this.ensureTty(question);
-    return (await paused(() => this.io.input({ message: question }))).trim() || autoAnswer;
+    const answer = (await paused(() => this.io.input({ message: question }))).trim() || autoAnswer;
+    log.human(`${question}: ${answer}`);
+    return answer;
   }
 
   /**

@@ -5,3 +5,6 @@ node_modules/
 !.agentflow-runs/*/ACCEPTANCE.md
 e2e/evidence/*
 !e2e/evidence/.gitkeep
+.claude
+.agents
+.kimi-code

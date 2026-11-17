@@ -1,11 +1,14 @@
 // Консольный рендер конвейера: фазы, петли с номером раунда, запуск субагентов,
 // их вызовы инструментов, решения ACL, гейты и вердикты. Всё дублируется в events.jsonl.
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import type { AclCategory, AclDecision } from './roles.ts';
-import { screen, textWidth, wrapText, type ThinkingView } from './screen.ts';
+import { textWidth, wrapText } from './terminal-text.ts';
+import type { DisplayRecord } from './state.ts';
 import type { DenialGroup } from './session-tracker.ts';
-import { fit, panel } from './status-panel.ts';
+import { panel } from './status-panel.ts';
 import { oneLine, pluralRu } from './util.ts';
 
 const useColor = process.stdout.isTTY && !process.env['NO_COLOR'];
@@ -41,39 +44,45 @@ export function setLogSink(fn: Sink): void {
 }
 
 // Пока открыт диалог, строки копятся здесь и выходят после него: меню inquirer не рвётся
-// параллельным выводом работающей сессии. events.jsonl пишется сразу.
-const HELD_MAX = 2000;
+// параллельным выводом работающей сессии. В управляемом окне журнал пишется сразу.
 let held = 0;
-let buffer: (string | ThinkingView)[] = [];
-let dropped = 0;
-
+let buffer: DisplayRecord[] = [];
+export interface DisplaySink {
+  /** Во время меню записи сразу сохраняются, а кадры приостановлены владельцем окна. */
+  retainWhileHeld?: boolean;
+  append(record: DisplayRecord): void;
+  /** Закрывает окно и выводит уже сохранённый transcript перед потоковым продолжением. */
+  fail(error: unknown): void;
+}
+let displaySink: DisplaySink | undefined;
+let streamWriter: ((text: string) => void) | undefined;
+export function setStreamWriter(writer?: (text: string) => void): void { streamWriter = writer; }
+export function setDisplaySink(next?: DisplaySink): void { displaySink = next; }
+export function displayActive(): boolean { return !!displaySink; }
 const indent = () => c.gray('│ '.repeat(depth));
-
-function line(text: string): void {
-  out(indent() + text);
+function line(text: string): void { out({ kind: 'line', text: indent() + text }); }
+function out(record: DisplayRecord): void {
+  if (held && !displaySink?.retainWhileHeld) buffer.push(record);
+  else print(record);
 }
-
-function out(item: string | ThinkingView): void {
-  if (!held) return print(item);
-  if (buffer.length < HELD_MAX) buffer.push(item);
-  else dropped++;
-}
-
-/**
- * Блок размышления рисуется в момент фактического вывода (после удержания — при release): по
- * ширине окна в этот момент, и только тогда экран узнаёт, где он стоит.
- */
-function print(item: string | ThinkingView): void {
-  if (typeof item === 'string') return void console.log(item);
-  const lines = item.lines(false, screen.active() ? screen.width() : process.stdout.columns || 120);
-  const mark = screen.active() && item.expandable(screen.width()) ? screen.mark() : undefined;
-  console.log(lines.join('\n'));
-  if (mark) screen.register(mark, item, lines.length);
+function print(record: DisplayRecord): void {
+  if (displaySink) {
+    try { displaySink.append(record); return; }
+    catch (error) {
+      const failed = displaySink;
+      displaySink = undefined;
+      failed.fail(error);
+      log.error(`журнал отображения недоступен, продолжаю потоковый вывод: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const text = renderRecord(record, false, process.stdout.columns || 120, false).join('\n');
+  if (streamWriter) streamWriter(text + '\n');
+  else console.log(text);
 }
 
 /** Сколько символов размышления видно сразу; по умолчанию — THINKING_CHARS. */
 export const THINKING_CHARS = 300;
-const thinkingCfg = { chars: THINKING_CHARS, dir: undefined as string | undefined, links: !!process.stdout.isTTY, seq: 0 };
+const thinkingCfg = { chars: THINKING_CHARS, dir: undefined as string | undefined, links: !!process.stdout.isTTY };
 
 /**
  * Настройки вывода размышлений: chars — сколько символов видно сразу, dir — куда класть полный текст
@@ -135,23 +144,28 @@ export function thinkingLines(text: string, width: number): string[] {
 }
 
 /** Полный текст размышления в файл run: на него ведёт ссылка «Развернуть». */
-function thinkingFile(role: string, text: string): string | undefined {
-  const dir = thinkingCfg.dir;
-  if (!dir || !thinkingCfg.links) return undefined;
-  try {
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, `${String(++thinkingCfg.seq).padStart(4, '0')}-${role}.md`);
-    writeFileSync(path, `# ${role} · ${clockTime()}\n\n${text.trim()}\n`);
-    return path;
-  } catch {
-    return undefined;
+export function writeThinkingFile(dir: string, role: string, text: string, uuid: () => string = randomUUID): string {
+  mkdirSync(dir, { recursive: true });
+  for (;;) {
+    const path = join(dir, `${uuid()}-${role.replace(/[^a-zA-Z0-9_-]/g, '_')}.md`);
+    try {
+      writeFileSync(path, `# ${role} · ${clockTime()}\n\n${text.trim()}\n`, { flag: 'wx' });
+      return path;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
   }
+}
+function thinkingFile(role: string, text: string): string | undefined {
+  if (!thinkingCfg.dir || !thinkingCfg.links) return undefined;
+  try { return writeThinkingFile(thinkingCfg.dir, role, text); }
+  catch { return undefined; }
 }
 
 /** Слово-кнопка размышления; со ссылкой OSC 8 на файл — ⌘-клик открывает полный текст. */
 function button(label: string, file?: string): { label: string; s: string } {
   const s = c.cyan(label);
-  return { label, s: file ? `\x1b]8;;file://${encodeURI(file)}\x07${s}\x1b]8;;\x07` : s };
+  return { label, s: file ? `\x1b]8;;${pathToFileURL(file).href}\x07${s}\x1b]8;;\x07` : s };
 }
 
 /** Кнопка в конце последней строки, если влезает в ширину, иначе — отдельной строкой. */
@@ -190,10 +204,14 @@ const verdictColor = (status: string) =>
   status === 'PASS' ? c.green : status === 'BLOCKED' ? c.red : c.yellow;
 
 export const log = {
+  /** Обычный отображаемый текст без отступа: артефакты, итоги и transcript используют один маршрут. */
+  write(text: string): void {
+    for (const part of text.split('\n')) out({ kind: 'line', text: part });
+  },
   phase(title: string): void {
     depth = 0;
     const bar = '═'.repeat(72);
-    console.log('\n' + c.bold(bar) + '\n' + c.bold(' ' + title) + '\n' + c.bold(bar));
+    log.write('\n' + c.bold(bar) + '\n' + c.bold(' ' + title) + '\n' + c.bold(bar));
     emit('phase', { title });
     panel.update({ phase: title, loop: undefined });
   },
@@ -238,38 +256,8 @@ export const log = {
    * сворачивает обратно; ссылка на файл с текстом открывается ⌘-кликом и из истории терминала.
    */
   thinking(role: string, text: string): void {
-    const chars = `размышляет (${text.length} симв.)`;
-    if (!text.trim()) return log.role(role, c.gray(`… ${chars}`));
-    const pre = indent();
-    const name = paintRole(role, `  ${role} │ `);
-    const time = clockTime();
-    const clickable = screen.active();
-    const file = thinkingFile(role, text);
-    const header = (mark: string) => pre + name + c.gray(time) + ' ' + c.gray(`${mark} ${chars}`);
-    // Текст стоит под временем строки; в узком окне — без префикса, лишь бы терминал не переносил строки.
-    const lead = textWidth(pre + name) + time.length + 1;
-    const pad = (columns: number) =>
-      columns - lead - 1 >= 20 ? { p: pre + name + ' '.repeat(time.length + 1), w: columns - lead - 1 } : { p: '  ', w: columns - 3 };
-    const cut = (columns: number) => previewLines(thinkingLines(text, pad(columns).w), thinkingCfg.chars).cut;
-    out({
-      expandable: (columns) => clickable && cut(columns),
-      lines(open, columns, max = Infinity) {
-        const { p, w } = pad(columns);
-        const body = thinkingLines(text, w);
-        const preview = previewLines(body, thinkingCfg.chars);
-        const paint = (ls: string[]) => ls.map((l) => p + c.gray(l));
-        if (!preview.cut) return [header('…'), ...paint(body)];
-        const expand = clickable || file ? button('Развернуть', file) : undefined;
-        if (!open) return [header(clickable ? '▸' : '…'), ...withButton(paint(preview.lines), p, w, expand)];
-        const fold = button('Свернуть');
-        const full = [header('▾'), ...withButton(paint(body), p, w, fold)];
-        if (full.length <= max) return full;
-        // Не влезает: сколько влезло и «… ещё N строк» со словом «Свернуть» в той же строке.
-        const shown = Math.max(0, max - 2);
-        const more = fit(moreLines(body.length - shown), w - fold.label.length - 1);
-        return [header('▾'), ...paint(body.slice(0, shown)), `${p}${c.gray(more)} ${fold.s}`];
-      },
-    });
+    if (!text.trim()) return log.role(role, c.gray(`… размышляет (${text.length} симв.)`));
+    out({ kind: 'thinking', role, text, pre: indent(), name: paintRole(role, `  ${role} │ `), time: clockTime(), chars: thinkingCfg.chars, file: thinkingFile(role, text) });
   },
 
   /** Глубина вложенности петель. Петля, пройденная решением человека посреди раунда, возвращает прежнюю. */
@@ -288,8 +276,6 @@ export const log = {
     const items = buffer;
     buffer = [];
     for (const item of items) print(item);
-    if (dropped) console.log(c.gray(`… ещё ${dropped} строк лога не показано — они в events.jsonl`));
-    dropped = 0;
   },
 
   /** Вызов инструмента роли: строка лога и счётчик инструментов в панели. */
@@ -405,3 +391,26 @@ export const log = {
     panel.update({ activity: 'решение человека', activitySince: Date.now() });
   },
 };
+
+export function recordExpandable(record: DisplayRecord, columns: number): boolean {
+  if (record.kind !== 'thinking') return false;
+  const lead = textWidth(record.pre + record.name) + record.time.length + 1;
+  const width = Math.max(1, columns - lead - 1 >= 20 ? columns - lead - 1 : columns - 3);
+  return previewLines(thinkingLines(record.text, width), record.chars).cut;
+}
+
+export function renderRecord(record: DisplayRecord, open: boolean, columns: number, clickable: boolean): string[] {
+  if (record.kind === 'line') return [record.text];
+  const { text, pre, name, time, chars, file } = record;
+  const lead = textWidth(pre + name) + time.length + 1;
+  const w = Math.max(1, columns - lead - 1 >= 20 ? columns - lead - 1 : columns - 3);
+  const p = columns - lead - 1 >= 20 ? pre + name + ' '.repeat(time.length + 1) : '  ';
+  const body = thinkingLines(text, w);
+  const preview = previewLines(body, chars);
+  const header = (mark: string) => pre + name + c.gray(time) + ' ' + c.gray(`${mark} размышляет (${text.length} симв.)`);
+  const paint = (ls: string[]) => ls.map((l) => p + c.gray(l));
+  if (!preview.cut) return [header('…'), ...withButton(paint(body), p, w, file ? button('Полный текст', file) : undefined)];
+  if (!open) return [header(clickable ? '▸' : '…'), ...withButton(paint(preview.lines), p, w, clickable || file ? button('Развернуть', file) : undefined)];
+  const lines = withButton(paint(body), p, w, button('Свернуть'));
+  return [header('▾'), ...lines, ...(file ? [p + button('Полный текст', file).s] : [])];
+}

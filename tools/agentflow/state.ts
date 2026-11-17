@@ -1,7 +1,8 @@
 // state.json — единственный источник правды о прогоне: текущий шаг, snapshot входов,
 // findings, гейты, фактические модели, решения человека, причина остановки.
 // Запись атомарная (временный файл + rename), каждый этап идемпотентен.
-import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, writeFileSync, writeSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { now } from './util.ts';
 
@@ -218,6 +219,19 @@ export class RunStore {
     return existsSync(this.statePath);
   }
 
+  createDisplayJournal(): DisplayJournal {
+    const dir = join(this.runDir, 'display');
+    mkdirSync(dir, { recursive: true });
+    for (;;) {
+      const path = join(dir, `${randomUUID()}.jsonl`);
+      try {
+        return new DisplayJournal(path, openSync(path, 'wx+'));
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      }
+    }
+  }
+
   load(): RunState {
     this.state = JSON.parse(readFileSync(this.statePath, 'utf8')) as RunState;
     // state.json прогонов до перехода дальше и обсуждения решений.
@@ -248,5 +262,66 @@ export class RunStore {
 
   append(event: Record<string, unknown>): void {
     appendFileSync(this.ledgerPath, JSON.stringify({ at: now(), ...event }) + '\n');
+  }
+}
+
+/** Только данные: записи можно перечитать, не сохраняя весь текст в памяти и state.json. */
+export type DisplayRecord =
+  | { kind: 'line'; text: string }
+  | { kind: 'thinking'; role: string; text: string; pre: string; name: string; time: string; chars: number; file?: string };
+export type DisplayEntry = DisplayRecord & { id: number };
+
+export class DisplayJournal {
+  private index: { offset: number; bytes: number }[] = [];
+  private bytes = 0;
+  private closed = false;
+
+  constructor(readonly path: string, private readonly fd: number) {}
+
+  static open(path: string): DisplayJournal {
+    const journal = new DisplayJournal(path, openSync(path, 'r'));
+    const data = readFileSync(path);
+    let start = 0;
+    for (let end = data.indexOf(10); end >= 0; end = data.indexOf(10, start)) {
+      journal.index.push({ offset: start, bytes: end + 1 - start });
+      start = end + 1;
+    }
+    journal.bytes = start;
+    return journal;
+  }
+
+  get length(): number { return this.index.length; }
+
+  append(record: DisplayRecord): DisplayEntry {
+    const entry = { ...record, id: this.length };
+    const data = Buffer.from(JSON.stringify(entry) + '\n');
+    let written = 0;
+    while (written < data.length) {
+      const n = writeSync(this.fd, data, written, data.length - written, this.bytes + written);
+      if (!n) throw new Error('журнал отображения: запись не продвигается');
+      written += n;
+    }
+    this.index.push({ offset: this.bytes, bytes: data.length });
+    this.bytes += data.length;
+    return entry;
+  }
+
+  page(start: number, count: number): DisplayEntry[] {
+    return this.index.slice(start, start + count).map(({ offset, bytes }) => {
+      const data = Buffer.alloc(bytes);
+      let read = 0;
+      while (read < bytes) {
+        const n = readSync(this.fd, data, read, bytes - read, offset + read);
+        if (!n) throw new Error('журнал отображения: неполная запись');
+        read += n;
+      }
+      return JSON.parse(data.toString('utf8')) as DisplayEntry;
+    });
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    closeSync(this.fd);
   }
 }

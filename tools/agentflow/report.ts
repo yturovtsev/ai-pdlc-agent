@@ -1,7 +1,7 @@
 // ACCEPTANCE.md — отчёт для человеческой приёмки и сводка пройденных петель.
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { c } from './log.ts';
+import { c, log } from './log.ts';
 import type { Proceeded, RunState } from './state.ts';
 import { skippedSteps, specOnly } from './run-settings.ts';
 import { inMainTree, mergeSteps } from './run-tree.ts';
@@ -15,10 +15,10 @@ export function loopSummary(s: RunState): { loop: string; rounds: number; path: 
 
 export function printLoopSummary(s: RunState): void {
   const rows = loopSummary(s);
-  console.log('\n' + c.bold('Пройденные петли'));
+  log.write('\n' + c.bold('Пройденные петли'));
   for (const r of rows) {
     const colored = r.path.replace(/PASS/g, c.green('PASS')).replace(/REVISE|RED/g, (m) => c.yellow(m)).replace(/BLOCKED/g, c.red('BLOCKED'));
-    console.log(`  ${r.loop.padEnd(28)} ${String(r.rounds).padStart(2)} раунд(ов)  ${colored}`);
+    log.write(`  ${r.loop.padEnd(28)} ${String(r.rounds).padStart(2)} раунд(ов)  ${colored}`);
   }
 }
 

@@ -5,15 +5,6 @@
 const ESC = '\x1b';
 const REPORT_ON = `${ESC}[?1000h${ESC}[?1006h`;
 const REPORT_OFF = `${ESC}[?1000l${ESC}[?1006l`;
-const CLICKS_ON = `${ESC}[?1000h`;
-const CLICKS_OFF = `${ESC}[?1000l`;
-/**
- * Сколько колесо прокручивает историю терминала без перехвата. iTerm2 сообщает колесо и клик только
- * над живым экраном, над историей колесо прокручивает само: пауза нужна лишь первому сдвигу, а длинная
- * съедала клики сразу после прокрутки.
- */
-export const WHEEL_PAUSE_MS = 1_000;
-
 export function mouseEnabled(o: { stdinTTY?: boolean; stdoutTTY?: boolean; noMouse?: boolean; env?: Record<string, string | undefined> }): boolean {
   return !!o.stdinTTY && !!o.stdoutTTY && !o.noMouse && o.env?.['AGENTFLOW_NO_MOUSE'] !== '1';
 }
@@ -23,12 +14,13 @@ export type InputEvent =
   | { kind: 'wheel'; up: boolean }
   | { kind: 'motion' }
   | { kind: 'cursor'; row: number; col: number }
-  | { kind: 'interrupt' };
+  | { kind: 'interrupt' }
+  | { kind: 'key'; key: 'pageUp' | 'pageDown' | 'end' };
 
 const MOUSE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/;
 const CURSOR = /^\x1b\[(\d+);(\d+)R/;
 // Начало одной из этих последовательностей: ждать продолжения в следующем data.
-const PARTIAL = /^\x1b(\[(<[\d;]*|[\d;]*)?)?$/;
+const PARTIAL = /^\x1b(\[(<[\d;]*|[\d;]*)?|O)?$/;
 
 /** Разбор ввода терминала: SGR-отчёт мыши, ответ о позиции курсора, Ctrl+C; остальное пропускается. */
 export class InputParser {
@@ -54,6 +46,11 @@ export class InputParser {
         events.push(mouseEvent(Number(m[1]), Number(m[2]), Number(m[3]), m[4] === 'M'));
         s = s.slice(m[0].length);
         continue;
+      }
+      const key = /^\x1b\[(5~|6~|4~|1;\d+F|F)/.exec(s) ?? /^\x1bO(F)/.exec(s);
+      if (key) {
+        events.push({ kind: 'key', key: key[1] === '5~' ? 'pageUp' : key[1] === '6~' ? 'pageDown' : 'end' });
+        s = s.slice(key[0].length); continue;
       }
       const r = CURSOR.exec(s);
       if (r) {
@@ -92,33 +89,37 @@ export interface MouseHandlers {
   /** Нажатие левой кнопки: колонка и строка экрана с 1. */
   click(x: number, y: number): void;
   /** Ответ терминала на запрос позиции курсора. */
-  cursor(row: number, col: number): void;
+  cursor?(row: number, col: number): void;
+  wheel(up: boolean): void;
+  key(key: 'pageUp' | 'pageDown' | 'end'): void;
 }
 
-class Mouse {
+export class Mouse {
   private input: MouseInput | undefined;
   private out: { write(s: string): unknown } | undefined;
   private handlers: MouseHandlers | undefined;
   private active = false;
   private paused = false;
-  private reporting = false;
-  private wheelTimer: ReturnType<typeof setTimeout> | undefined;
+  private managed = false;
   private parser = new InputParser();
   private readonly onData = (d: Buffer | string) => this.data(String(d));
   private readonly onExit = () => this.stop();
   private readonly onSigint = () => this.exitBySignal(130);
   private readonly onSigterm = () => this.exitBySignal(143);
 
-  start(o: { enabled: boolean; input: MouseInput; out: { write(s: string): unknown }; handlers: MouseHandlers }): void {
+  start(o: { enabled: boolean; managed?: boolean; input: MouseInput; out: { write(s: string): unknown }; handlers: MouseHandlers }): void {
     if (!o.enabled || this.active) return;
+    this.managed = !!o.managed;
     this.input = o.input;
     this.out = o.out;
     this.handlers = o.handlers;
     this.active = true;
     this.paused = false;
-    process.on('exit', this.onExit);
-    process.once('SIGINT', this.onSigint);
-    process.once('SIGTERM', this.onSigterm);
+    if (!this.managed) {
+      process.on('exit', this.onExit);
+      process.once('SIGINT', this.onSigint);
+      process.once('SIGTERM', this.onSigterm);
+    }
     this.attach();
   }
 
@@ -162,14 +163,13 @@ class Mouse {
     input.ref?.();
     input.resume();
     this.out?.write(REPORT_ON);
-    this.reporting = true;
+
   }
 
   private detach(): void {
-    if (this.wheelTimer) clearTimeout(this.wheelTimer);
-    this.wheelTimer = undefined;
+
     this.out?.write(REPORT_OFF);
-    this.reporting = false;
+
     const input = this.input!;
     input.off('data', this.onData);
     input.setRawMode?.(false);
@@ -180,25 +180,13 @@ class Mouse {
   private data(d: string): void {
     for (const ev of this.parser.feed(d)) {
       if (ev.kind === 'interrupt') interrupt();
-      else if (ev.kind === 'wheel') this.wheel();
-      else if (ev.kind === 'cursor') this.handlers?.cursor(ev.row, ev.col);
+      else if (ev.kind === 'wheel') this.handlers?.wheel(ev.up);
+      else if (ev.kind === 'key') this.handlers?.key(ev.key);
+      else if (ev.kind === 'cursor') this.handlers?.cursor?.(ev.row, ev.col);
       else if (ev.kind === 'press' && ev.button === 0) this.handlers?.click(ev.x, ev.y);
     }
   }
 
-  /** Колесо: перехват кликов выключен на паузу, и следующие щелчки колеса листают историю терминала. */
-  private wheel(): void {
-    if (!this.reporting) return;
-    this.out?.write(CLICKS_OFF);
-    this.reporting = false;
-    this.wheelTimer = setTimeout(() => {
-      this.wheelTimer = undefined;
-      if (!this.active || this.paused) return;
-      this.out?.write(CLICKS_ON);
-      this.reporting = true;
-    }, WHEEL_PAUSE_MS);
-    this.wheelTimer.unref?.();
-  }
 }
 
 /** Ctrl+C в raw-режиме: SIGINT всей группе процессов, как от терминала (обёртка, CLI ролей, гейты). */
