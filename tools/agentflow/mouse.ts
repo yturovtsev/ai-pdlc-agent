@@ -3,8 +3,10 @@
 // и сигнал отправляется всей группе процессов, как это делает терминал. Без start() всё — no-op.
 
 const ESC = '\x1b';
-const REPORT_ON = `${ESC}[?1000h${ESC}[?1006h`;
-const REPORT_OFF = `${ESC}[?1000l${ESC}[?1006l`;
+// iTerm2 может заменять колесо стрелками в alternate screen: сначала выключаем этот режим,
+// но стрелки всё равно разбираем ниже для профилей, где он включается автоматически.
+const REPORT_ON = `${ESC}[?1007l${ESC}[?1000h${ESC}[?1006h`;
+const REPORT_OFF = `${ESC}[?1000l${ESC}[?1006l${ESC}[?1007l`;
 export function mouseEnabled(o: { stdinTTY?: boolean; stdoutTTY?: boolean; noMouse?: boolean; env?: Record<string, string | undefined> }): boolean {
   return !!o.stdinTTY && !!o.stdoutTTY && !o.noMouse && o.env?.['AGENTFLOW_NO_MOUSE'] !== '1';
 }
@@ -15,14 +17,14 @@ export type InputEvent =
   | { kind: 'motion' }
   | { kind: 'cursor'; row: number; col: number }
   | { kind: 'interrupt' }
-  | { kind: 'key'; key: 'pageUp' | 'pageDown' | 'end' };
+  | { kind: 'key'; key: 'pageUp' | 'pageDown' | 'end' | 'up' | 'down' };
 
 const MOUSE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/;
 const CURSOR = /^\x1b\[(\d+);(\d+)R/;
 // Начало одной из этих последовательностей: ждать продолжения в следующем data.
 const PARTIAL = /^\x1b(\[(<[\d;]*|[\d;]*)?|O)?$/;
 
-/** Разбор ввода терминала: SGR-отчёт мыши, ответ о позиции курсора, Ctrl+C; остальное пропускается. */
+/** Разбор ввода: SGR-мышь, клавиши навигации, ответ о позиции курсора, Ctrl+C; остальное пропускается. */
 export class InputParser {
   private buf = '';
 
@@ -47,9 +49,10 @@ export class InputParser {
         s = s.slice(m[0].length);
         continue;
       }
-      const key = /^\x1b\[(5~|6~|4~|1;\d+F|F)/.exec(s) ?? /^\x1bO(F)/.exec(s);
+      const key = /^\x1b\[(5~|6~|4~|1;\d+F|F|A|B)/.exec(s) ?? /^\x1bO(F|A|B)/.exec(s);
       if (key) {
-        events.push({ kind: 'key', key: key[1] === '5~' ? 'pageUp' : key[1] === '6~' ? 'pageDown' : 'end' });
+        const name = key[1] === '5~' ? 'pageUp' : key[1] === '6~' ? 'pageDown' : key[1] === 'A' ? 'up' : key[1] === 'B' ? 'down' : 'end';
+        events.push({ kind: 'key', key: name });
         s = s.slice(key[0].length); continue;
       }
       const r = CURSOR.exec(s);
@@ -91,7 +94,7 @@ export interface MouseHandlers {
   /** Ответ терминала на запрос позиции курсора. */
   cursor?(row: number, col: number): void;
   wheel(up: boolean): void;
-  key(key: 'pageUp' | 'pageDown' | 'end'): void;
+  key(key: 'pageUp' | 'pageDown' | 'end' | 'up' | 'down'): void;
 }
 
 export class Mouse {

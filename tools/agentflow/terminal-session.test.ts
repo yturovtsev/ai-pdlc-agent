@@ -59,6 +59,23 @@ test('окно: медленные шаги и быстрые 15 вверх/7 в
   } finally { f.close(); }
 });
 
+test('alternate mouse scroll: стрелки двигают историю, клик после них раскрывает блок', () => {
+  const f = fixture();
+  try {
+    assert.match(f.out.writes.join(''), /\x1b\[\?1007l/);
+    data();
+    const before = f.out.vt.lines();
+    f.input.emit('data', '\x1b[A');
+    assert.deepEqual(f.out.vt.lines().slice(1, 27), before.slice(0, 26));
+    f.input.emit('data', '\x1bOB');
+    assert.deepEqual(f.out.vt.lines(), before);
+    for (let i = 0; i < 150; i++) f.input.emit('data', i % 2 ? '\x1bOA' : '\x1b[A');
+    log.write('DURING-READ');
+    f.click('▸');
+    assert.match(f.lines(), /▾/);
+  } finally { f.close(); }
+});
+
 test('якорь: новый лог и панель не сбрасывают чтение; End возвращает слежение', () => {
   const f = fixture();
   try {

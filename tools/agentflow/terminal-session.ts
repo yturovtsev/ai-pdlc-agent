@@ -66,7 +66,11 @@ export class TerminalSession {
     this.mouse.start({ enabled: true, managed: true, input, out, handlers: {
       click: (_x, y) => this.screen?.click(y),
       wheel: (up) => this.screen?.scroll(up ? -1 : 1),
-      key: (key) => key === 'end' ? this.screen?.end() : this.screen?.page(key === 'pageUp'),
+      key: (key) => {
+        if (key === 'end') this.screen?.end();
+        else if (key === 'up' || key === 'down') this.screen?.scroll(key === 'up' ? -1 : 1);
+        else this.screen?.page(key === 'pageUp');
+      },
     } });
     setDisplaySink({
       retainWhileHeld: true,

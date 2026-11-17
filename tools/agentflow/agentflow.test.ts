@@ -1023,7 +1023,12 @@ test('мышь: разбор ввода терминала', () => {
   assert.deepEqual(p.feed('0;20M'), [{ kind: 'press', button: 0, x: 10, y: 20 }]);
   assert.deepEqual(p.feed('\x1b[2'), []);
   assert.deepEqual(p.feed('7;1R'), [{ kind: 'cursor', row: 27, col: 1 }]);
-  assert.deepEqual(p.feed('\x1bOA\x1b[Aq'), [], 'стрелки и буквы — мимо');
+  assert.deepEqual(p.feed('\x1bOA\x1b[A\x1bOB\x1b[Bq'), [
+    { kind: 'key', key: 'up' },
+    { kind: 'key', key: 'up' },
+    { kind: 'key', key: 'down' },
+    { kind: 'key', key: 'down' },
+  ], 'alternate mouse scroll приходит стрелками; буквы — мимо');
 });
 
 test('режим мыши включается только при TTY stdin и stdout без --no-mouse', () => {
